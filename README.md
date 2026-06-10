@@ -1,13 +1,20 @@
 # notebooklm-py
 **A Comprehensive NotebookLM Skill & Unofficial Python API.** Full programmatic access to NotebookLM's features—including capabilities the web UI doesn't expose—via Python, CLI, and AI agents like Claude Code, Codex, and OpenClaw.
 
+<br/>
+<br/>
+<br/>
+<br/>
 
 
 
 > 📚 **Generating NCERT data?** Use the batch pipeline: `cd pipeline` and follow **[pipeline/COMMANDS.md](pipeline/COMMANDS.md)** (step-by-step commands). Overview: [pipeline/README.md](pipeline/README.md).
 
 
-
+<br/>
+<br/>
+<br/>
+<br/>
 
 
 [![PyPI version](https://img.shields.io/pypi/v/notebooklm-py.svg)](https://pypi.org/project/notebooklm-py/)
