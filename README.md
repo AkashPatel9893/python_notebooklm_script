@@ -1,11 +1,14 @@
 # notebooklm-py
-<p align="left">
-  <img src="https://raw.githubusercontent.com/teng-lin/notebooklm-py/main/notebooklm-py.png" alt="notebooklm-py logo" width="128">
-</p>
-
 **A Comprehensive NotebookLM Skill & Unofficial Python API.** Full programmatic access to NotebookLM's features—including capabilities the web UI doesn't expose—via Python, CLI, and AI agents like Claude Code, Codex, and OpenClaw.
 
+
+
+
 > 📚 **Generating NCERT data?** Use the batch pipeline: `cd pipeline` and follow **[pipeline/COMMANDS.md](pipeline/COMMANDS.md)** (step-by-step commands). Overview: [pipeline/README.md](pipeline/README.md).
+
+
+
+
 
 [![PyPI version](https://img.shields.io/pypi/v/notebooklm-py.svg)](https://pypi.org/project/notebooklm-py/)
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://pypi.org/project/notebooklm-py/)
