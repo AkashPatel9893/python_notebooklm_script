@@ -8,7 +8,15 @@
 
 
 
-> 📚 **Generating NCERT data?** Use the batch pipeline: `cd pipeline` and follow **[pipeline/COMMANDS.md](pipeline/COMMANDS.md)** (step-by-step commands). Overview: [pipeline/README.md](pipeline/README.md).
+<div align="center">
+
+> [!IMPORTANT]
+> ## 📚 Generating NCERT data?
+> Use the batch pipeline → **`cd pipeline`** and follow **[pipeline/COMMANDS.md](pipeline/COMMANDS.md)** for step-by-step commands.
+>
+> Overview: **[pipeline/README.md](pipeline/README.md)**
+
+</div>
 
 
 <br/>
