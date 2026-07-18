@@ -43,7 +43,16 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from notebooklm import ArtifactType, NotebookLMClient
+from notebooklm import (
+    ArtifactType,
+    AudioFormat,
+    AudioLength,
+    NotebookLMClient,
+    QuizDifficulty,
+    QuizQuantity,
+    SlideDeckFormat,
+    SlideDeckLength,
+)
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -58,6 +67,26 @@ PROGRESS_CSV = HERE / "progress.csv"
 LOG_FILE = HERE / "pipeline.log"
 
 LANGUAGE = "en"
+
+# Studio "Customize" defaults — mirror the settings picked in the NotebookLM UI.
+QUIZ_QUANTITY = QuizQuantity.MORE
+QUIZ_DIFFICULTY = QuizDifficulty.MEDIUM
+FLASHCARDS_QUANTITY = QuizQuantity.MORE
+FLASHCARDS_DIFFICULTY = QuizDifficulty.MEDIUM
+SLIDE_DECK_FORMAT = SlideDeckFormat.DETAILED_DECK
+SLIDE_DECK_LENGTH = SlideDeckLength.DEFAULT
+AUDIO_FORMAT = AudioFormat.DEEP_DIVE
+AUDIO_LENGTH = AudioLength.DEFAULT
+AUDIO_INSTRUCTIONS = """\
+The listener is a school-going student from India.
+
+Wherever needed, use Indian examples from Indian context and demography.
+
+The flow of the material should resonate with the flow of the material attached.
+
+For parts which seem critical and relevant from exam point of view, the hosts can emphasize them explicitly.
+
+In the end, include a 2 minute crash course of whatever is covered in the audio."""
 
 # Which artifacts to generate per chapter. Any subset of ARTIFACT_SPECS keys.
 ARTIFACTS: list[str] = [
@@ -89,17 +118,26 @@ async def _gen_study_guide(c: NotebookLMClient, nb: str, sids: list[str]) -> str
 
 
 async def _gen_quiz(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
-    s = await c.artifacts.generate_quiz(nb, sids)
+    s = await c.artifacts.generate_quiz(
+        nb, sids, quantity=QUIZ_QUANTITY, difficulty=QUIZ_DIFFICULTY
+    )
     return s.task_id
 
 
 async def _gen_flashcards(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
-    s = await c.artifacts.generate_flashcards(nb, sids)
+    s = await c.artifacts.generate_flashcards(
+        nb, sids, quantity=FLASHCARDS_QUANTITY, difficulty=FLASHCARDS_DIFFICULTY
+    )
     return s.task_id
 
 
 async def _gen_audio(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
-    s = await c.artifacts.generate_audio(nb, sids, LANGUAGE)
+    s = await c.artifacts.generate_audio(
+        nb, sids, LANGUAGE,
+        instructions=AUDIO_INSTRUCTIONS,
+        audio_format=AUDIO_FORMAT,
+        audio_length=AUDIO_LENGTH,
+    )
     return s.task_id
 
 
@@ -120,7 +158,11 @@ async def _gen_infographic(c: NotebookLMClient, nb: str, sids: list[str]) -> str
 
 
 async def _gen_slide_deck(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
-    s = await c.artifacts.generate_slide_deck(nb, sids, LANGUAGE)
+    s = await c.artifacts.generate_slide_deck(
+        nb, sids, LANGUAGE,
+        slide_format=SLIDE_DECK_FORMAT,
+        slide_length=SLIDE_DECK_LENGTH,
+    )
     return s.task_id
 
 
