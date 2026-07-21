@@ -79,7 +79,7 @@ python run.py generate
 ```
 
 - Creates one NotebookLM notebook per chapter, uploads the PDF, and generates
-  all 6 artifacts: quiz, flashcards, mind map, slide deck, audio, cinematic video.
+  all 7 artifacts: quiz, flashcards, mind map, slide deck, audio, cinematic video, infographic.
 - Chapters run 3 at a time. Leave it running — it can take a while
   (audio/quiz/flashcards are rate-limited by Google).
 
@@ -120,6 +120,7 @@ pipeline/output/<Class>/<Subject>/<Chapter>/
     slides.pdf
     audio.mp3
     cinematic_video.mp4
+    infographic.png
 ```
 
 Retry failed downloads:
@@ -153,7 +154,7 @@ python run.py all
 
 Valid artifact names for `--artifacts`:
 `quiz, flashcards, mind_map, slide_deck, audio, cinematic_video, study_guide, video, infographic, data_table`
-(default set: `quiz, flashcards, mind_map, slide_deck, audio, cinematic_video`)
+(default set: `quiz, flashcards, mind_map, slide_deck, audio, cinematic_video, infographic`)
 
 ---
 

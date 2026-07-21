@@ -47,6 +47,9 @@ from notebooklm import (
     ArtifactType,
     AudioFormat,
     AudioLength,
+    InfographicDetail,
+    InfographicOrientation,
+    InfographicStyle,
     NotebookLMClient,
     QuizDifficulty,
     QuizQuantity,
@@ -87,6 +90,9 @@ The flow of the material should resonate with the flow of the material attached.
 For parts which seem critical and relevant from exam point of view, the hosts can emphasize them explicitly.
 
 In the end, include a 2 minute crash course of whatever is covered in the audio."""
+INFOGRAPHIC_STYLE = InfographicStyle.INSTRUCTIONAL
+INFOGRAPHIC_ORIENTATION = InfographicOrientation.PORTRAIT
+INFOGRAPHIC_DETAIL = InfographicDetail.STANDARD
 
 # Which artifacts to generate per chapter. Any subset of ARTIFACT_SPECS keys.
 ARTIFACTS: list[str] = [
@@ -96,6 +102,7 @@ ARTIFACTS: list[str] = [
     "slide_deck",
     "audio",
     "cinematic_video",
+    "infographic",
 ]
 
 # Defaults (overridable on the CLI).
@@ -153,7 +160,12 @@ async def _gen_cinematic_video(c: NotebookLMClient, nb: str, sids: list[str]) ->
 
 
 async def _gen_infographic(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
-    s = await c.artifacts.generate_infographic(nb, sids, LANGUAGE)
+    s = await c.artifacts.generate_infographic(
+        nb, sids, LANGUAGE,
+        orientation=INFOGRAPHIC_ORIENTATION,
+        detail_level=INFOGRAPHIC_DETAIL,
+        style=INFOGRAPHIC_STYLE,
+    )
     return s.task_id
 
 

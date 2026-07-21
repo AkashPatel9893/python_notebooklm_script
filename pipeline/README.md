@@ -35,7 +35,7 @@ Useful flags on `generate` / `download` / `all`:
 | `--max-attempts N` | retries per row before giving up (default 3) |
 | `--only-failed` | only (re)process rows in `failed`/`partial` state |
 | `--limit N` | cap the number of rows (handy for a test run) |
-| `--artifacts a,b` | override which artifacts to make (default: `quiz,flashcards,mind_map,slide_deck,audio,cinematic_video`) |
+| `--artifacts a,b` | override which artifacts to make (default: `quiz,flashcards,mind_map,slide_deck,audio,cinematic_video,infographic`) |
 
 Examples:
 
@@ -70,6 +70,7 @@ output/
         slides.pdf
         audio.mp3
         cinematic_video.mp4
+        infographic.png
 ```
 
 ## Notes
