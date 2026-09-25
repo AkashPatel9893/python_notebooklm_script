@@ -37,11 +37,16 @@ import csv
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from notebooklm import (
     ArtifactType,
@@ -53,8 +58,12 @@ from notebooklm import (
     NotebookLMClient,
     QuizDifficulty,
     QuizQuantity,
+    RateLimitError,
+    RPCError,
     SlideDeckFormat,
     SlideDeckLength,
+    UsageActionKind,
+    UsageWindowKind,
 )
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +285,26 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
         "type": ArtifactType.DATA_TABLE,
     },
 }
+
+# Which live-usage-meter category each artifact is charged against
+# (`notebooklm usage --categories`). Used to skip an artifact up front when
+# Google reports insufficient quota, instead of firing it and watching it fail.
+USAGE_KIND: dict[str, UsageActionKind] = {
+    "study_guide": UsageActionKind.REPORTS,
+    "quiz": UsageActionKind.QUIZ,
+    "flashcards": UsageActionKind.FLASHCARDS,
+    "mind_map": UsageActionKind.MINDMAP,
+    "audio": UsageActionKind.AUDIO_OVERVIEW,
+    "video": UsageActionKind.VIDEO_OVERVIEW,
+    "cinematic_video": UsageActionKind.BREAKDOWNS_VIDEO,  # meter code 3 = cinematic
+    "infographic": UsageActionKind.INFOGRAPHIC,
+    "slide_deck": UsageActionKind.SLIDES,
+    "data_table": UsageActionKind.TABLES,
+}
+
+# Subscription tiers (AccountLimits.tier) that cannot generate cinematic video.
+# Opaque ids, not a ranking: 1=Standard/Free, 4=Plus (see docs/quota-limits.md).
+NO_CINEMATIC_TIERS = {1, 4}
 
 # --------------------------------------------------------------------------- #
 # CSV schema. Tracking columns cover only the ACTIVE artifacts (ARTIFACTS),
@@ -501,6 +530,8 @@ _RL_MARKERS = (
 
 def _looks_rate_limited(e: Exception) -> bool:
     """Heuristic: did this exception come from a Google rate limit / quota cap?"""
+    if isinstance(e, RateLimitError):
+        return True
     code = getattr(e, "error_code", None) or getattr(e, "code", None) or ""
     text = f"{code} {e}".lower()
     return any(m in text for m in _RL_MARKERS)
@@ -522,8 +553,235 @@ def roll_up(row: dict[str, str], kind: str, active: list[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Live usage meter (quota gate)
+# --------------------------------------------------------------------------- #
+
+
+IST = timezone(timedelta(hours=5, minutes=30))
+USAGE_EVERY = 120.0  # seconds between live usage tables during `generate` (0 = off)
+
+
+def _ist(ts: datetime) -> str:
+    """Render a UTC reset time in IST for the log."""
+    return ts.astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+
+
+def _reset_label(ts: datetime) -> str:
+    """'09:12 IST · in 4h 10m' today, '3 Oct 04:12 IST · in 6d 23h' otherwise."""
+    local, now_ist = ts.astimezone(IST), datetime.now(IST)
+    when = local.strftime("%H:%M IST") if local.date() == now_ist.date() \
+        else local.strftime("%-d %b %H:%M IST")
+    mins = max(0, int((local - now_ist).total_seconds() // 60))
+    days, rem = divmod(mins, 1440)
+    eta = f"{days}d {rem // 60}h" if days else f"{rem // 60}h {rem % 60:02d}m"
+    return f"{when} · in {eta}"
+
+
+class QuotaGate:
+    """Serialises "check the usage meter → kick off a generation" across chapters.
+
+    With --concurrency > 1, several chapters could otherwise read "sufficient"
+    at the same moment and all fire an expensive artifact, overdrawing the
+    budget together (how three slide decks failed at once). Holding one lock
+    around check + kickoff makes each chapter see the meter after the previous
+    kickoff. Waiting for completion happens outside the lock.
+
+    Fails open: if the meter is disabled/unavailable or the call errors, the
+    artifact is allowed and Google's own refusal handling takes over.
+    """
+
+    def __init__(self, client: NotebookLMClient) -> None:
+        self.client = client
+        self.lock = asyncio.Lock()
+
+    async def insufficient(self, name: str) -> str | None:
+        """Return a reason string if Google says there is no quota for `name`.
+
+        Caller must hold ``self.lock``.
+        """
+        kind = USAGE_KIND.get(name)
+        if kind is None:
+            return None
+        try:
+            usage = await self.client.settings.get_usage()
+        except Exception as e:  # noqa: BLE001 — meter is advisory; never block on it
+            log.debug("usage meter unavailable (%s) — not gating %s", e, name)
+            return None
+        if not usage.available:
+            return None
+        action = usage.action(kind)
+        if action is None or action.has_sufficient_quota:
+            return None
+        window = usage.active_window
+        cost = action.estimated_cost_percent
+        reason = f"insufficient quota for {name}"
+        if cost is not None:
+            reason += f" (needs ~{cost:.1f}%"
+            if window is not None:
+                reason += f", {window.remaining_percent:.1f}% left"
+            reason += ")"
+        if window is not None:
+            reason += f"; resets {_ist(window.resets_at)}"
+        return reason
+
+
+def _bar(used: float, width: int = 20) -> Text:
+    filled = max(0, min(width, round(used / 100 * width)))
+    style = "green" if used < 60 else "yellow" if used < 90 else "red"
+    bar = Text("█" * filled, style=style)
+    bar.append("░" * (width - filled), style="bright_black")
+    return bar
+
+
+def show_usage(usage: Any, active: list[str]) -> None:
+    """Two tables: the usage windows, then what each active artifact costs."""
+    windows = Table(title=f"NotebookLM usage · {datetime.now(IST).strftime('%H:%M:%S')}",
+                    title_style="bold", header_style="bold", border_style="bright_black")
+    windows.add_column("window")
+    windows.add_column("used", justify="right")
+    windows.add_column("", no_wrap=True)
+    windows.add_column("left", justify="right")
+    windows.add_column("resets", no_wrap=True)
+    plain = []
+    for kind in (UsageWindowKind.FIVE_HOUR, UsageWindowKind.WEEKLY):
+        w = usage.window(kind)
+        if w is None:
+            continue
+        label = kind.name.lower().replace("_", "-")
+        style = "green" if w.used_percent < 60 else "yellow" if w.used_percent < 90 else "bold red"
+        windows.add_row(label, Text(f"{w.used_percent:.1f}%", style=style), _bar(w.used_percent),
+                        f"{w.remaining_percent:.1f}%", _reset_label(w.resets_at))
+        plain.append(f"usage {label}: {w.used_percent:.1f}% used, "
+                     f"{w.remaining_percent:.1f}% left, resets {_ist(w.resets_at)}")
+    show_table(windows, plain)
+
+    active_w = usage.active_window
+    left = active_w.remaining_percent if active_w is not None else None
+    costs = Table(header_style="bold", border_style="bright_black")
+    costs.add_column("artifact")
+    costs.add_column("cost", justify="right")
+    costs.add_column("quota", justify="center")
+    costs.add_column("fits now", justify="right")
+    plain, total = [], 0.0
+    for name in active:
+        kind = USAGE_KIND.get(name)
+        a = usage.action(kind) if kind is not None else None
+        if a is None:
+            continue
+        cost = a.estimated_cost_percent
+        total += cost or 0.0
+        n = 0 if not cost or left is None else int(left // cost)
+        if a.has_sufficient_quota:
+            n = max(n, 1)  # Google's own verdict wins over our estimate
+        fits = "?" if not cost or left is None else f"×{n}"
+        costs.add_row(name, f"{cost:.1f}%" if cost is not None else "?",
+                      Text("ok", style="green") if a.has_sufficient_quota
+                      else Text("insufficient", style="bold red"),
+                      fits)
+        plain.append(f"  {name:<16} cost~{cost if cost is not None else '?'}%  "
+                     f"{'ok' if a.has_sufficient_quota else 'INSUFFICIENT'}")
+    costs.caption = f"1 chapter ≈ {total:.0f}% of window"
+    show_table(costs, plain)
+
+
+async def usage_monitor(client: NotebookLMClient, active: list[str], every: float) -> None:
+    """Re-print the usage tables every `every` seconds until cancelled."""
+    while True:
+        await asyncio.sleep(every)
+        try:
+            usage = await client.settings.get_usage()
+        except Exception as e:  # noqa: BLE001 — a missed refresh is harmless
+            log.debug("usage refresh failed: %s", e)
+            continue
+        if usage.available:
+            show_usage(usage, active)
+
+
+async def preflight(client: NotebookLMClient, active: list[str], n_chapters: int,
+                    concurrency: int) -> bool:
+    """Log plan tier + live usage before a generate run.
+
+    Returns False (abort the run) only when the meter says the active window
+    is fully exhausted — nothing could be generated until it resets.
+    """
+    fields: list[tuple[str, Any]] = [
+        ("chapters", f"{n_chapters}  ({concurrency} in parallel)"),
+        ("artifacts", artifact_list(active)),
+    ]
+    limits = None
+    try:
+        limits = await client.settings.get_account_limits()
+        plan = TIER_NAMES.get(limits.tier or 0, f"tier {limits.tier}")
+        fields.append(("account", Text.assemble(
+            (plan, "bold green"),
+            (f"  ·  {limits.notebook_limit} notebooks  ·  "
+             f"{limits.source_limit} sources/notebook", "")
+        )))
+    except Exception as e:  # noqa: BLE001 — informational only
+        fields.append(("account", Text(f"unavailable ({e})", style="yellow")))
+    show_header("Generate", fields)
+
+    try:
+        if limits is None:
+            raise RuntimeError("no limits")
+        if "cinematic_video" in active and limits.tier in NO_CINEMATIC_TIERS:
+            log.warning("%s plan cannot generate cinematic_video — it will be skipped; "
+                        "use 'video' instead (--artifacts ...)",
+                        TIER_NAMES.get(limits.tier or 0, limits.tier))
+    except RuntimeError:
+        pass
+
+    try:
+        usage = await client.settings.get_usage()
+    except Exception as e:  # noqa: BLE001 — informational only
+        log.warning("could not read usage meter: %s", e)
+        return True
+    if not usage.available:
+        log.info("usage meter %s — not gating on quota", usage.status.value)
+        return True
+    show_usage(usage, active)
+    if usage.is_exhausted:
+        w = usage.active_window
+        log.error("usage window exhausted — nothing can be generated until %s",
+                  _ist(w.resets_at) if w is not None else "it resets")
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Phase 1: generate
 # --------------------------------------------------------------------------- #
+
+
+async def _kickoff(
+    client: NotebookLMClient,
+    nb_id: str,
+    sids: list[str],
+    name: str,
+    spec: dict[str, Any],
+    prev_id: str,
+    key: str,
+) -> str:
+    """Start generation for one artifact and return its id.
+
+    If a previous attempt left an artifact id (and it wasn't adopted as
+    completed / in flight, so it failed or vanished), retry it IN PLACE — the
+    UI "Retry" action — so the notebook keeps one entry per artifact and the id
+    in progress.csv stays stable. A quota refusal raises RateLimitError, which
+    the caller records as rate_limited. Any other refusal (not retryable,
+    artifact gone) falls back to a fresh generation.
+    """
+    if prev_id and not spec["sync_gen"]:
+        try:
+            st = await client.artifacts.retry_failed(nb_id, prev_id)
+            log.info("[%s] retrying %s in place (%s)", key, name, sid(st.task_id))
+            return st.task_id
+        except RateLimitError:
+            raise
+        except RPCError as e:
+            log.info("[%s] %s retry-in-place refused (%s) — generating fresh", key, name, e)
+    log.info("[%s] generating %s", key, name)
+    return await spec["generate"](client, nb_id, sids)
 
 
 async def generate_row(
@@ -534,6 +792,7 @@ async def generate_row(
     sem: asyncio.Semaphore,
     max_attempts: int,
     nb_index: dict[str, str],
+    gate: QuotaGate,
 ) -> None:
     key = row_key(row)
     async with sem:
@@ -573,12 +832,12 @@ async def generate_row(
             if not row.get("notebook_id"):
                 if title in nb_index:
                     row["notebook_id"] = nb_index[title]
-                    log.info("[%s] adopted existing notebook %s", key, nb_index[title])
+                    log.info("[%s] adopted existing notebook %s", key, sid(nb_index[title]))
                 else:
                     nb = await client.notebooks.create(title)
                     row["notebook_id"] = nb.id
                     nb_index[title] = nb.id
-                    log.info("[%s] created notebook %s", key, nb.id)
+                    log.info("[%s] created notebook %s", key, sid(nb.id))
                 await store.save()
             nb_id = row["notebook_id"]
 
@@ -588,7 +847,7 @@ async def generate_row(
                 existing = await client.sources.list(nb_id)
                 if existing:
                     row["source_id"] = existing[0].id
-                    log.info("[%s] adopted existing source %s", key, existing[0].id)
+                    log.info("[%s] adopted existing source %s", key, sid(existing[0].id))
                 else:
                     log.info("[%s] uploading source", key)
                     src = await client.sources.add_file(
@@ -599,7 +858,7 @@ async def generate_row(
             await client.sources.wait_until_ready(
                 nb_id, row["source_id"], timeout=SOURCE_READY_TIMEOUT
             )
-            log.info("[%s] source ready %s", key, row["source_id"])
+            log.info("[%s] source ready (%s)", key, sid(row["source_id"]))
             sids = [row["source_id"]]
 
             # 4. Artifacts (sequential within a chapter; chapters run in parallel).
@@ -615,17 +874,26 @@ async def generate_row(
                     if existing_art is not None and existing_art.is_completed:
                         row[f"{name}_id"] = existing_art.id
                         row[f"{name}_gen"] = "done"
-                        log.info("[%s] %s already present — adopted %s",
-                                 key, name, existing_art.id)
+                        log.info("[%s] %s already present — adopted (%s)",
+                                 key, name, sid(existing_art.id))
                         continue
 
                     if existing_art is not None:
                         art_id = existing_art.id
-                        log.info("[%s] %s already in flight — waiting on %s",
-                                 key, name, art_id)
+                        log.info("[%s] %s already in flight — waiting (%s)",
+                                 key, name, sid(art_id))
                     else:
-                        log.info("[%s] generating %s", key, name)
-                        art_id = await spec["generate"](client, nb_id, sids)
+                        # Check the meter and kick off under one lock so parallel
+                        # chapters can't all spend the same remaining quota.
+                        async with gate.lock:
+                            reason = await gate.insufficient(name)
+                            if reason:
+                                row[f"{name}_gen"] = "rate_limited"
+                                row["gen_error"] = f"{name}: {reason}"[:500]
+                                log.warning("[%s] %s SKIPPED — %s", key, name, reason)
+                                continue
+                            art_id = await _kickoff(client, nb_id, sids, name, spec,
+                                                    row.get(f"{name}_id", ""), key)
                     # Persist the id BEFORE waiting, so a crash mid-wait lets the
                     # next run adopt this artifact instead of regenerating it.
                     row[f"{name}_id"] = art_id or ""
@@ -684,18 +952,25 @@ async def phase_generate(args: argparse.Namespace) -> None:
     if not targets:
         log.info("nothing to generate")
         return
-    log.info("generating %d chapter(s), %d concurrent, artifacts=%s",
-             len(targets), args.concurrency, ",".join(active))
 
     sem = asyncio.Semaphore(args.concurrency)
     async with NotebookLMClient.from_storage() as client:
+        if not await preflight(client, active, len(targets), args.concurrency):
+            return
+        gate = QuotaGate(client)
         # Title→id map of existing notebooks, so an interrupted prior run can
         # adopt its notebook instead of creating a duplicate.
         nb_index = {nb.title: nb.id for nb in await client.notebooks.list()}
-        await asyncio.gather(*[
-            generate_row(client, store, row, active, sem, args.max_attempts, nb_index)
-            for row in targets
-        ])
+        monitor = (asyncio.create_task(usage_monitor(client, active, args.usage_every))
+                   if args.usage_every > 0 else None)
+        try:
+            await asyncio.gather(*[
+                generate_row(client, store, row, active, sem, args.max_attempts, nb_index, gate)
+                for row in targets
+            ])
+        finally:
+            if monitor is not None:
+                monitor.cancel()
     summarize(store)
 
 
@@ -770,7 +1045,8 @@ async def phase_download(args: argparse.Namespace) -> None:
     if not targets:
         log.info("nothing to download (run `generate` first)")
         return
-    log.info("downloading %d chapter(s), %d concurrent", len(targets), args.concurrency)
+    show_header("Download", [("chapters", f"{len(targets)}  ({args.concurrency} in parallel)"),
+                             ("artifacts", artifact_list(active))])
 
     sem = asyncio.Semaphore(args.concurrency)
     async with NotebookLMClient.from_storage() as client:
@@ -824,14 +1100,45 @@ def select_rows(
 
 
 def summarize(store: Store) -> None:
+    """Per-chapter × per-artifact status grid (coloured table on the console)."""
     rows = list(store.rows.values())
-    def tally(field: str) -> dict[str, int]:
-        out: dict[str, int] = {}
-        for r in rows:
-            out[r.get(field) or "pending"] = out.get(r.get(field) or "pending", 0) + 1
-        return out
-    log.info("── summary ──  total=%d  gen=%s  dl=%s",
-             len(rows), tally("gen_status"), tally("dl_status"))
+    if not rows:
+        log.info("summary: no chapters tracked yet")
+        return
+    wide = console.width >= 110
+    table = Table(title="Pipeline status", title_style="bold", header_style="bold",
+                  border_style="bright_black", box=box.SIMPLE_HEAVY, pad_edge=False, collapse_padding=True)
+    table.add_column("chapter", style="bold", no_wrap=True, min_width=KEY_WIDTH - 3)
+    for a in ARTIFACTS:
+        head = SHORT_NAME.get(a, a[:5])
+        table.add_column(head, justify="center", no_wrap=True, min_width=len(head))
+    table.add_column("gen", justify="center", no_wrap=True, min_width=7)
+    narrow = console.width < 90
+    if not narrow:
+        table.add_column("dl", justify="center", no_wrap=True, min_width=7)
+    if wide:
+        table.add_column("notebook", style="dim", no_wrap=True)
+
+    plain = []
+    for r in rows:
+        key = short_key(row_key(r))
+        cells = [CELL.get(r.get(f"{a}_gen", ""), CELL[""]) for a in ARTIFACTS]
+        gen = r.get("gen_status") or "pending"
+        dl = r.get("dl_status") or "pending"
+        table.add_row(Text(key, style=key_style(key)), *[Text(c[0], style=c[1]) for c in cells],
+                      Text(gen, style=STATUS_STYLE.get(gen, "")),
+                      *([Text(dl, style=STATUS_STYLE.get(dl, ""))] if not narrow else []),
+                      *([(r.get("notebook_id") or "")[:8]] if wide else []))
+        plain.append(f"{key:<24} " + " ".join(c[0] for c in cells) + f"  gen={gen} dl={dl}")
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        k = r.get("gen_status") or "pending"
+        counts[k] = counts.get(k, 0) + 1
+    table.caption = ("[green]✓ done[/]   [red]✗ failed[/]   [yellow]⏸ no quota / rate-limited[/]"
+                     "   [bright_black]· not yet[/]\n"
+                     + "  ".join(f"{k}={v}" for k, v in counts.items()))
+    show_table(table, plain)
 
 
 def cmd_status(_: argparse.Namespace) -> None:
@@ -840,10 +1147,6 @@ def cmd_status(_: argparse.Namespace) -> None:
     if not store.rows:
         print("No progress.csv yet. Run `python run.py sync`.")
         return
-    print(f"{'CLASS':<9} {'SUBJECT':<12} {'CHAPTER':<11} {'GEN':<8} {'DL':<8} {'NOTEBOOK'}")
-    for r in store.rows.values():
-        print(f"{r['class']:<9} {r['subject']:<12} {r['chapter']:<11} "
-              f"{r.get('gen_status',''):<8} {r.get('dl_status',''):<8} {r.get('notebook_id','')}")
     summarize(store)
 
 
@@ -870,17 +1173,171 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--limit", type=int, default=0, help="cap number of rows (0 = all)")
     p.add_argument("--artifacts", type=str, default="",
                    help=f"comma list (default: {','.join(ARTIFACTS)}); valid: {','.join(ARTIFACT_SPECS)}")
+    p.add_argument("--usage-every", type=float, default=USAGE_EVERY, metavar="SECONDS",
+                   help=f"re-print the live usage tables this often while generating "
+                        f"(default {USAGE_EVERY:.0f}; 0 = off)")
+
+
+# --------------------------------------------------------------------------- #
+# Logging: a clean console view + the full detail in pipeline.log
+# --------------------------------------------------------------------------- #
+
+
+console = Console(highlight=False)  # colours only on a real terminal
+
+SHORT_NAME = {"study_guide": "study", "flashcards": "flash", "mind_map": "mind",
+              "slide_deck": "slide", "cinematic_video": "cine", "infographic": "info",
+              "data_table": "table"}
+CELL = {"done": ("✓", "bold green"), "failed": ("✗", "bold red"),
+        "rate_limited": ("⏸", "yellow"), "": ("·", "bright_black")}
+STATUS_STYLE = {"done": "green", "partial": "yellow", "rate_limited": "yellow",
+                "failed": "red", "pending": "bright_black"}
+_KEY_PALETTE = ["cyan", "magenta", "blue", "green", "bright_cyan", "bright_magenta",
+                "bright_blue", "bright_green"]
+KEY_WIDTH = 24
+
+
+def short_key(key: str) -> str:
+    """'Class 11|Chemistry|Chapter 1' -> 'C11 · Chemistry · Ch1'."""
+    parts = key.split("|")
+    if len(parts) != 3:
+        return key
+    cls, subject, chapter = parts
+    return (f"C{cls.replace('Class', '').strip()} · {subject} · "
+            f"Ch{chapter.replace('Chapter', '').strip()}")
+
+
+def key_style(key: str) -> str:
+    """A stable colour per chapter, so interleaved lines are easy to follow."""
+    return "bold " + _KEY_PALETTE[sum(map(ord, key)) % len(_KEY_PALETTE)]
+
+
+def show_table(table: Table, plain_lines: list[str]) -> None:
+    """Render a table on the console; write a plain-text copy to pipeline.log."""
+    console.print(table)
+    for line in plain_lines:
+        log.info(line, extra={"file_only": True})
+
+
+TIER_NAMES = {1: "Standard (free)", 2: "Pro", 3: "Ultra 20 TB", 4: "Plus",
+              5: "Expanded", 6: "Ultra 30 TB"}
+
+
+def sid(x: str | None) -> str:
+    """Short id for display (full ids stay in progress.csv / pipeline.log)."""
+    return (x or "")[:8]
+
+
+def show_header(title: str, fields: list[tuple[str, Any]]) -> None:
+    """A boxed key/value panel at the start of a run."""
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bright_black", no_wrap=True)
+    grid.add_column()
+    for label, value in fields:
+        grid.add_row(label, value)
+    console.print(Panel(grid, title=f"[bold]{title}[/]", title_align="left",
+                        border_style="cyan", expand=False))
+    for label, value in fields:
+        log.info("%s: %s", label, value.plain if isinstance(value, Text) else value,
+                 extra={"file_only": True})
+
+
+def artifact_list(names: list[str]) -> Text:
+    out = Text()
+    for i, n in enumerate(names):
+        if i:
+            out.append(" · ", style="bright_black")
+        out.append(n, style="bold")
+    return out
+
+
+class ConsoleHandler(logging.Handler):
+    """One coloured, aligned line per pipeline event:
+
+        04:56:06  C11 · Chemistry · Ch1    ✓ slide_deck done
+        04:50:01  C11 · Chemistry · Ch2    ⚠ slide_deck RATE-LIMITED — will retry
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()  # already scrubbed in place by the redaction filter
+            key = ""
+            if msg.startswith("[") and "] " in msg:
+                raw_key, msg = msg[1:].split("] ", 1)
+                key = short_key(raw_key)
+
+            line = Text()
+            line.append(datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
+                        style="bright_black")
+            line.append("  ")
+            if key:
+                line.append(key.ljust(KEY_WIDTH), style=key_style(key))
+                line.append(" ")
+
+            if record.levelno >= logging.ERROR:
+                icon, style = "✖ ", "bold red"
+            elif record.levelno >= logging.WARNING:
+                icon, style = "⚠ ", "yellow"
+            elif (msg.endswith(" done") or "already present" in msg or msg.endswith("=done")
+                  or msg.startswith("source ready")):
+                icon, style = "✓ ", "green"
+            elif key and msg.startswith(("generating", "retrying", "downloading", "uploading",
+                                         "created")):
+                icon, style = "▶ ", ""
+            elif "waiting" in msg or "in flight" in msg:
+                icon, style = "⏳ ", ""
+            else:
+                icon, style = "  ", ""
+            line.append(icon, style=style)
+
+            # Highlight the artifact name wherever it appears first.
+            body = Text(msg, style=style)
+            for name in sorted(ARTIFACT_SPECS, key=len, reverse=True):  # cinematic_video before video
+                idx = msg.find(name)
+                if idx != -1:
+                    body.stylize("bold " + (style or "white"), idx, idx + len(name))
+                    break
+            line.append_text(body)
+            console.print(line, soft_wrap=True)
+        except Exception:  # noqa: BLE001 — logging must never crash the run
+            self.handleError(record)
+
+
+def setup_logging(verbose: bool) -> None:
+    """Console: coloured pipeline events only (or everything with -v). File: everything."""
+    from notebooklm._logging import apply_redaction
+
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    file_h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s"))
+
+    console_h = ConsoleHandler()
+    console_h.addFilter(lambda r: not getattr(r, "file_only", False))
+    if not verbose:
+        # Library/HTTP chatter (polling requests, RPC errors the pipeline
+        # already reports in its own words) stays in pipeline.log only.
+        console_h.addFilter(lambda r: r.name == "pipeline" or r.name.startswith("pipeline."))
+
+    # Scrub credentials from both sinks, then drop the library's own stderr
+    # handler — it would print its records a second time in another format.
+    for h in (file_h, console_h):
+        apply_redaction(h)
+        root.addHandler(h)
+    nb_logger = logging.getLogger("notebooklm")
+    for h in list(nb_logger.handlers):
+        nb_logger.removeHandler(h)
+    nb_logger.setLevel(logging.INFO)
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout),
-                  logging.FileHandler(LOG_FILE, encoding="utf-8")],
-    )
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="also show library + HTTP request logs on the console")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("sync", help="pull sheet into progress.csv").set_defaults(fn=cmd_sync)
@@ -892,6 +1349,9 @@ def main() -> None:
             acquire_lock()
             try:
                 asyncio.run(coro_factory(ns))
+            except KeyboardInterrupt:
+                log.warning("interrupted — progress is saved; re-run the same command to resume")
+                sys.exit(130)
             finally:
                 release_lock()
         return runner
@@ -914,6 +1374,7 @@ def main() -> None:
     a.set_defaults(fn=locked(_all))
 
     args = parser.parse_args()
+    setup_logging(args.verbose)
     args.fn(args)
 
 
