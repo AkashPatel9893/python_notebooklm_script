@@ -1,21 +1,31 @@
-"""Tests for auth storage and loader behavior (split from tests/unit/test_auth.py for D1 PR-2).
+"""Tests for auth storage and loader behavior (split in D1 PR-2).
 
 This file owns one concern from the auth subpackage. The original
-``tests/unit/test_auth.py`` (4090 LOC) was split into six concern-aligned
-files alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
+monolithic auth test module was split into six concern-aligned files
+alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
 (superseded) and ADR-0007 (test-monkeypatch policy) for the rationale.
 """
 
+import asyncio
+import inspect
 import json
+import warnings
+from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
+from notebooklm._auth.cookies import load_httpx_cookies
+from notebooklm._auth.tokens import load_auth_from_storage
 from notebooklm.auth import (
     AuthTokens,
-    load_auth_from_storage,
-    load_httpx_cookies,
 )
+
+
+class _Abort(BaseException):
+    pass
 
 
 def test_load_auth_from_storage_lives_in_private_module() -> None:
@@ -341,17 +351,22 @@ class TestAuthTokensFromStorage:
         html = '"SNlM0e":"csrf_token" "FdrFJe":"session_id"'
         httpx_mock.add_response(content=html.encode())
 
-        tokens = await AuthTokens.from_storage(storage_file)
+        with pytest.warns(DeprecationWarning, match="AuthTokens.from_storage"):
+            tokens = await AuthTokens.from_storage(storage_file)
 
         assert tokens.cookies[("SID", ".google.com", "/")] == "sid"
-        assert tokens.flat_cookies["SID"] == "sid"
+        with pytest.warns(DeprecationWarning, match="flat_cookies"):
+            assert tokens.flat_cookies["SID"] == "sid"
         assert tokens.csrf_token == "csrf_token"
         assert tokens.session_id == "session_id"
 
     @pytest.mark.asyncio
     async def test_from_storage_file_not_found(self, tmp_path):
         """Test raises error when storage file doesn't exist."""
-        with pytest.raises(FileNotFoundError):
+        with (
+            pytest.raises(FileNotFoundError),
+            pytest.warns(DeprecationWarning, match="AuthTokens.from_storage"),
+        ):
             await AuthTokens.from_storage(tmp_path / "nonexistent.json")
 
     @pytest.mark.asyncio
@@ -390,12 +405,136 @@ class TestAuthTokensFromStorage:
         html = '"SNlM0e":"csrf_token" "FdrFJe":"session_id"'
         httpx_mock.add_response(content=html.encode())
 
-        tokens = await AuthTokens.from_storage(storage_file)
+        with pytest.warns(DeprecationWarning, match="AuthTokens.from_storage"):
+            tokens = await AuthTokens.from_storage(storage_file)
 
         sid = next(c for c in tokens.cookie_jar.jar if c.name == "SID")
         assert sid.path == "/u/0/"
         assert sid.secure is True
         assert sid.has_nonstandard_attr("HttpOnly")
+
+    @pytest.mark.asyncio
+    async def test_warning_is_attributed_to_await_site_and_precedes_loader(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from notebooklm._auth import tokens as tokens_module
+
+        returned = object()
+        events: list[str] = []
+
+        async def load(_self, **kwargs):
+            assert len(caught) == 1
+            events.append("load")
+            assert kwargs == {
+                "path": Path("credential-path.json"),
+                "profile": "work",
+                "policy": tokens_module.LoadPolicy(allow_headless=True),
+                "auth_type": AuthTokens,
+            }
+            return SimpleNamespace(auth=returned)
+
+        monkeypatch.setattr(tokens_module.StoredAuthLoader, "load", load)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            warning_line = inspect.currentframe().f_lineno + 1
+            result = await AuthTokens.from_storage(
+                Path("credential-path.json"), profile="work", allow_headless=True
+            )
+
+        assert result is returned
+        assert events == ["load"]
+        assert len(caught) == 1
+        assert caught[0].category is DeprecationWarning
+        assert caught[0].filename == __file__
+        assert caught[0].lineno == warning_line
+        assert "credential-path.json" not in str(caught[0].message)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error", [ValueError("bad"), asyncio.CancelledError(), _Abort("abort")]
+    )
+    async def test_warning_preserves_loader_error_identity(
+        self, monkeypatch: pytest.MonkeyPatch, error: BaseException
+    ) -> None:
+        from notebooklm._auth import tokens as tokens_module
+
+        async def load(_self, **_kwargs):
+            raise error
+
+        monkeypatch.setattr(tokens_module.StoredAuthLoader, "load", load)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(type(error)) as excinfo:
+                await AuthTokens.from_storage(Path("secret-profile.json"))
+        assert excinfo.value is error
+        assert len(caught) == 1
+        assert "secret-profile.json" not in str(caught[0].message)
+
+
+class TestAuthTokensSyncStorageDeprecation:
+    def test_exact_predicate_and_user_stacklevel(self, tmp_path: Path) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            warning_line = inspect.currentframe().f_lineno + 1
+            AuthTokens(
+                {},
+                "csrf-secret",
+                "session-secret",
+                storage_path=tmp_path / "secret.json",
+            )
+        assert len(caught) == 1
+        assert caught[0].category is DeprecationWarning
+        assert caught[0].filename == __file__
+        assert caught[0].lineno == warning_line
+        assert "secret.json" not in str(caught[0].message)
+        assert "csrf-secret" not in str(caught[0].message)
+        assert "session-secret" not in str(caught[0].message)
+
+        supplied = httpx.Cookies()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            AuthTokens(
+                {}, "csrf", "session", storage_path=Path("storage.json"), cookie_jar=supplied
+            )
+            AuthTokens({}, "csrf", "session")
+        assert caught == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [ValueError("ordinary"), asyncio.CancelledError(), _Abort("abort")],
+    )
+    def test_warning_precedes_fallback_and_preserves_error_identity(
+        self, error: BaseException
+    ) -> None:
+        class ExplodingPath:
+            def exists(self) -> bool:
+                raise error
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(type(error)) as excinfo:
+                AuthTokens({}, "csrf", "session", storage_path=ExplodingPath())  # type: ignore[arg-type]
+        assert excinfo.value is error
+        assert len(caught) == 1
+
+    def test_normalization_failure_is_warning_free(self) -> None:
+        error = ValueError("bad cookie shape")
+
+        class ExplodingCookies(dict):
+            def items(self):
+                raise error
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError) as excinfo:
+                AuthTokens(
+                    ExplodingCookies({"SID": "secret"}),
+                    "csrf",
+                    "session",
+                    storage_path=Path("x"),
+                )
+        assert excinfo.value is error
+        assert caught == []
 
 
 class TestLoaderFlatCookieParity:
@@ -445,9 +584,11 @@ class TestLoaderFlatCookieParity:
         httpx_mock.add_response(content=html.encode())
 
         cli_cookies = load_auth_from_storage(storage_file)
-        lib_tokens = await AuthTokens.from_storage(storage_file)
+        with pytest.warns(DeprecationWarning, match="AuthTokens.from_storage"):
+            lib_tokens = await AuthTokens.from_storage(storage_file)
 
-        assert cli_cookies["OSID"] == lib_tokens.flat_cookies["OSID"]
+        with pytest.warns(DeprecationWarning, match="flat_cookies"):
+            assert cli_cookies["OSID"] == lib_tokens.flat_cookies["OSID"]
         assert cli_cookies["OSID"] == "from-notebooklm"
 
     @pytest.mark.asyncio
@@ -478,10 +619,12 @@ class TestLoaderFlatCookieParity:
         httpx_mock.add_response(content=html.encode())
 
         cli_cookies = load_auth_from_storage(storage_file)
-        lib_tokens = await AuthTokens.from_storage(storage_file)
+        with pytest.warns(DeprecationWarning, match="AuthTokens.from_storage"):
+            lib_tokens = await AuthTokens.from_storage(storage_file)
 
         assert cli_cookies["SID"] == "from-base"
-        assert lib_tokens.flat_cookies["SID"] == "from-base"
+        with pytest.warns(DeprecationWarning, match="flat_cookies"):
+            assert lib_tokens.flat_cookies["SID"] == "from-base"
 
 
 # =============================================================================

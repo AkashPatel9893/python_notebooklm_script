@@ -16,7 +16,7 @@ a different cancel-injection site:
 - ``_rotate_cookies`` monkeypatched to hang on an unset ``asyncio.Event``
   so the keepalive task is genuinely parked when close starts cancelling
   it. CancelledError is intentionally NOT trapped — the keepalive task
-  must remain cancellable so that ``_core.close()`` can tear it down and
+  must remain cancellable so that ``client.close()`` can tear it down and
   reach the shielded ``aclose`` block.
 - The httpx client's ``aclose`` is also monkeypatched to insert a short
   ``await asyncio.sleep(0.2)`` so the close path doesn't run to
@@ -26,7 +26,7 @@ a different cancel-injection site:
 - ``__aexit__`` driven through :func:`asyncio.wait_for(timeout=0.1)` so
   the outer cancel reliably arrives while the slowed ``aclose`` is in
   flight — i.e. inside the shielded await.
-- We hold a reference to ``client._collaborators.kernel.http_client`` captured before
+- We hold a reference to ``client._web_runtime.kernel.http_client`` captured before
   the cancel (close nulls the attribute on success) and assert
   ``http_client_ref.is_closed`` is true afterwards — proof that the
   shielded ``aclose`` in the outer ``finally`` ran to completion.
@@ -48,6 +48,12 @@ from pytest_httpx import HTTPXMock
 
 from notebooklm import NotebookLMClient
 from notebooklm.auth import AuthTokens
+from notebooklm.options import (
+    ClientConfig,
+    WebBackendConfig,
+    WebSessionHooks,
+    WebSessionOptions,
+)
 
 ROTATE_URL_RE = re.compile(r"^https://accounts\.google\.com/RotateCookies$")
 
@@ -90,9 +96,9 @@ async def test_close_during_keepalive_cancel_does_not_leak_transport(
     - ``__aexit__`` wrapped in ``wait_for(timeout=0.1)`` so the cancel
       fires during ``aclose``.
 
-    The shield in :meth:`Session.close` wraps
-    ``self._kernel.http_client.aclose()`` in ``asyncio.shield`` inside an
-    outer ``finally``. Without that shield, a cancel arriving inside
+    The shield in ``NotebookLMClient.close`` / ``ClientLifecycle.close`` wraps
+    the httpx client's ``aclose()`` in ``asyncio.shield`` inside an outer
+    ``finally``. Without that shield, a cancel arriving inside
     ``aclose`` aborts the close and leaks the httpx transport. With
     it, the captured ``http_client_ref.is_closed`` must read ``True``
     once the shielded Task has had a moment to finish.
@@ -110,14 +116,14 @@ async def test_close_during_keepalive_cancel_does_not_leak_transport(
 
     # The unset event the patched rotate hangs on. Never set by the
     # test — the keepalive task's only exit is the ``CancelledError``
-    # that ``_core.close()`` injects via ``_keepalive_task.cancel()``.
+    # that ``client.close()`` injects via ``_keepalive_task.cancel()``.
     hang_event = asyncio.Event()
     rotate_entered = asyncio.Event()
 
     async def _hanging_rotate(*_args: object, **_kwargs: object) -> None:
         """Park the keepalive loop on an unset event.
 
-        With keepalive's poke stuck here, ``_core.close()`` has to
+        With keepalive's poke stuck here, ``client.close()`` has to
         cancel the keepalive task and ``gather()`` it before reaching
         ``save_cookies`` and the shielded ``aclose``. The outer
         ``wait_for(timeout=0.1)`` below — combined with the patched
@@ -145,9 +151,15 @@ async def test_close_during_keepalive_cancel_does_not_leak_transport(
     # keepalive actually fires within the test window.
     client = NotebookLMClient(
         keepalive_auth,
-        keepalive=0.05,
-        keepalive_min_interval=0.01,
-        cookie_rotator=_hanging_rotate,
+        config=ClientConfig(
+            backend=WebBackendConfig(
+                session=WebSessionOptions(
+                    keepalive_interval=0.05,
+                    keepalive_min_interval=0.01,
+                ),
+                hooks=WebSessionHooks(cookie_rotator=_hanging_rotate),
+            ),
+        ),
     )
 
     # Open the client and let the keepalive loop enter ``_rotate_cookies``
@@ -155,9 +167,9 @@ async def test_close_during_keepalive_cancel_does_not_leak_transport(
     await client.__aenter__()
     try:
         # Save the transport ref BEFORE the cancel — successful close
-        # sets ``_core._kernel.http_client = None`` (inner finally), so we'd
+        # clears ``client._web_runtime.kernel.http_client`` (inner finally), so we'd
         # have no handle otherwise.
-        http_client_ref = client._collaborators.kernel.get_http_client()
+        http_client_ref = client._web_runtime.kernel.get_http_client()
         assert http_client_ref is not None, "open() must have installed a transport"
 
         # Slow down ``aclose()`` so the outer ``wait_for(timeout=0.1)``
@@ -180,10 +192,9 @@ async def test_close_during_keepalive_cancel_does_not_leak_transport(
             await asyncio.sleep(0.2)
             await original_aclose()
 
-        # Patching the bound method on the instance — _core.close()
-        # calls through ``self._kernel.http_client.aclose()`` which dispatches off
-        # the instance attribute first. ``setattr`` shadows the class
-        # method for this one instance.
+        # Patching the bound method on the instance — lifecycle close calls through
+        # the current httpx client and dispatches off the instance attribute first.
+        # ``setattr`` shadows the class method for this one instance.
         monkeypatch.setattr(http_client_ref, "aclose", _slow_aclose)
 
         # Wait for the patched rotate to be called at least once so the
@@ -227,7 +238,7 @@ async def test_close_during_keepalive_cancel_does_not_leak_transport(
 
         assert http_client_ref.is_closed, (
             "transport leaked: cancel during _slow_aclose left the httpx "
-            "client open — the asyncio.shield in Session.close was "
+            "client open — the asyncio.shield in NotebookLMClient.close was "
             "either removed, repositioned, or no longer wraps aclose()"
         )
     finally:
@@ -246,38 +257,31 @@ async def test_cancel_during_drain_in_close_does_not_leak_transport(
     Sibling test to ``test_close_during_keepalive_cancel_does_not_leak_transport``
     above. That test covers the shielded inner-close path (cancel lands
     *inside* ``aclose`` while lifecycle close is already running). This
-    test covers the **outer-wrapper** path (cancel lands while
-    ``NotebookLMClient.close()`` is still awaiting ``self.drain(...)``,
-    i.e. BEFORE lifecycle close is reached). Audit finding I12
-    (``architecture-audit.md``) flagged that the public wrapper at
-    ``client.py:close()`` awaits ``self.drain(...)`` *before* calling
-    lifecycle close with no protection; if the caller task is
-    cancelled while drain is parked on an in-flight operation,
-    ``CancelledError`` propagates out of ``close()`` and the shielded
-    lifecycle close / ``Kernel.aclose()`` never runs — leaking the
-    live ``httpx.AsyncClient``.
+    test covers the root lifecycle's graceful prephase (cancel lands while
+    ``ClientLifecycle.close()`` is waiting for supervised work to settle,
+    before resource teardown begins). The B0 lifecycle owns both the graceful
+    wait and teardown as one retained close wave: cancelling its first waiter
+    aborts the graceful prephase, completes teardown, and then propagates
+    ``CancelledError`` to the waiter.
 
     Repro setup:
 
     - Open the client.
     - Capture ``http_client_ref`` BEFORE the cancel (successful close
       nulls the kernel's transport attribute).
-    - Monkeypatch ``client._collaborators.drain_tracker.drain`` to park on an
-      unset ``asyncio.Event`` so drain() blocks indefinitely; the only
-      exit is the ``CancelledError`` injected by the outer ``wait_for``
-      deadline. The public ``NotebookLMClient.drain`` reaches the
-      tracker directly.
+    - Monkeypatch ``CallSupervisor.wait_for_idle`` to park on an unset
+      ``asyncio.Event`` so the graceful prephase blocks indefinitely; the
+      only exit is the ``CancelledError`` injected by the outer
+      ``wait_for`` deadline.
     - Drive ``close(drain=True)`` through ``asyncio.wait_for(timeout=0.1)``
       so the cancel reliably lands while ``drain`` is parked.
 
     Expected invariant (regression assertion):
 
+    - The first cancellation still surfaces to the caller.
     - After the cancel, ``client.is_connected`` must be ``False`` AND
-      ``http_client_ref.is_closed`` must be ``True`` — proving the outer
-      wrapper drove lifecycle close to completion despite the cancel
-      that fired mid-drain. Pre-fix this assertion fails: cancel exits
-      ``NotebookLMClient.close()`` before lifecycle close is
-      reached and the transport stays open.
+      ``http_client_ref.is_closed`` must be ``True`` — proving the retained
+      close wave completed teardown before propagating cancellation.
     """
     client = NotebookLMClient(keepalive_auth)
     await client.__aenter__()
@@ -289,14 +293,13 @@ async def test_cancel_during_drain_in_close_does_not_leak_transport(
     try:
         # Capture the transport ref BEFORE the cancel — successful close
         # nulls ``_kernel.http_client``, so we'd lose the handle.
-        http_client_ref = client._collaborators.kernel.get_http_client()
+        http_client_ref = client._web_runtime.kernel.get_http_client()
         assert http_client_ref is not None, "open() must have installed a transport"
 
-        # Park ``drain`` on an unset event. The only way out is the
-        # ``CancelledError`` that the outer ``wait_for`` injects when
-        # its 0.1 s deadline fires. This reproduces the production case
-        # where ``drain()`` is awaiting an in-flight operation that
-        # outlives the caller's cancel.
+        # Park the supervisor's graceful wait on an unset event. The only
+        # way out is the ``CancelledError`` that the outer ``wait_for``
+        # injects when its 0.1 s deadline fires. This reproduces an in-flight
+        # operation that outlives the close caller's patience.
         drain_entered = asyncio.Event()
         hang_event = asyncio.Event()
 
@@ -304,13 +307,16 @@ async def test_cancel_during_drain_in_close_does_not_leak_transport(
             drain_entered.set()
             await hang_event.wait()
 
-        monkeypatch.setattr(client._collaborators.drain_tracker, "drain", _hanging_drain)
+        monkeypatch.setattr(
+            client._collaborators.call_supervisor,
+            "wait_for_idle",
+            _hanging_drain,
+        )
 
         # Drive ``close(drain=True)`` through a short ``wait_for`` so a
-        # cancel lands while ``drain`` is parked. The cancel propagates
-        # out of ``wait_for`` as ``TimeoutError``; pre-fix it also
-        # exits ``NotebookLMClient.close()`` before reaching lifecycle close,
-        # leaking the transport.
+        # cancel lands while the graceful wait is parked. The lifecycle
+        # aborts that prephase, completes the retained teardown wave, and
+        # re-raises cancellation; ``wait_for`` exposes it as ``TimeoutError``.
         with pytest.raises((TimeoutError, asyncio.TimeoutError)):
             await asyncio.wait_for(
                 client.close(drain=True),
@@ -327,9 +333,8 @@ async def test_cancel_during_drain_in_close_does_not_leak_transport(
             "during drain and the bug surface isn't being exercised"
         )
 
-        # Release the patched drain hang so any pending shielded close
-        # task (post-fix) can make progress; pre-fix this is a no-op
-        # because close() already abandoned.
+        # Release the patched wait in case the implementation elects to let it
+        # settle instead of cancelling it when the close waiter is cancelled.
         hang_event.set()
 
         # Bounded poll: the shielded lifecycle close runs as a
@@ -339,12 +344,8 @@ async def test_cancel_during_drain_in_close_does_not_leak_transport(
                 break
             await asyncio.sleep(0.01)
 
-        # The regression assertions. Pre-fix both fail (is_connected
-        # stays True, is_closed stays False) because the cancel skipped
-        # lifecycle close entirely. Post-fix both hold because
-        # the ``except asyncio.CancelledError:`` branch in
-        # ``NotebookLMClient.close()`` drives shielded lifecycle close before
-        # re-raising the cancel.
+        # The regression assertions prove the root-owned retained wave did not
+        # strand its resource generation when its first waiter was cancelled.
         assert not client.is_connected, (
             "transport leaked: cancel during drain() left client.is_connected "
             "= True - NotebookLMClient.close() abandoned cleanup before "

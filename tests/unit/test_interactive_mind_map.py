@@ -2,10 +2,10 @@
 
 The web GUI now generates an *interactive* mind map as a studio artifact in the
 type-4 (QUIZ) family with variant 4 — distinct from the note-backed mind map the
-library surfaces with the synthetic type code 5. These tests pin the wire
-recognition: kind mapping, the listing-filter union, the `is_interactive_mind_map`
-discriminator, and downloading the interactive tree via GET_INTERACTIVE_HTML.
-See issue #1256.
+library adapts using the genuine backend mind-map type code 5. These tests pin
+the wire recognition: kind mapping, the listing-filter union, the
+`is_interactive_mind_map` discriminator, and downloading the interactive tree
+via GET_INTERACTIVE_HTML. See issue #1256.
 """
 
 from __future__ import annotations
@@ -15,9 +15,9 @@ import warnings
 
 import pytest
 
-from notebooklm._artifact.listing import _matches_artifact_type
 from notebooklm._types.artifacts import _map_artifact_kind, _warned_artifact_types
 from notebooklm._types.common import UnknownTypeWarning
+from notebooklm._web.artifact.listing import _matches_artifact_type
 from notebooklm.rpc.types import INTERACTIVE_MIND_MAP_VARIANT
 from notebooklm.types import Artifact, ArtifactType
 
@@ -73,7 +73,7 @@ def test_is_interactive_mind_map_property():
     assert _art(4, 4).is_interactive_mind_map is True
     assert _art(4, 2).is_interactive_mind_map is False  # quiz
     assert _art(4, 1).is_interactive_mind_map is False  # flashcards
-    assert _art(5, None).is_interactive_mind_map is False  # note-backed synthetic
+    assert _art(5, None).is_interactive_mind_map is False  # adapted note-backed row
 
 
 # --- T1.3: listing-filter union ----------------------------------------------
@@ -94,8 +94,8 @@ def test_list_unknown_excludes_interactive_but_keeps_genuine_unknown():
 
 from unittest.mock import AsyncMock, MagicMock  # noqa: E402
 
-from notebooklm._artifact.downloads import ArtifactDownloadService  # noqa: E402
-from notebooklm._runtime.contracts import RpcCaller  # noqa: E402
+from notebooklm._web.artifact.downloads import ArtifactDownloadService  # noqa: E402
+from notebooklm._web.contracts import RpcCaller  # noqa: E402
 from notebooklm.rpc.types import RPCMethod  # noqa: E402
 from notebooklm.types import ArtifactNotReadyError  # noqa: E402
 
@@ -241,4 +241,4 @@ def test_is_unclassified_type4_property():
     assert _art(4, None).is_unclassified_type4 is True  # settling window
     assert _art(4, 4).is_unclassified_type4 is False  # resolved interactive
     assert _art(4, 2).is_unclassified_type4 is False  # resolved quiz
-    assert _art(5, None).is_unclassified_type4 is False  # note-backed synthetic
+    assert _art(5, None).is_unclassified_type4 is False  # adapted note-backed row

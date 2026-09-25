@@ -1,9 +1,9 @@
 """Shared exponential-backoff helper for retry loops.
 
-A single ``compute_backoff_delay`` is used by every transient-retry path in
-the package so the curve, jitter shape, and cap-behavior are defined in one
-place. The function is pure math (sync, no I/O) — callers pair it with their
-own sleep primitive.
+``compute_backoff_delay`` is shared by transport and polling retry loops;
+artifact rate-limit retry uses the public
+:func:`notebooklm.artifacts.calculate_backoff_delay` helper. The function is
+pure math (sync, no I/O) — callers pair it with their own sleep primitive.
 
 Jitter uses an ``rng`` parameter so tests can pass a seeded ``random.Random``
 for deterministic output. In production callers pass ``rng=None`` and the
@@ -16,7 +16,20 @@ from __future__ import annotations
 
 import random as _random
 
-__all__ = ["compute_backoff_delay"]
+# Retry timing is shared by the web middleware and Android gRPC session. Keep
+# these values here so parity cannot drift between transports.
+RETRY_BACKOFF_BASE_SECONDS = 1.0
+RETRY_BACKOFF_CAP_SECONDS = 30.0
+RETRY_BACKOFF_JITTER_RATIO = 0.2
+RETRY_BACKOFF_MIN_SECONDS = 0.1
+
+__all__ = [
+    "RETRY_BACKOFF_BASE_SECONDS",
+    "RETRY_BACKOFF_CAP_SECONDS",
+    "RETRY_BACKOFF_JITTER_RATIO",
+    "RETRY_BACKOFF_MIN_SECONDS",
+    "compute_backoff_delay",
+]
 
 
 def compute_backoff_delay(

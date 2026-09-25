@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from ..options import USE_DEFAULT
+
 if TYPE_CHECKING:
     from ..client import NotebookLMClient
     from ..types import Notebook
@@ -78,28 +80,39 @@ async def verify_and_set_notebook(
     client: NotebookLMClient,
     partial_id: str,
     *,
-    json_output: bool,
     resolve_notebook_id: ResolveNotebookIdFn,
 ) -> UseNotebookResult:
     """Verify a (possibly partial) notebook id by hitting the server, then return it.
 
     ``resolve_notebook_id`` is injected so this core stays free of the
     ``rich``-coupled resolver and the CLI's ``monkeypatch`` seam keeps landing.
-    ``json_output`` is forwarded so the resolver's "Matched: ..." diagnostic
-    routes to stderr in JSON mode (keeping stdout pure parseable JSON).
 
     Errors mirror the legacy contract: the resolver's ambiguity / "no match"
     error, plus :class:`NotebookNotFoundError` / :class:`AuthError` / any other
     exception, all propagate to the adapter's body-error handler.
     """
-    resolved_id = await resolve_notebook_id(client, partial_id, json_output=json_output)
-    notebook = await client.notebooks.get(resolved_id)
-    return UseNotebookResult(notebook=notebook, resolved_id=resolved_id)
+    async with client.operation(timeout=USE_DEFAULT):
+        resolved_id = await resolve_notebook_id(client, partial_id)
+        notebook = await client.notebooks.get(resolved_id)
+        return UseNotebookResult(notebook=notebook, resolved_id=resolved_id)
 
 
 # ---------------------------------------------------------------------------
 # ``status`` — read + project
 # ---------------------------------------------------------------------------
+
+
+#: Role labels the context file may legitimately carry — the same strings
+#: ``share_permission_to_str`` writes. The context file is user-editable, so the
+#: read side validates rather than trusting it: an unrecognized value would
+#: otherwise be title-cased straight onto the ``status`` table (a hand-edited
+#: ``"role": "wizard"`` printing ``Access: Wizard``).
+_ROLE_LABELS = frozenset({"owner", "editor", "viewer"})
+
+
+def _valid_role_label(raw: object) -> str | None:
+    """Return ``raw`` if it is a known role label, else ``None``."""
+    return raw if isinstance(raw, str) and raw in _ROLE_LABELS else None
 
 
 @dataclass(frozen=True)
@@ -117,6 +130,10 @@ class StatusContext:
     created_at: str | None = None
     conversation_id: str | None = None
     payload_readable: bool = True
+    #: Cached ``"owner"`` / ``"editor"`` / ``"viewer"`` label (#2125). Appended
+    #: last so positional construction stays unaffected. ``None`` for contexts
+    #: written before the role was recorded, which fall back to ``is_owner``.
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +227,7 @@ def read_status(inputs: StatusInputs) -> StatusReport:
             is_owner=data.get("is_owner"),
             created_at=data.get("created_at"),
             conversation_id=data.get("conversation_id"),
+            role=_valid_role_label(data.get("role")),
         ),
         paths=inputs.path_info,
         has_env_auth=inputs.has_env_auth,
@@ -269,11 +287,14 @@ class LogoutOutcome:
             this logout (file-based artifacts removed but the env var survives).
         failure: ``None`` on success; a :class:`LogoutFailure` when one of the
             three filesystem steps raised :class:`OSError`.
+        browser_profile_preserved: Existing unowned browser directory skipped
+            by policy, or ``None`` when no browser directory was preserved.
     """
 
     removed_any: bool
     env_auth_remains: bool
     failure: LogoutFailure | None = None
+    browser_profile_preserved: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +322,8 @@ class LogoutInputs:
             storage/browser teardown runs.
         env_auth_remains: ``True`` when env-supplied auth survives this logout.
         rmtree: Recursive directory remover (the CLI passes ``shutil.rmtree``).
+        remove_browser_profile: Whether the resolved browser directory is safe
+            to remove. Explicit-storage adapters set this only for owned dirs.
     """
 
     storage_path: Path
@@ -309,18 +332,20 @@ class LogoutInputs:
     context_path: Callable[[], Path]
     env_auth_remains: bool
     rmtree: Callable[[Path], Any]
+    remove_browser_profile: bool = True
 
 
 def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
     """Execute ``auth logout`` end-to-end as a pure-typed-outcome operation.
 
-    Removes the resolved storage file, the cached browser profile, and the
-    per-context cache file. Returns a :class:`LogoutOutcome` carrying whichever
-    step (if any) raised an :class:`OSError`; the adapter owns all presentation
-    and exit-code policy. The order matches the legacy implementation:
+    Removes the resolved storage file, the cached browser profile when the
+    adapter marks it safe to remove, and the per-context cache file. Returns a
+    :class:`LogoutOutcome` carrying whichever step (if any) raised an
+    :class:`OSError`; the adapter owns all presentation and exit-code policy.
+    The order matches the legacy implementation:
 
     1. Storage file (the credential itself).
-    2. Browser profile (the persistent SSO cache).
+    2. Browser profile (the persistent SSO cache), when enabled.
     3. Context cache (notebook + account routing).
 
     Each step is independent — a failure short-circuits the rest of the pipeline
@@ -335,6 +360,11 @@ def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
     line on stderr requires.
     """
     removed_any = False
+    browser_profile_preserved = (
+        inputs.browser_profile_dir
+        if not inputs.remove_browser_profile and inputs.browser_profile_dir.exists()
+        else None
+    )
 
     if inputs.storage_path.exists():
         try:
@@ -347,6 +377,7 @@ def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
             return LogoutOutcome(
                 removed_any=removed_any,
                 env_auth_remains=inputs.env_auth_remains,
+                browser_profile_preserved=browser_profile_preserved,
                 failure=LogoutFailure(
                     kind="storage",
                     path=inputs.storage_path,
@@ -354,7 +385,7 @@ def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
                 ),
             )
 
-    if inputs.browser_profile_dir.exists():
+    if inputs.remove_browser_profile and inputs.browser_profile_dir.exists():
         try:
             inputs.rmtree(inputs.browser_profile_dir)
             removed_any = True
@@ -367,6 +398,7 @@ def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
             return LogoutOutcome(
                 removed_any=removed_any,
                 env_auth_remains=inputs.env_auth_remains,
+                browser_profile_preserved=browser_profile_preserved,
                 failure=LogoutFailure(
                     kind="browser_profile",
                     path=inputs.browser_profile_dir,
@@ -395,6 +427,7 @@ def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
         return LogoutOutcome(
             removed_any=removed_any,
             env_auth_remains=inputs.env_auth_remains,
+            browser_profile_preserved=browser_profile_preserved,
             failure=LogoutFailure(
                 kind="context",
                 path=context_path,
@@ -405,6 +438,7 @@ def execute_logout(inputs: LogoutInputs) -> LogoutOutcome:
     return LogoutOutcome(
         removed_any=removed_any,
         env_auth_remains=inputs.env_auth_remains,
+        browser_profile_preserved=browser_profile_preserved,
         failure=None,
     )
 

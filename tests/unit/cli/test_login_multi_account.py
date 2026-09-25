@@ -9,12 +9,14 @@ helpers live in ``_session_helpers.py``; the proxy-block-aware
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from _fixtures import patch_session_login_dual
+import notebooklm.auth as auth_module
+import notebooklm.paths as paths_module
 from notebooklm.notebooklm_cli import cli
+from tests._fixtures import patch_session_login_dual
 
 from ._session_helpers import (
     _account_exists,
-    _multiaccount_rookiepy_mock,
+    _multiaccount_rookie_cookies_mock,
     _read_account,
 )
 
@@ -57,17 +59,17 @@ class TestLoginMultiAccount:
     """--account / --profile-name / --all-accounts on `notebooklm login --browser-cookies`."""
 
     def test_account_writes_default_profile_by_default(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
             patch_session_login_dual("_sync_server_language_to_config") as mock_sync,
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -90,17 +92,17 @@ class TestLoginMultiAccount:
         }
 
     def test_account_honors_global_profile(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
             patch_session_login_dual("_sync_server_language_to_config") as mock_sync,
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -130,17 +132,17 @@ class TestLoginMultiAccount:
         }
 
     def test_account_profile_name_still_writes_named_profile(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
             patch_session_login_dual("_sync_server_language_to_config") as mock_sync,
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -171,16 +173,16 @@ class TestLoginMultiAccount:
         }
 
     def test_account_profile_name_invalid_name_exits_with_click_error(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -206,14 +208,14 @@ class TestLoginMultiAccount:
         assert not target_root.exists()
 
     def test_account_storage_bypasses_profile_targeting(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target = tmp_path / "custom-storage.json"
         _write_account_metadata(target, authuser=0, email="alice@example.com")
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch("click.confirm") as mock_confirm,
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual("_sync_server_language_to_config") as mock_sync,
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
@@ -243,20 +245,21 @@ class TestLoginMultiAccount:
         }
 
     def test_account_same_existing_profile_account_does_not_prompt(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
         storage_file = target_root / "default" / "storage_state.json"
         _write_account_metadata(storage_file, authuser=1, email="bob@gmail.com")
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch("click.confirm") as mock_confirm,
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
-            patch(
-                "notebooklm.auth.enumerate_accounts",
+            patch.object(
+                auth_module,
+                "enumerate_accounts",
                 new=_account_enum([(1, "bob@gmail.com", False)]),
             ),
             patch_session_login_dual(
@@ -280,18 +283,18 @@ class TestLoginMultiAccount:
     def test_account_different_existing_profile_account_aborts_without_confirm(
         self, runner, tmp_path
     ):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
         storage_file = target_root / "default" / "storage_state.json"
         _write_account_metadata(storage_file, authuser=0, email="alice@example.com")
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -316,19 +319,19 @@ class TestLoginMultiAccount:
     def test_account_existing_profile_without_metadata_aborts_without_confirm(
         self, runner, tmp_path
     ):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
         storage_file = target_root / "default" / "storage_state.json"
         storage_file.parent.mkdir(parents=True)
         storage_file.write_text(json.dumps({"cookies": [], "origins": []}))
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -350,18 +353,18 @@ class TestLoginMultiAccount:
     def test_account_profile_name_existing_different_account_aborts_without_confirm(
         self, runner, tmp_path
     ):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
         storage_file = target_root / "work" / "storage_state.json"
         _write_account_metadata(storage_file, authuser=0, email="alice@example.com")
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -392,18 +395,18 @@ class TestLoginMultiAccount:
     def test_account_different_existing_profile_account_overwrites_after_confirm(
         self, runner, tmp_path
     ):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
         target_root = tmp_path / "profiles"
         storage_file = target_root / "default" / "storage_state.json"
         _write_account_metadata(storage_file, authuser=0, email="alice@example.com")
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 side_effect=_profile_storage_path(target_root),
             ),
-            patch("notebooklm.auth.enumerate_accounts", new=_account_enum()),
+            patch.object(auth_module, "enumerate_accounts", new=_account_enum()),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -427,8 +430,9 @@ class TestLoginMultiAccount:
 
         with (
             patch_session_login_dual("_login_with_browser_cookies") as login_mock,
-            patch(
-                "notebooklm.auth.enumerate_accounts",
+            patch.object(
+                auth_module,
+                "enumerate_accounts",
                 side_effect=AssertionError("should not enumerate accounts"),
             ),
         ):
@@ -443,7 +447,7 @@ class TestLoginMultiAccount:
         assert login_mock.call_args.args[1] == "chrome"
 
     def test_account_not_found_aborts(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
 
         async def _enum(*args, **kwargs):
             from notebooklm.auth import Account
@@ -451,12 +455,12 @@ class TestLoginMultiAccount:
             return [Account(authuser=0, email="alice@example.com", is_default=True)]
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual(
                 "get_storage_path",
                 return_value=tmp_path / "storage.json",
             ),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch.object(auth_module, "enumerate_accounts", new=_enum),
         ):
             result = runner.invoke(
                 cli,
@@ -466,7 +470,7 @@ class TestLoginMultiAccount:
         assert "not found" in result.output.lower()
 
     def test_all_accounts_writes_one_profile_per_account(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
 
         async def _enum(*args, **kwargs):
             from notebooklm.auth import Account
@@ -487,10 +491,10 @@ class TestLoginMultiAccount:
             return sorted(path.name for path in target_root.iterdir() if path.is_dir())
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual("get_storage_path", side_effect=fake_get_storage_path),
-            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch.object(paths_module, "list_profiles", side_effect=fake_list_profiles),
+            patch.object(auth_module, "enumerate_accounts", new=_enum),
             patch_session_login_dual("_sync_server_language_to_config") as mock_sync,
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
@@ -511,7 +515,7 @@ class TestLoginMultiAccount:
         )
 
     def test_all_accounts_rerun_reuses_profiles_by_email(self, runner, tmp_path):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
 
         async def _enum(*args, **kwargs):
             from notebooklm.auth import Account
@@ -532,10 +536,10 @@ class TestLoginMultiAccount:
             return sorted(path.name for path in target_root.iterdir() if path.is_dir())
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual("get_storage_path", side_effect=fake_get_storage_path),
-            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch.object(paths_module, "list_profiles", side_effect=fake_list_profiles),
+            patch.object(auth_module, "enumerate_accounts", new=_enum),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -552,7 +556,7 @@ class TestLoginMultiAccount:
     def test_all_accounts_does_not_overwrite_same_name_without_matching_email(
         self, runner, tmp_path
     ):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
 
         async def _enum(*args, **kwargs):
             from notebooklm.auth import Account
@@ -571,10 +575,10 @@ class TestLoginMultiAccount:
             return sorted(path.name for path in target_root.iterdir() if path.is_dir())
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual("get_storage_path", side_effect=fake_get_storage_path),
-            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch.object(paths_module, "list_profiles", side_effect=fake_list_profiles),
+            patch.object(auth_module, "enumerate_accounts", new=_enum),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -594,7 +598,7 @@ class TestLoginMultiAccount:
     def test_all_accounts_updates_existing_profile_when_authuser_index_changes(
         self, runner, tmp_path
     ):
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
 
         first_accounts = None
 
@@ -621,10 +625,10 @@ class TestLoginMultiAccount:
             return sorted(path.name for path in target_root.iterdir() if path.is_dir())
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual("get_storage_path", side_effect=fake_get_storage_path),
-            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch.object(paths_module, "list_profiles", side_effect=fake_list_profiles),
+            patch.object(auth_module, "enumerate_accounts", new=_enum),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -696,7 +700,7 @@ class TestLoginAllAccountsUpdate:
                 with no context.json, i.e. a hand-created profile with no
                 account metadata).
         """
-        mock_rk = _multiaccount_rookiepy_mock()
+        mock_rk = _multiaccount_rookie_cookies_mock()
 
         async def _enum(*args, **kwargs):
             from notebooklm.auth import Account
@@ -722,10 +726,10 @@ class TestLoginAllAccountsUpdate:
         if update:
             argv.append("--update")
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rk}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rk}),
             patch_session_login_dual("get_storage_path", side_effect=fake_get_storage_path),
-            patch("notebooklm.paths.list_profiles", side_effect=fake_list_profiles),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch.object(paths_module, "list_profiles", side_effect=fake_list_profiles),
+            patch.object(auth_module, "enumerate_accounts", new=_enum),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,
@@ -875,18 +879,18 @@ class TestStaleAccountMetadataCleanup:
                 "value": f"{name}-value",
                 "path": "/",
                 "secure": True,
-                "expires": 9999,
+                "expires": 4102444800,
                 "http_only": False,
             }
             for name in ("SID", "APISID", "SAPISID", "__Secure-1PSIDTS")
         ]
-        mock_rookiepy = MagicMock()
-        mock_rookiepy.load = MagicMock(return_value=mock_cookies)
+        mock_rookie_cookies = MagicMock()
+        mock_rookie_cookies.load = MagicMock(return_value=mock_cookies)
 
         with (
-            patch.dict("sys.modules", {"rookiepy": mock_rookiepy}),
+            patch.dict("sys.modules", {"rookie_cookies": mock_rookie_cookies}),
             patch_session_login_dual("get_storage_path", return_value=storage_file),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch_session_login_dual(
                 "fetch_tokens_with_domains",
                 new_callable=AsyncMock,

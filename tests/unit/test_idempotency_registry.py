@@ -17,7 +17,8 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from notebooklm._idempotency import (
+from notebooklm._idempotency import bound_operation_journal_entries
+from notebooklm._web.policy import (
     IDEMPOTENCY_REGISTRY,
     IdempotencyEntry,
     IdempotencyPolicy,
@@ -64,6 +65,25 @@ def test_registry_classifies_every_rpc_method_at_variant_none() -> None:
         assert entry.notes.strip(), f"{method.name} classification must document its rationale"
 
 
+def test_get_notebook_notes_do_not_claim_the_fetch_is_side_effect_free() -> None:
+    """``GET_NOTEBOOK`` is idempotent, but it is NOT free of server-side effect.
+
+    It writes ``ProjectMetadata.lastViewedTime`` and thereby reorders the
+    account's recency list (#2126) — live-probed. The classification is still
+    correct (a timestamp write is last-write-wins under replay), but the
+    rationale string used to say "read-only notebook fetch; replay does not
+    mutate notebook state", which is the exact claim #2126 disproves. Pin the
+    correction: prose is the only record of a probed server behavior, and
+    nothing else would fail if it were reverted.
+    """
+    entry = IDEMPOTENCY_REGISTRY.get_entry(RPCMethod.GET_NOTEBOOK)
+    assert entry is not None
+    notes = entry.notes
+
+    assert "lastViewedTime" in notes
+    assert "read-only" not in notes
+
+
 def test_seed_defaults_makes_unregistered_methods_resolve_unclassified() -> None:
     """A method with NO explicit ``.register()`` MUST resolve to UNCLASSIFIED.
 
@@ -96,7 +116,7 @@ def test_register_default_policies_runs_the_totality_seed_pass() -> None:
     fires. A spy registry counts the ``_seed_defaults`` calls, and a separate
     fresh registry confirms the applied result is total over ``RPCMethod``.
     """
-    from notebooklm._idempotency_policy import register_default_policies
+    from notebooklm._web.policy import register_default_policies
 
     # (a) The seed pass fires exactly once during policy application.
     spy = SeedSpyRegistry()
@@ -133,36 +153,42 @@ def test_registry_has_no_unclassified_production_entries() -> None:
 def test_retry_disabled_entries_are_intentional_and_documented() -> None:
     """Non-retryable methods are pinned so cleanup cannot make them retryable."""
     expected = {
-        (RPCMethod.CREATE_NOTEBOOK, None): IdempotencyPolicy.PROBE_THEN_CREATE,
+        (RPCMethod.CREATE_NOTEBOOK, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.COPY_NOTEBOOK, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.ADD_SOURCE, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
-        (RPCMethod.ADD_SOURCE, "url"): IdempotencyPolicy.PROBE_THEN_CREATE,
-        (RPCMethod.ADD_SOURCE, "drive"): IdempotencyPolicy.PROBE_THEN_CREATE,
+        (RPCMethod.ADD_SOURCE, "url"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.ADD_SOURCE, "drive"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.ADD_SOURCE, "text"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
-        (RPCMethod.ADD_SOURCE_FILE, None): IdempotencyPolicy.PROBE_THEN_CREATE,
-        (RPCMethod.CREATE_ARTIFACT, None): IdempotencyPolicy.PROBE_THEN_CREATE,
+        (RPCMethod.ADD_SOURCE_FILE, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.CREATE_ARTIFACT, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.EXPORT_ARTIFACT, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.REVISE_SLIDE, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.RETRY_ARTIFACT, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.DISCOVER_SOURCES, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.START_FAST_RESEARCH, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.START_DEEP_RESEARCH, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.IMPORT_RESEARCH, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
-        (RPCMethod.GENERATE_MIND_MAP, None): IdempotencyPolicy.PROBE_THEN_CREATE,
+        (RPCMethod.GENERATE_MIND_MAP, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.CREATE_NOTE, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.CREATE_NOTE, "plain"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.CREATE_NOTE, "saved_from_chat"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
-        (RPCMethod.SHARE_NOTEBOOK, None): IdempotencyPolicy.PROBE_THEN_CREATE,
+        (RPCMethod.SHARE_NOTEBOOK, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.CREATE_LABEL, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.DELETE_LABEL, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
         (RPCMethod.UPDATE_LABEL, "add_sources"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.UPDATE_LABEL, "add_notebooks"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        # #2283 transfer family: row-creating / in-place-appending writes with no
+        # client token and no post-failure probe (see _web/policy.py notes).
+        (RPCMethod.ADD_SOURCES_ASYNC, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.ADD_SOURCES_ASYNC, "play_book"): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.APPEND_SOURCE, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.COPY_SOURCES, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
+        (RPCMethod.COPY_ARTIFACTS, None): IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
     }
     actual = {
         (method, variant): entry.policy
         for method, variant, entry in IDEMPOTENCY_REGISTRY.iter_entries()
-        if entry.policy
-        in {
-            IdempotencyPolicy.PROBE_THEN_CREATE,
-            IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY,
-        }
+        if entry.policy is IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY
     }
 
     assert actual == expected
@@ -206,6 +232,31 @@ def test_update_label_remove_sources_variant_is_idempotent_set_op() -> None:
     )
 
 
+def test_update_label_remove_notebooks_variant_is_idempotent_set_op() -> None:
+    """The ``remove_notebooks`` UPDATE_LABEL variant is a retry-safe set-op.
+
+    Live-verified (PR #2009): removing an already-absent notebook member is a
+    confirmed silent no-op, so a blind transport retry that lands twice leaves
+    the same final state — same conclusion as ``remove_sources`` above, once
+    the previously-inferred (and wrong) wire shape was corrected and reverified
+    live.
+    """
+    entry = IDEMPOTENCY_REGISTRY.get_entry(
+        RPCMethod.UPDATE_LABEL, operation_variant="remove_notebooks"
+    )
+    assert entry.policy is IdempotencyPolicy.IDEMPOTENT_SET_OP
+    assert entry.notes.strip()
+    assert (
+        resolve_effective_disable_internal_retries(
+            IDEMPOTENCY_REGISTRY,
+            RPCMethod.UPDATE_LABEL,
+            caller_disable_internal_retries=False,
+            operation_variant="remove_notebooks",
+        )
+        is False
+    )
+
+
 def test_non_idempotent_no_retry_entries_document_dedupe_gap() -> None:
     """Hard no-retry methods must explain why blind retry cannot be safe."""
     expected_terms = {
@@ -238,15 +289,14 @@ def test_non_idempotent_no_retry_entries_document_dedupe_gap() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5-policy enum
+# 4-policy enum
 # ---------------------------------------------------------------------------
 
 
-def test_idempotency_policy_has_all_five_values() -> None:
-    """The classification axis is 5-way; nothing else."""
+def test_idempotency_policy_has_all_four_values() -> None:
+    """The classification axis is 4-way; nothing else."""
     expected = {
         "UNCLASSIFIED",
-        "PROBE_THEN_CREATE",
         "IDEMPOTENT_SET_OP",
         "AT_LEAST_ONCE_ACCEPTED",
         "NON_IDEMPOTENT_NO_RETRY",
@@ -351,22 +401,6 @@ def test_caller_disable_true_always_wins() -> None:
     assert effective is True
 
 
-def test_probe_then_create_disables_internal_retries() -> None:
-    """PROBE_THEN_CREATE methods are NOT safe to retry inside the transport —
-    the executor must surface failures so the caller's probe-then-create
-    state machine handles them."""
-    registry = IdempotencyRegistry()
-    registry.register(RPCMethod.LIST_NOTEBOOKS, IdempotencyPolicy.PROBE_THEN_CREATE)
-
-    effective = resolve_effective_disable_internal_retries(
-        registry,
-        RPCMethod.LIST_NOTEBOOKS,
-        caller_disable_internal_retries=False,
-        operation_variant=None,
-    )
-    assert effective is True
-
-
 def test_non_idempotent_no_retry_disables_internal_retries() -> None:
     """NON_IDEMPOTENT_NO_RETRY is a hard "never retry" — disables the
     transport retry loop unconditionally (caller-False is overridden upward)."""
@@ -451,9 +485,9 @@ def test_at_least_once_accepted_rate_limits_warn_log(
     rate-limited to avoid spamming under load (100 calls → ≤2 log lines)."""
     # Clear the module-level rate-limit ledger so a previously-tripped
     # window from another test doesn't suppress the first WARN here.
-    import notebooklm._idempotency as idemp_mod
+    import notebooklm._web.policy as policy_mod
 
-    monkeypatch.setattr(idemp_mod, "_at_least_once_last_logged", {})
+    monkeypatch.setattr(policy_mod, "_at_least_once_last_logged", {})
 
     registry = IdempotencyRegistry()
     registry.register(RPCMethod.LIST_NOTEBOOKS, IdempotencyPolicy.AT_LEAST_ONCE_ACCEPTED)
@@ -491,9 +525,9 @@ def _build_rpc_executor() -> Any:
     The executor is driven via its ``_execute_once()`` method (the lowest of the
     five consultation sites). The fixture stubs the transport so we can
     assert on the ``disable_internal_retries`` value that the executor
-    actually hands to ``_perform_authed_post``.
+    actually hands to ``RuntimeTransport.perform_authed_post``.
     """
-    from notebooklm._rpc_executor import RpcExecutor
+    from notebooklm._web.transport.executor import RpcExecutor
 
     captured: dict[str, Any] = {}
 
@@ -504,17 +538,26 @@ def _build_rpc_executor() -> Any:
         disable_internal_retries: bool = False,
         rpc_method: str | None = None,
         refresh_budget: Any = None,
+        retry_deadline: Any = None,
+        retry_budget: Any = None,
+        read_timeout: float | None = None,
+        expected_epoch: int | None = None,
+        epoch_observer: Any = None,
     ) -> httpx.Response:
+        for entry in bound_operation_journal_entries():
+            entry.mark_dispatched()
+        admitted_epoch = 1 if expected_epoch is None else expected_epoch
+        if epoch_observer is not None:
+            epoch_observer(admitted_epoch)
         captured["disable_internal_retries"] = disable_internal_retries
         captured["log_label"] = log_label
         captured["rpc_method"] = rpc_method
+        captured["expected_epoch"] = expected_epoch
         return httpx.Response(200, text=")]}'\n[]")
 
-    # ADR-0014 Rule 5 (Wave 4 of session-decoupling): RpcExecutor takes
-    # its four collaborators (kernel/transport/auth_refresh/metrics) as
-    # keyword-only args. Use four MagicMock collaborators so each role
-    # can be inspected independently.
-    kernel = MagicMock()
+    # ADR-0014 Rule 5: RpcExecutor takes its direct runtime collaborators as
+    # keyword-only args. Use separate mocks so each role can be inspected
+    # independently.
     transport = MagicMock()
     transport.perform_authed_post = AsyncMock(side_effect=_fake_perform_authed_post)
     auth_refresh = MagicMock()
@@ -526,7 +569,9 @@ def _build_rpc_executor() -> Any:
     timeout = 30.0
     refresh_retry_delay = 0.0
 
-    def _decode(raw: str, rpc_id: str, *, allow_null: bool = False) -> Any:
+    def _decode(
+        raw: str, rpc_id: str, *, allow_null: bool = False, raise_on_null_status: bool = False
+    ) -> Any:
         return []
 
     async def _sleep(_: float) -> None:
@@ -536,10 +581,10 @@ def _build_rpc_executor() -> Any:
         return False
 
     executor = RpcExecutor(
-        kernel=kernel,
         transport=transport,
         auth_refresh=auth_refresh,
         metrics=metrics,
+        call_supervisor=MagicMock(),
         decode_response=_decode,
         is_auth_error=_is_auth_error,
         sleep=_sleep,

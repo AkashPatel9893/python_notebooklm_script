@@ -1,8 +1,6 @@
 """Coverage gap tests for ``notebooklm.cli.source_cmd`` render helpers.
-
 These exercise the small pure render/handler helpers that own the
 text-vs-JSON branching and exit-code policy for ``source`` subcommands:
-
 * ``_resolve_source_fulltext_output_path`` force/no-clobber conflict
 * ``_handle_source_mutation_error`` status-message → JSON-extra vs text-hint
 * ``_render_source_delete_result`` status-message emission
@@ -11,7 +9,6 @@ text-vs-JSON branching and exit-code policy for ``source`` subcommands:
 * ``_render_add_research_result`` JSON branches for ``no_research``,
   ``failed``/``timeout``, ``unknown_status``
 * ``_dispatch_source_clean_result`` text partial-failure overflow + exit
-
 Plus one ``source add`` CLI invocation to cover the validation-error
 JSON branch in the command body.
 """
@@ -24,11 +21,12 @@ from unittest.mock import AsyncMock, patch
 import click
 import pytest
 
+import notebooklm.auth as auth_module
 from notebooklm._app.source_clean import SourceCleanResult
 from notebooklm.cli import source_cmd
 from notebooklm.cli.services.source_mutations import (
+    CliSourceMutationError,
     SourceDeleteResult,
-    SourceMutationError,
     SourceRefreshResult,
 )
 from notebooklm.cli.services.source_research import (
@@ -50,16 +48,13 @@ def _research_result(outcome: str, **kw) -> SourceAddResearchResult:
         cited_only=False,
         no_wait=False,
         timeout=60,
-        json_output=True,
     )
     return SourceAddResearchResult(outcome=outcome, plan=plan, **kw)
 
 
 # ---------------------------------------------------------------------------
-# _resolve_source_fulltext_output_path — force + no-clobber conflict (line 223)
+# _resolve_source_fulltext_output_path — force + no-clobber conflict
 # ---------------------------------------------------------------------------
-
-
 class TestResolveFulltextOutputPath:
     def test_force_and_no_clobber_conflict_text_raises_usage_error(self, tmp_path):
         path = tmp_path / "out.md"
@@ -81,10 +76,8 @@ class TestResolveFulltextOutputPath:
 
 
 # ---------------------------------------------------------------------------
-# _render_source_wait_outcome — defensive unreachable guard (line 399)
+# _render_source_wait_outcome — defensive unreachable guard
 # ---------------------------------------------------------------------------
-
-
 class TestRenderSourceWaitOutcomeGuard:
     def test_unknown_outcome_type_raises_assertion(self):
         class _Bogus:
@@ -95,58 +88,48 @@ class TestRenderSourceWaitOutcomeGuard:
 
 
 # ---------------------------------------------------------------------------
-# _handle_source_mutation_error — status-message branches (452-457)
+# _handle_source_mutation_error
 # ---------------------------------------------------------------------------
-
-
 class TestHandleSourceMutationError:
-    def test_status_message_routed_to_json_extra(self, capsys):
-        exc = SourceMutationError(
-            "boom", "DELETE_FAILED", extra={"k": "v"}, status_message="[red]bad[/red]"
-        )
+    def test_structured_extra_is_preserved(self, capsys):
+        exc = CliSourceMutationError("boom", "DELETE_FAILED", extra={"k": "v"})
         with pytest.raises(SystemExit):
             source_cmd._handle_source_mutation_error(exc, json_output=True)
         payload = json.loads(capsys.readouterr().out)
         assert payload["code"] == "DELETE_FAILED"
-        # Markup stripped to plain text in the JSON extra.
-        assert payload["status_message"] == "bad"
         assert payload["k"] == "v"
 
-    def test_status_message_routed_to_text_hint(self, capsys):
-        exc = SourceMutationError("boom", "DELETE_FAILED", status_message="[red]hint here[/red]")
+    def test_text_error_uses_adapter_renderer(self, capsys):
+        exc = CliSourceMutationError("boom", "DELETE_FAILED")
         with pytest.raises(SystemExit):
             source_cmd._handle_source_mutation_error(exc, json_output=False)
         err = capsys.readouterr().err
         assert "boom" in err
-        assert "hint here" in err
 
 
 # ---------------------------------------------------------------------------
-# _render_source_delete_result — status-message emission (line 476)
+# _render_source_delete_result — status-message emission
 # ---------------------------------------------------------------------------
-
-
 class TestRenderSourceDeleteResult:
-    def test_status_message_emitted_text_mode(self, capsys):
+    def test_match_metadata_rendered_in_text_mode(self, capsys):
         ctx = click.Context(click.Command("x"))
         result = SourceDeleteResult(
             source_id="src_1",
             notebook_id="nb_1",
             success=True,
             status="completed",
-            status_message="[dim]queued[/dim]",
+            matched_title="Paper",
         )
         source_cmd._render_source_delete_result(result, json_output=False, ctx=ctx)
         out = capsys.readouterr().out
-        assert "queued" in out
+        assert "Matched:" in out
+        assert "Paper" in out
         assert "Deleted source" in out
 
 
 # ---------------------------------------------------------------------------
 # _render_source_refresh_result — None-success branch
 # ---------------------------------------------------------------------------
-
-
 class TestRenderSourceRefreshResult:
     def test_result_none_prints_source_id(self, capsys):
         # v0.8.0 (#1290): refresh() returns None on success; the renderer prints
@@ -160,10 +143,8 @@ class TestRenderSourceRefreshResult:
 
 
 # ---------------------------------------------------------------------------
-# _exit_with_add_research_status (918-921)
+# _exit_with_add_research_status
 # ---------------------------------------------------------------------------
-
-
 class TestExitWithAddResearchStatus:
     def test_emits_payload_and_exits_one(self, capsys):
         with pytest.raises(SystemExit) as exc_info:
@@ -174,10 +155,8 @@ class TestExitWithAddResearchStatus:
 
 
 # ---------------------------------------------------------------------------
-# _render_add_research_result — JSON outcome branches (962-988)
+# _render_add_research_result — JSON outcome branches
 # ---------------------------------------------------------------------------
-
-
 class TestRenderAddResearchResultJson:
     def test_no_research_json(self, capsys):
         with pytest.raises(SystemExit):
@@ -233,10 +212,8 @@ class TestRenderAddResearchResultText:
 
 
 # ---------------------------------------------------------------------------
-# _dispatch_source_clean_result — text partial-failure overflow (1477, 1482)
+# _dispatch_source_clean_result — text partial-failure overflow
 # ---------------------------------------------------------------------------
-
-
 class TestDispatchSourceCleanResultTextFailures:
     def test_text_partial_failure_overflow_and_exit(self, capsys):
         ctx = click.Context(click.Command("x"))
@@ -258,30 +235,51 @@ class TestDispatchSourceCleanResultTextFailures:
 
 
 # ---------------------------------------------------------------------------
-# source add — validation-error JSON branch in the command body (line 691)
+# source add — validation-error JSON branch in the command body
 # ---------------------------------------------------------------------------
-
-
 class TestSourceAddValidationErrorJson:
-    def test_invalid_url_json_emits_validation_error(self, runner, mock_auth):
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+    @pytest.mark.parametrize(
+        ("url", "expected_message"),
+        [
+            ("http://", "Error: URL has no host component: http://"),
+            (
+                "file:///etc/passwd",
+                "Error: URL scheme 'file' is not allowed; only http and https URLs "
+                "are accepted as sources. Got: file:///etc/passwd",
+            ),
+            (
+                "http://localhost",
+                "Error: URL targets the local host 'localhost'; pass --allow-internal "
+                "to override. Got: http://localhost",
+            ),
+            (
+                "http://127.0.0.1",
+                "Error: URL targets an internal IP address 127.0.0.1; pass --allow-internal "
+                "to override. Got: http://127.0.0.1",
+            ),
+        ],
+    )
+    def test_invalid_url_json_emits_validation_error(
+        self,
+        runner,
+        mock_auth,
+        url: str,
+        expected_message: str,
+    ) -> None:
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
                 cli,
-                [
-                    "source",
-                    "add",
-                    "http://",  # malformed URL — no host component
-                    "--type",
-                    "url",
-                    "-n",
-                    "nb_123",
-                    "--json",
-                ],
+                ["source", "add", url, "--type", "url", "-n", "nb_123", "--json"],
                 obj=inject_client(create_mock_client()),
             )
+
         assert result.exit_code == 1
         payload = json.loads(result.output)
-        assert payload["code"] == "VALIDATION_ERROR"
+        assert payload == {
+            "error": True,
+            "code": "VALIDATION_ERROR",
+            "message": expected_message,
+        }

@@ -1,34 +1,78 @@
 """Unit tests for RPC types and constants."""
 
 import ast
+import os
+import pickle
 import re
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from notebooklm.rpc import RPCMethod as FacadeRPCMethod
+from notebooklm.rpc import types as rpc_types
+from notebooklm.rpc._identifiers import RPCMethod as IdentifierRPCMethod
 from notebooklm.rpc.types import (
     BATCHEXECUTE_URL,
     QUERY_URL,
     ArtifactStatus,
     ArtifactTypeCode,
+    DiscoveryMode,
+    DriveSourceStatus,
+    GrpcStatusCode,
     RPCMethod,
+    SharePermission,
     SourceStatus,
     artifact_status_to_str,
+    discovery_mode_to_str,
+    drive_source_status_to_str,
     get_batchexecute_url,
     get_query_url,
+    normalize_grpc_status,
+    normalize_rpc_code,
+    share_permission_to_str,
     source_status_to_str,
 )
 
 
+def test_rpc_method_identity_and_historical_runtime_provenance() -> None:
+    """The dependency-bottom owner must not change the public enum object."""
+    assert IdentifierRPCMethod is RPCMethod is FacadeRPCMethod
+    assert RPCMethod.__module__ == "notebooklm.rpc.types"
+    assert RPCMethod.__qualname__ == "RPCMethod"
+    assert repr(RPCMethod) == "<enum 'RPCMethod'>"
+    assert repr(RPCMethod.LIST_NOTEBOOKS) == "<RPCMethod.LIST_NOTEBOOKS: 'wXbhsf'>"
+    assert str(RPCMethod.LIST_NOTEBOOKS) == "RPCMethod.LIST_NOTEBOOKS"
+
+    payload = pickle.dumps(RPCMethod.LIST_NOTEBOOKS)
+    assert b"notebooklm.rpc.types" in payload
+    assert b"_identifiers" not in payload
+    assert pickle.loads(payload) is RPCMethod.LIST_NOTEBOOKS
+
+
+def test_rpc_types_preserves_historical_wildcard_tail_order() -> None:
+    """Moving the enum owner must not reorder the compatibility star surface."""
+    assert rpc_types.__all__[-7:] == [
+        "QUERY_URL",
+        "UPLOAD_URL",
+        "get_batchexecute_url",
+        "get_query_url",
+        "get_upload_url",
+        "RPCMethod",
+        "resolve_rpc_id",
+    ]
+
+
 def test_rpc_types_does_not_own_runtime_override_policy() -> None:
-    """Runtime override env parsing belongs in rpc.overrides, not rpc.types."""
+    """Runtime override policy belongs in Web wire, not compatibility types."""
     path = Path(__file__).parents[2] / "src/notebooklm/rpc/types.py"
     tree = ast.parse(path.read_text())
 
     imported_os: list[int] = []
     environ_access: list[int] = []
     direct_override_defs: list[int] = []
-    override_aliases: set[str] = set()
+    web_override_imports: list[int] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -38,9 +82,8 @@ def test_rpc_types_does_not_own_runtime_override_policy() -> None:
         elif isinstance(node, ast.ImportFrom):
             if node.module == "os":
                 imported_os.append(node.lineno)
-            for alias in node.names:
-                if (node.module, node.level) == ("overrides", 1):
-                    override_aliases.add(alias.asname or alias.name)
+            if (node.module, node.level) == ("_web.wire.overrides", 2):
+                web_override_imports.append(node.lineno)
         elif (
             isinstance(node, ast.Attribute)
             and node.attr == "environ"
@@ -57,12 +100,31 @@ def test_rpc_types_does_not_own_runtime_override_policy() -> None:
     assert imported_os == []
     assert environ_access == []
     assert direct_override_defs == []
-    assert {
-        "_load_rpc_overrides",
-        "_logged_override_hashes",
-        "_parse_rpc_overrides",
-        "resolve_rpc_id",
-    } <= override_aliases
+    assert web_override_imports == []
+
+
+def test_rpc_types_legacy_override_exports_are_lazy_identity_reexports() -> None:
+    """Legacy names remain exact aliases without an eager Web-wire import."""
+    import notebooklm._web.wire.overrides as web_overrides
+    import notebooklm.rpc.types as rpc_types
+
+    assert rpc_types.resolve_rpc_id is web_overrides.resolve_rpc_id
+    assert rpc_types._parse_rpc_overrides is web_overrides._parse_rpc_overrides
+    assert rpc_types._load_rpc_overrides is web_overrides._load_rpc_overrides
+    assert rpc_types._logged_override_hashes is web_overrides._logged_override_hashes
+
+
+def test_rpc_types_does_not_bind_web_override_policy_at_module_scope() -> None:
+    """The identifier module keeps compatibility aliases lazy in its namespace."""
+    script = """
+import notebooklm.rpc.types as rpc_types
+assert 'resolve_rpc_id' not in vars(rpc_types)
+assert '_parse_rpc_overrides' not in vars(rpc_types)
+"""
+    env = os.environ.copy()
+    source_root = str(Path(__file__).parents[2] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (source_root, env.get("PYTHONPATH"))))
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
 
 
 def test_rpc_override_import_order_smoke() -> None:
@@ -73,17 +135,35 @@ def test_rpc_override_import_order_smoke() -> None:
         "from notebooklm.rpc.types import RPCMethod, resolve_rpc_id, _parse_rpc_overrides; "
         "assert resolve_rpc_id(RPCMethod.LIST_NOTEBOOKS.name, RPCMethod.LIST_NOTEBOOKS.value); "
         "assert hasattr(_parse_rpc_overrides, 'cache_clear')",
+        "from notebooklm._web.wire.overrides import RPCMethod as web_method; "
+        "from notebooklm.rpc.types import RPCMethod as compat_method; "
+        "from notebooklm.rpc import RPCMethod as public_method; "
+        "assert web_method is compat_method is public_method",
+        "from notebooklm.rpc._identifiers import RPCMethod as leaf_method; "
+        "from notebooklm._web.wire.overrides import RPCMethod as web_method; "
+        "from notebooklm.rpc.types import RPCMethod as compat_method; "
+        "assert leaf_method is web_method is compat_method",
     ]
     for snippet in snippets:
         subprocess.run([sys.executable, "-c", snippet], check=True)
 
 
+def test_rpc_types_wildcard_import_preserves_lazy_override_export() -> None:
+    """Wildcard compatibility keeps ``resolve_rpc_id`` without leaking typing helpers."""
+    script = """
+namespace = {}
+exec('from notebooklm.rpc.types import *', namespace)
+assert 'resolve_rpc_id' in namespace
+assert 'Any' not in namespace
+assert namespace['resolve_rpc_id']('LIST_NOTEBOOKS', 'canonical') == 'canonical'
+"""
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+
 class TestRPCConstants:
     def test_batchexecute_url(self):
         """Test batchexecute URL is correct."""
-        assert (
-            BATCHEXECUTE_URL == "https://notebooklm.google.com/_/LabsTailwindUi/data/batchexecute"
-        )
+        assert BATCHEXECUTE_URL == "https://notebook.google.com/_/LabsTailwindUi/data/batchexecute"
 
     def test_query_url(self):
         """Test query URL for streaming chat."""
@@ -114,7 +194,7 @@ class TestRPCMethod:
     re-stated ``rpc/types.py`` (zero behavioral value, a mechanical re-edit on
     every ID rotation). This is strictly stronger: it holds for ALL members and
     catches empties / malformed tokens / cross-enum duplicate IDs that the
-    individual pins never checked. ``rpc/types.py`` remains the single source of
+    individual pins never checked. ``rpc/_identifiers.py`` remains the single source of
     truth for the literal values.
     """
 
@@ -179,33 +259,52 @@ class TestArtifactTypeCode:
         assert isinstance(ArtifactTypeCode.AUDIO.value, int)
 
 
+#: The backend ``ArtifactStatus`` enum, code by code, as recovered in
+#: ``docs/android/enums.txt`` and corrected against live traces in #2127.
+#: ``(wire code, member name, public status string)``.
+_ARTIFACT_STATUS_TABLE = [
+    (0, "UNKNOWN", "unknown"),
+    (1, "PENDING", "pending"),
+    (2, "PROCESSING", "in_progress"),
+    (3, "COMPLETED", "completed"),
+    (4, "FAILED", "failed"),
+    (5, "SUGGESTED", "suggested"),
+    (6, "PENDING_REVIEW", "pending_review"),
+]
+
+
 class TestArtifactStatusToStr:
-    """Tests for artifact_status_to_str helper function."""
+    """Pin every backend ``ArtifactStatus`` code to its member and status string."""
 
-    def test_processing_status(self):
-        """Test status code 1 (PROCESSING) returns 'in_progress'."""
-        assert artifact_status_to_str(ArtifactStatus.PROCESSING) == "in_progress"
-        assert artifact_status_to_str(1) == "in_progress"
+    @pytest.mark.parametrize(
+        ("code", "member_name", "expected"),
+        _ARTIFACT_STATUS_TABLE,
+        ids=[name for _code, name, _s in _ARTIFACT_STATUS_TABLE],
+    )
+    def test_code_maps_to_member_and_string(self, code, member_name, expected):
+        member = ArtifactStatus(code)
+        assert member.name == member_name
+        assert artifact_status_to_str(code) == expected
+        assert artifact_status_to_str(member) == expected
 
-    def test_pending_status(self):
-        """Test status code 2 (PENDING) returns 'pending'."""
-        assert artifact_status_to_str(ArtifactStatus.PENDING) == "pending"
-        assert artifact_status_to_str(2) == "pending"
+    def test_enum_covers_exactly_the_backend_codes(self):
+        """No member is missing, and none was invented beyond the backend enum."""
+        assert {member.value for member in ArtifactStatus} == {
+            code for code, _name, _s in _ARTIFACT_STATUS_TABLE
+        }
 
-    def test_completed_status(self):
-        """Test status code 3 (COMPLETED) returns 'completed'."""
-        assert artifact_status_to_str(ArtifactStatus.COMPLETED) == "completed"
-        assert artifact_status_to_str(3) == "completed"
+    def test_transitional_codes_are_not_transposed(self):
+        """#2127 regression pin: 1 is queued, 2 is actively generating.
 
-    def test_failed_status(self):
-        """Test status code 4 (FAILED) returns 'failed'."""
-        assert artifact_status_to_str(ArtifactStatus.FAILED) == "failed"
-        assert artifact_status_to_str(4) == "failed"
+        Two independent live traces observed ``2 -> 3`` on a generating
+        artifact, and every recorded CREATE_ARTIFACT row starts at 1.
+        """
+        assert ArtifactStatus.PENDING == 1
+        assert ArtifactStatus.PROCESSING == 2
 
-    def test_unknown_status_codes(self):
-        """Test unknown status codes return 'unknown'."""
-        assert artifact_status_to_str(0) == "unknown"
-        assert artifact_status_to_str(5) == "unknown"
+    def test_unrecognized_status_codes_degrade_to_unknown(self):
+        """Codes outside the backend enum still fail closed rather than raise."""
+        assert artifact_status_to_str(7) == "unknown"
         assert artifact_status_to_str(99) == "unknown"
         assert artifact_status_to_str(-1) == "unknown"
 
@@ -215,6 +314,7 @@ class TestSourceStatusToStr:
 
     def test_all_status_codes(self):
         """Test all SourceStatus enum values map correctly."""
+        assert source_status_to_str(SourceStatus.UNKNOWN) == "unknown"
         assert source_status_to_str(SourceStatus.PROCESSING) == "processing"
         assert source_status_to_str(1) == "processing"
         assert source_status_to_str(SourceStatus.READY) == "ready"
@@ -224,13 +324,161 @@ class TestSourceStatusToStr:
         assert source_status_to_str(SourceStatus.PREPARING) == "preparing"
         assert source_status_to_str(5) == "preparing"
 
-    def test_gap_status_code(self):
-        """Test gap status code 4 returns 'unknown'."""
-        assert source_status_to_str(4) == "unknown"
-
     def test_unknown_status_codes(self):
         """Test unknown status codes return 'unknown'."""
         assert source_status_to_str(0) == "unknown"
+        assert source_status_to_str(4) == "unknown"
         assert source_status_to_str(6) == "unknown"
         assert source_status_to_str(99) == "unknown"
         assert source_status_to_str(-1) == "unknown"
+
+
+class TestSharePermissionToStr:
+    """Tests for the share_permission_to_str helper function."""
+
+    def test_all_permission_codes(self):
+        """Every displayable SharePermission member maps to its label."""
+        assert share_permission_to_str(SharePermission.OWNER) == "owner"
+        assert share_permission_to_str(1) == "owner"
+        assert share_permission_to_str(SharePermission.EDITOR) == "editor"
+        assert share_permission_to_str(2) == "editor"
+        assert share_permission_to_str(SharePermission.VIEWER) == "viewer"
+        assert share_permission_to_str(3) == "viewer"
+
+    def test_remove_sentinel_is_not_a_label(self):
+        """``_REMOVE`` is a write-only share-mutation sentinel, not a role.
+
+        It must never surface as a displayable permission, so it degrades like
+        any other unmapped code rather than leaking a private enum name.
+        """
+        assert share_permission_to_str(SharePermission._REMOVE) == "unknown"
+        assert share_permission_to_str(4) == "unknown"
+
+    def test_unknown_permission_codes(self):
+        """Unrecognized codes return 'unknown' (future-proofing)."""
+        assert share_permission_to_str(0) == "unknown"
+        assert share_permission_to_str(5) == "unknown"
+        assert share_permission_to_str(99) == "unknown"
+        assert share_permission_to_str(-1) == "unknown"
+
+
+class TestDriveSourceStatusToStr:
+    """Tests for the drive_source_status_to_str helper function (#2111)."""
+
+    def test_every_member_has_a_label(self):
+        """No member falls through to the "unknown" default by accident."""
+        assert {member: drive_source_status_to_str(member) for member in DriveSourceStatus} == {
+            DriveSourceStatus.UNKNOWN: "unknown",
+            DriveSourceStatus.INACCESSIBLE: "inaccessible",
+            DriveSourceStatus.SYNCING: "syncing",
+            DriveSourceStatus.ACTIVE: "active",
+            DriveSourceStatus.DELETED: "deleted",
+            DriveSourceStatus.GEN_AI_ACCESS_DENIED: "gen_ai_access_denied",
+        }
+
+    def test_accepts_raw_wire_codes(self):
+        """The backend UserDriveSourceStatus integers map without an enum wrap."""
+        assert drive_source_status_to_str(1) == "inaccessible"
+        assert drive_source_status_to_str(2) == "syncing"
+        assert drive_source_status_to_str(3) == "active"
+        assert drive_source_status_to_str(4) == "deleted"
+        assert drive_source_status_to_str(5) == "gen_ai_access_denied"
+
+    def test_unknown_codes_degrade(self):
+        """Unrecognized codes return 'unknown' (future-proofing)."""
+        # 0 is the backend UNSPECIFIED, deliberately unmodelled: the decoder
+        # normalizes it to None before a label is ever asked for.
+        assert drive_source_status_to_str(0) == "unknown"
+        assert drive_source_status_to_str(6) == "unknown"
+        assert drive_source_status_to_str(99) == "unknown"
+        assert drive_source_status_to_str(-2) == "unknown"
+
+
+class TestDiscoveryModeToStr:
+    """Tests for the discovery_mode_to_str helper function (#2122)."""
+
+    def test_every_member_has_a_label(self):
+        """No member falls through to the "unknown" default by accident."""
+        assert {member: discovery_mode_to_str(member) for member in DiscoveryMode} == {
+            DiscoveryMode.UNKNOWN: "unknown",
+            DiscoveryMode.DEFAULT_LLM_SEARCH: "default_llm_search",
+            DiscoveryMode.RAW_SEARCH: "raw_search",
+            DiscoveryMode.CURIOUS_SEARCH: "curious_search",
+            DiscoveryMode.CURIOUS_RAW_SEARCH: "curious_raw_search",
+            DiscoveryMode.DEEP_RESEARCH: "deep_research",
+            DiscoveryMode.LITE_LLM_SEARCH: "lite_llm_search",
+        }
+
+    def test_accepts_raw_wire_codes(self):
+        """The backend DiscoveryMode integers map without an enum wrap."""
+        assert discovery_mode_to_str(1) == "default_llm_search"
+        assert discovery_mode_to_str(5) == "deep_research"
+
+    def test_unknown_codes_degrade(self):
+        """Unrecognized codes return 'unknown' (future-proofing)."""
+        # 0 is the backend UNSPECIFIED, deliberately unmodelled: the decoder
+        # normalizes it to None before a label is ever asked for.
+        assert discovery_mode_to_str(0) == "unknown"
+        assert discovery_mode_to_str(7) == "unknown"
+        assert discovery_mode_to_str(-2) == "unknown"
+
+
+class TestGrpcStatusCode:
+    """The canonical gRPC status table and its two coercion helpers."""
+
+    def test_values_match_the_google_rpc_code_table(self):
+        # Wire contract: these numbers come from google.rpc.Code and are what
+        # the backend embeds at index 5 of a wrb.fr entry.
+        assert GrpcStatusCode.NOT_FOUND == 5
+        assert GrpcStatusCode.PERMISSION_DENIED == 7
+        assert GrpcStatusCode.OK == 0
+        assert GrpcStatusCode.UNAUTHENTICATED == 16
+
+    def test_is_a_separate_namespace_from_rpc_error_code(self):
+        """``NOT_FOUND`` means 5 here and 404 in the HTTP-style enum.
+
+        The two enums share member names, so anything comparing a wire status
+        has to say which namespace it means. Pins that they did not get merged.
+        """
+        from notebooklm._web.wire.decoder import RPCErrorCode
+
+        assert RPCErrorCode.NOT_FOUND == 404
+        assert GrpcStatusCode.NOT_FOUND == 5
+
+    def test_decoder_status_labels_cover_every_member(self):
+        """Every status has wording; a new member cannot go unlabelled."""
+        from notebooklm._web.wire.decoder import _GRPC_STATUS_MESSAGES
+
+        assert set(_GRPC_STATUS_MESSAGES) == {int(code) for code in GrpcStatusCode}
+
+    def test_normalize_grpc_status_accepts_both_wire_forms(self):
+        assert normalize_grpc_status(5) is GrpcStatusCode.NOT_FOUND
+        assert normalize_grpc_status("5") is GrpcStatusCode.NOT_FOUND
+        assert normalize_grpc_status(7) is GrpcStatusCode.PERMISSION_DENIED
+
+    def test_normalize_grpc_status_rejects_non_statuses(self):
+        # rpc_code also carries non-numeric labels and may be absent entirely;
+        # neither may raise, and neither is a status.
+        assert normalize_grpc_status(None) is None
+        assert normalize_grpc_status("USER_DISPLAYABLE_ERROR") is None
+        assert normalize_grpc_status(999) is None
+        # An HTTP status is numeric but is not a gRPC code.
+        assert normalize_grpc_status(500) is None
+
+    def test_bool_is_not_a_status(self):
+        """``True`` must not normalize to CANCELLED (1) via the int subclass."""
+        assert normalize_grpc_status(True) is None
+        assert normalize_rpc_code(True) is None
+
+    def test_normalize_rpc_code_keeps_http_statuses(self):
+        """The wider helper passes 5xx through — the transient check needs it.
+
+        Narrowing this one to the gRPC table would silently drop every HTTP
+        status to ``None`` and disable the ``500 <= code < 600`` branch in the
+        neutral error classifier.
+        """
+        assert normalize_rpc_code(500) == 500
+        assert normalize_rpc_code("503") == 503
+        assert normalize_rpc_code(5) == 5
+        assert normalize_rpc_code(None) is None
+        assert normalize_rpc_code("USER_DISPLAYABLE_ERROR") is None

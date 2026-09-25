@@ -25,10 +25,12 @@ Design seams worth calling out:
   ``rename`` path consults ``client.mind_maps.list`` (typed :class:`MindMap`
   objects carrying ``kind``) so it can route note-backed maps via ``UPDATE_NOTE``
   and interactive maps via ``RENAME_ARTIFACT`` behind the unified mind-map API
-  (#1256). The ``delete`` path consults ``client.notes.list_mind_maps`` (raw note
-  rows, matched on ``row[0] == artifact_id``) because note-backed maps are
-  cleared via ``notes.delete``, not removed. Both are preserved exactly so the
-  recorded RPC call sets stay cassette-stable.
+  (#1256). The ``delete`` path probes membership via the typed
+  ``client.mind_maps.list_note_backed`` (one ``GET_NOTES_AND_MIND_MAPS``
+  round-trip, the same single RPC the old raw-row scan issued, and the same
+  mind-map-rows-only match) because note-backed maps are cleared via
+  ``notes.delete``, not removed. Both call sets are preserved exactly so the
+  recorded RPC cassettes stay stable.
 
 * **The status DTO is neutral.** :class:`ArtifactStatusView` mirrors the public
   :class:`~notebooklm.types.GenerationStatus` fields the adapters read
@@ -43,15 +45,44 @@ This module is transport-neutral — no ``click`` / ``rich`` / ``cli`` /
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ..exceptions import ArtifactNotFoundError
-from ..types import Artifact, ExportType
+from ..exceptions import ArtifactNotFoundError, RPCError
+from ..options import USE_DEFAULT
+from ..types import Artifact, ArtifactLookupStatus, ExportType
 
 if TYPE_CHECKING:
     from ..client import NotebookLMClient
     from ..types import GenerationStatus
+
+
+def _incomplete_artifact_lookup_error(failures: Sequence[Any] = ()) -> RPCError:
+    """Project bounded aggregate-read evidence through the existing RPC error."""
+    components = (
+        ", ".join(sorted({failure.component.value for failure in failures})) or "unspecified"
+    )
+    return RPCError(
+        f"Artifact lookup is incomplete; unavailable components: {components}",
+        method_id="artifacts.lookup",
+    )
+
+
+async def require_complete_artifact_listing(
+    client: NotebookLMClient,
+    notebook_id: str,
+) -> list[Artifact]:
+    """Return artifacts only when every aggregate backing was read successfully.
+
+    Fuzzy title/prefix resolution must not treat a Studio-only snapshot as a
+    unique match or as absence. Callers that already hold a canonical UUID
+    should skip this listing entirely.
+    """
+    listing = await client.artifacts.list_with_status(notebook_id)
+    if not listing.is_complete:
+        raise _incomplete_artifact_lookup_error(listing.failures)
+    return list(listing.items)
 
 
 # ---------------------------------------------------------------------------
@@ -66,16 +97,43 @@ async def get_artifact(
 ) -> Artifact:
     """Fetch a single artifact, raising :class:`ArtifactNotFoundError` on a miss.
 
-    Mirrors the v0.8.0 fail-loud contract (issue #1247): ``get_or_none``
-    returning ``None`` — the artifact was deleted between the partial-id resolve
-    and the get, or a canonical UUID points at a since-deleted artifact — is
-    surfaced as a typed not-found error the adapter maps to its own exit policy
-    (the CLI emits a ``NOT_FOUND`` envelope + exit 1).
+    Mirrors the v0.8.0 fail-loud contract (issue #1247): an authoritative
+    ``MISSING`` result is surfaced as a typed not-found error the adapter maps
+    to its own exit policy (the CLI emits a ``NOT_FOUND`` envelope + exit 1).
     """
-    art = await client.artifacts.get_or_none(notebook_id, artifact_id)
-    if art is None:
+    result = await client.artifacts.lookup(notebook_id, artifact_id)
+    if result.status is ArtifactLookupStatus.FOUND:
+        assert result.artifact is not None
+        return result.artifact
+    if result.status is ArtifactLookupStatus.UNKNOWN:
+        raise _incomplete_artifact_lookup_error(result.failures)
+    if result.status is ArtifactLookupStatus.MISSING:
         raise ArtifactNotFoundError(artifact_id)
-    return art
+    raise AssertionError(f"unrecognized artifact lookup status: {result.status!r}")
+
+
+# ---------------------------------------------------------------------------
+# get-prompt
+# ---------------------------------------------------------------------------
+
+
+async def get_artifact_prompt(
+    client: NotebookLMClient,
+    notebook_id: str,
+    artifact_id: str,
+) -> str | None:
+    """Fetch the free-text prompt an artifact was generated from.
+
+    Returns the prompt string, or ``None`` when the artifact stores no prompt
+    (e.g. a note-backed mind map). Raises :class:`ArtifactNotFoundError` when no
+    studio artifact matches ``artifact_id`` — the adapter maps that to its own
+    not-found policy (the CLI emits a ``NOT_FOUND`` envelope + exit 1).
+    """
+    return await client.artifacts.get_prompt(
+        notebook_id,
+        artifact_id,
+        require_complete=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -113,19 +171,20 @@ async def rename_artifact(
     pointing at a since-deleted artifact prints a benign no-op "success" — a
     pre-existing condition, not introduced here.
     """
-    mind_maps = await client.mind_maps.list(notebook_id)
-    mind_map = next((m for m in mind_maps if m.id == artifact_id), None)
-    if mind_map is not None:
-        await client.mind_maps.rename(
-            notebook_id, artifact_id, new_title, kind=mind_map.kind, return_object=False
+    async with client.operation(timeout=USE_DEFAULT):
+        mind_maps = await client.mind_maps.list(notebook_id)
+        mind_map = next((m for m in mind_maps if m.id == artifact_id), None)
+        if mind_map is not None:
+            await client.mind_maps.rename(
+                notebook_id, artifact_id, new_title, kind=mind_map.kind, return_object=False
+            )
+        else:
+            await client.artifacts.rename(notebook_id, artifact_id, new_title, return_object=False)
+        return ArtifactRenameResult(
+            artifact_id=artifact_id,
+            new_title=new_title,
+            is_mind_map=mind_map is not None,
         )
-    else:
-        await client.artifacts.rename(notebook_id, artifact_id, new_title, return_object=False)
-    return ArtifactRenameResult(
-        artifact_id=artifact_id,
-        new_title=new_title,
-        is_mind_map=mind_map is not None,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,20 +202,33 @@ async def delete_artifact(
     Note-backed mind maps live in the notes system; deleting one clears it (it
     is not removed — Google may garbage collect it later), so it routes through
     ``notes.delete`` while regular artifacts use ``artifacts.delete``. The
-    membership probe matches the raw note-row ``id`` (``row[0]``) against the
-    resolved artifact id, preserving the recorded RPC call set.
+    membership probe is the typed ``client.mind_maps.list_note_backed``, which
+    issues the same single ``GET_NOTES_AND_MIND_MAPS`` RPC (no
+    ``LIST_ARTIFACTS``) the historical raw-row scan did, so recorded cassettes
+    replay unchanged — and, like that scan, it matches **note-backed mind-map
+    rows only** (deleted rows excluded).
+
+    The narrow match is load-bearing, not an optimization: the CLI resolver's
+    full-ID fast-path skips the artifact listing for a canonical UUID, so a
+    plain user-note UUID can reach this function without ever being validated
+    as an artifact. A broader probe matching any note row (e.g. a
+    ``notes.get_or_none`` lookup) would route that plain note into
+    ``notes.delete`` and soft-delete user data; restricting the probe to
+    note-backed mind maps makes such an id fall through to
+    ``artifacts.delete`` (a harmless no-op/error), preserving the historical
+    behavior.
 
     Returns ``True`` when the deleted id was a note-backed mind map (so the
     adapter can flag the cleared-not-removed carve-out in its output), ``False``
     for a regular artifact.
     """
-    mind_maps = await client.notes.list_mind_maps(notebook_id)
-    for mm in mind_maps:
-        if mm[0] == artifact_id:
+    async with client.operation(timeout=USE_DEFAULT):
+        note_backed = await client.mind_maps.list_note_backed(notebook_id)
+        if any(mm.id == artifact_id for mm in note_backed):
             await client.notes.delete(notebook_id, artifact_id)
             return True
-    await client.artifacts.delete(notebook_id, artifact_id)
-    return False
+        await client.artifacts.delete(notebook_id, artifact_id)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +273,7 @@ async def export_artifact(
     retrieves the content from ``artifact_id`` itself.
     """
     export_type_enum = ExportType.SHEETS if export_type == "sheets" else ExportType.DOCS
-    result = await client.artifacts.export(notebook_id, artifact_id, None, title, export_type_enum)
+    result = await client.artifacts.export(notebook_id, artifact_id, title, export_type_enum)
     return ArtifactExportResult(
         artifact_id=artifact_id,
         title=title,
@@ -232,6 +304,14 @@ class ArtifactStatusView:
     error_code: str | None
     metadata: dict[str, Any] | None
     is_complete: bool
+    #: Whether the artifact's media is fully ready. ``poll_status`` extracts
+    #: ``url`` unconditionally (even for a still-pending row), so a non-null
+    #: ``url`` alone does NOT mean it is safe to use. This mirrors the poll
+    #: adapter's ``is_media_ready`` gate (it downgrades a COMPLETED-but-not-yet-
+    #: populated media row back to in-progress), so it is ``True`` exactly when
+    #: generation has completed — when ``False`` any ``url`` present is
+    #: provisional/expiring and should not be fetched yet (#1924 F13).
+    media_ready: bool
 
 
 def status_view(status: GenerationStatus) -> ArtifactStatusView:
@@ -250,6 +330,11 @@ def status_view(status: GenerationStatus) -> ArtifactStatusView:
         error_code=getattr(status, "error_code", None),
         metadata=getattr(status, "metadata", None),
         is_complete=status.is_complete,
+        # ``poll_status`` only reports ``is_complete`` once the media URL is
+        # populated (it downgrades a COMPLETED-but-empty media row to in-progress
+        # via ``is_media_ready``), so ``is_complete`` is the media-ready signal:
+        # a non-null ``url`` on a not-yet-complete row is provisional (#1924 F13).
+        media_ready=status.is_complete,
     )
 
 
@@ -319,8 +404,10 @@ __all__ = [
     "delete_artifact",
     "export_artifact",
     "get_artifact",
+    "get_artifact_prompt",
     "poll_artifact",
     "rename_artifact",
+    "require_complete_artifact_listing",
     "retry_artifact",
     "status_view",
     "wait_for_artifact",

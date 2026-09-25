@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import sys
 from pathlib import Path
 
 import pytest
+
+import notebooklm.config as notebooklm_config
 
 pytestmark = pytest.mark.repo_lint
 
@@ -62,6 +65,11 @@ def _class(*, members: dict | None = None, signature: dict | None = None) -> dic
         "members": members or {},
         "enum_members": {},
     }
+
+
+def _constant(value_repr: str) -> dict:
+    """A value-tracked module constant entry (VALUE_TRACKED_CONSTANTS)."""
+    return {"kind": "str", "signature": None, "constant_value": value_repr}
 
 
 def _manifest(exports: dict) -> dict:
@@ -181,6 +189,7 @@ def test_collect_manifest_includes_representative_client_namespace_methods(scrip
     assert {
         "artifacts.download_audio",
         "chat.ask",
+        "collections.list",
         "mind_maps.generate",
         "mind_maps.get",
         "notebooks.list",
@@ -196,6 +205,22 @@ def test_mind_maps_namespace_is_audited(script):
     assert "mind_maps" in script.CLIENT_NAMESPACE_ATTRIBUTES
 
 
+def test_all_eleven_client_namespaces_are_audited(script):
+    assert set(script.CLIENT_NAMESPACE_ATTRIBUTES) == {
+        "artifacts",
+        "chat",
+        "collections",
+        "labels",
+        "mind_maps",
+        "notes",
+        "notebooks",
+        "research",
+        "settings",
+        "sharing",
+        "sources",
+    }
+
+
 def test_collect_manifest_captures_return_annotation(script):
     manifest = script.collect_manifest(REPO_ROOT)
     members = manifest["modules"]["notebooklm"]["exports"]["NotebookLMClient"]["members"]
@@ -203,6 +228,12 @@ def test_collect_manifest_captures_return_annotation(script):
     delete = members["sources.delete"]["signature"]
     assert "return_annotation" in delete
     assert delete["return_annotation"] == "None"
+
+    # ``append_text`` is inherited from a postponed-annotations base while
+    # ``delete`` is defined by a non-postponed Web facade. Both spell the same
+    # public contract and must remain identical in the compatibility manifest.
+    append_text = members["sources.append_text"]["signature"]
+    assert append_text["return_annotation"] == "None"
 
 
 def test_collect_manifest_canonicalizes_pep563_return_annotation(script):
@@ -217,6 +248,30 @@ def test_collect_manifest_canonicalizes_pep563_return_annotation(script):
     assert members["mind_maps.get"]["signature"]["return_annotation"] == "notebooklm.types.MindMap"
 
 
+def test_collect_manifest_canonicalizes_neutral_enum_annotation_home(script):
+    """The enum move keeps the historical audited compatibility spelling."""
+    manifest = script.collect_manifest(REPO_ROOT)
+
+    cases = (
+        ("notebooklm", "Artifact", "report_format", "notebooklm.rpc.types.ReportFormat | None"),
+        (
+            "notebooklm",
+            "NextStepSuggestion",
+            "kind",
+            "notebooklm.rpc.types.MagicArtifactType | None",
+        ),
+        (
+            "notebooklm",
+            "NotebookMetadata",
+            "role",
+            "notebooklm.rpc.types.SharePermission | None",
+        ),
+    )
+    for module_name, class_name, member_name, expected in cases:
+        member = manifest["modules"][module_name]["exports"][class_name]["members"][member_name]
+        assert member["signature"]["return_annotation"] == expected
+
+
 def test_collect_manifest_preserves_defaulted_dataclass_fields(script):
     manifest = script.collect_manifest(REPO_ROOT)
     members = manifest["modules"]["notebooklm"]["exports"]["GenerationStatus"]["members"]
@@ -229,6 +284,18 @@ def test_signature_compare_allows_optional_parameter_addition(script):
     new = _signature(_param("notebook_id"), _param("timeout", default=True))
 
     assert script._signature_breakage(old, new) is None
+
+
+def test_signature_compare_allows_newly_inspectable_signature(script):
+    new = _signature(_param("notebook_id"))
+
+    assert script._signature_breakage(None, new) is None
+
+
+def test_signature_compare_rejects_newly_uninspectable_signature(script):
+    old = _signature(_param("notebook_id"))
+
+    assert script._signature_breakage(old, None) == f"signature changed from {old!r} to None"
 
 
 def test_signature_compare_rejects_required_parameter_addition(script):
@@ -425,6 +492,140 @@ def test_compare_manifests_detects_enum_value_change(script):
 
     assert [item.code for item in breaks] == ["changed-enum-value"]
     assert breaks[0].object == "notebooklm.SourceType.PDF"
+
+
+def test_compare_manifests_detects_changed_constant_value(script):
+    """A value-tracked constant rebound to a different value is a reviewable break.
+
+    Before this, a public constant carried only its ``kind`` into the manifest, so
+    repointing ``DEFAULT_BASE_URL`` at a different host compared as "str vs str" —
+    identical — and the audit stayed green through the host flip.
+    """
+    baseline = _manifest({"DEFAULT_BASE_URL": _constant("'https://old.example'")})
+    current = _manifest({"DEFAULT_BASE_URL": _constant("'https://new.example'")})
+
+    breaks = script.compare_manifests(baseline, current)
+
+    assert [item.code for item in breaks] == ["changed-constant-value"]
+    assert breaks[0].object == "notebooklm.DEFAULT_BASE_URL"
+    assert "old.example" in breaks[0].detail and "new.example" in breaks[0].detail
+
+
+def test_compare_manifests_ignores_untracked_constant(script):
+    """Only names in ``VALUE_TRACKED_CONSTANTS`` carry a fingerprint.
+
+    Both sides lack ``constant_value``, so nothing is compared — adding or removing
+    a name from the tracked set must not fire a break by itself.
+    """
+    baseline = _manifest({"SOME_CONSTANT": {"kind": "str"}})
+    current = _manifest({"SOME_CONSTANT": {"kind": "str"}})
+
+    assert script.compare_manifests(baseline, current) == []
+
+
+def test_compare_manifests_ignores_one_sided_constant_fingerprint(script):
+    """Newly tracking a constant is not itself a break.
+
+    The baseline predates the name being tracked, so only one side has a
+    fingerprint and there is nothing to compare against.
+    """
+    baseline = _manifest({"DEFAULT_BASE_URL": {"kind": "str"}})
+    current = _manifest({"DEFAULT_BASE_URL": _constant("'https://new.example'")})
+
+    assert script.compare_manifests(baseline, current) == []
+
+
+def test_collect_manifest_captures_tracked_constant_values(script):
+    """The tracked cookie-domain / host constants really do carry a fingerprint."""
+    manifest = script.collect_manifest(REPO_ROOT)
+
+    config_exports = manifest["modules"]["notebooklm.config"]["exports"]
+    assert config_exports["DEFAULT_BASE_URL"]["constant_value"] == repr(
+        notebooklm_config.DEFAULT_BASE_URL
+    )
+
+    auth_exports = manifest["modules"]["notebooklm.auth"]["exports"]
+    required = auth_exports["REQUIRED_COOKIE_DOMAINS"]["constant_value"]
+    assert ".google.com" in required
+    # Untracked public exports stay fingerprint-free — the capture is opt-in.
+    assert "constant_value" not in auth_exports["AuthTokens"]
+
+
+def test_collect_manifest_constant_fingerprint_is_hash_seed_stable(script, monkeypatch):
+    """Set/dict fingerprints must not depend on PYTHONHASHSEED.
+
+    ``REQUIRED_COOKIE_DOMAINS`` is a frozenset, and each collection runs in a fresh
+    subprocess. A raw ``repr()`` would order its members by hash and differ between
+    the baseline run and the current run, reporting a break on every invocation
+    while the value never changed.
+    """
+
+    def _tracked_constants(seed: str) -> dict[str, str]:
+        monkeypatch.setenv("PYTHONHASHSEED", seed)
+        exports = script.collect_manifest(REPO_ROOT)["modules"]["notebooklm.auth"]["exports"]
+        return {
+            name: exports[name]["constant_value"]
+            for name in script.VALUE_TRACKED_CONSTANTS["notebooklm.auth"]
+        }
+
+    assert _tracked_constants("1") == _tracked_constants("2")
+
+
+def _stable_value_repr(script):
+    """Return the real ``stable_value_repr`` from the collector source.
+
+    The function lives inside the ``_COLLECTOR`` script that the audit runs in a
+    subprocess, so it is not an attribute of the loaded module. Lift the actual
+    function definition out of that source rather than re-implementing it here —
+    a copy would happily keep passing after the shipped one regressed.
+    """
+    tree = ast.parse(script._COLLECTOR)
+    node = next(
+        item
+        for item in tree.body
+        if isinstance(item, ast.FunctionDef) and item.name == "stable_value_repr"
+    )
+    namespace: dict = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<collector>", "exec"), namespace)
+    return namespace["stable_value_repr"]
+
+
+def test_stable_value_repr_is_order_insensitive_for_containers(script):
+    """Set and dict members render sorted, so iteration order cannot leak in."""
+    stable_value_repr = _stable_value_repr(script)
+
+    assert stable_value_repr(frozenset({"b", "a"})) == stable_value_repr(frozenset({"a", "b"}))
+    assert stable_value_repr({"b": 1, "a": 2}) == stable_value_repr({"a": 2, "b": 1})
+    # Sequences keep their order — reordering a public tuple IS a change.
+    assert stable_value_repr(("a", "b")) != stable_value_repr(("b", "a"))
+
+
+def test_stable_value_repr_distinguishes_container_types(script):
+    """A ``frozenset`` and a ``set`` with equal members must not fingerprint alike.
+
+    Swapping the container of a published constant is a real contract change —
+    a ``set`` lets callers mutate the library's own state — so an untagged
+    ``{...}`` rendering (which also collides with an empty dict) would let it pass
+    as no change.
+    """
+    stable_value_repr = _stable_value_repr(script)
+
+    assert stable_value_repr(frozenset({"a"})) != stable_value_repr({"a"})
+    assert stable_value_repr(frozenset()) != stable_value_repr({})
+    # Nested, too: the members are equal, only the inner container type differs.
+    assert stable_value_repr({"k": frozenset({"a"})}) != stable_value_repr({"k": {"a"}})
+
+
+def test_compare_manifests_detects_nested_container_type_change(script):
+    """The nested change above reaches ``compare_manifests`` as a break."""
+    stable_value_repr = _stable_value_repr(script)
+    baseline = _manifest({"TIERS": _constant(stable_value_repr({"k": frozenset({"a"})}))})
+    current = _manifest({"TIERS": _constant(stable_value_repr({"k": {"a"}}))})
+
+    breaks = script.compare_manifests(baseline, current)
+
+    assert [item.code for item in breaks] == ["changed-constant-value"]
+    assert breaks[0].object == "notebooklm.TIERS"
 
 
 def test_compare_manifests_detects_removed_enum_member(script):
@@ -675,6 +876,18 @@ def test_audit_json_includes_stale_allowances_field(script, tmp_path, monkeypatc
     _stub_manifests()
     assert script.main(["--check-stale", "--allowlist", str(allowlist)]) == 1
 
+    # ``--prune`` performs the explicit write and reports the removed entry.
+    _stub_manifests()
+    assert script.main(["--prune", "--allowlist", str(allowlist)]) == 0
+    assert json.loads(allowlist.read_text(encoding="utf-8"))["allowed_breaks"] == [
+        {
+            "code": "removed-export",
+            "object": "notebooklm.GoneExport",
+            "reason": "intentional, pending next release",
+        }
+    ]
+    assert "Pruned stale allowlist entries" in capsys.readouterr().out
+
 
 def test_stale_allowances_does_not_collide_on_same_object_different_codes(script):
     # Two allowances for the SAME object but different codes must be tracked
@@ -692,6 +905,130 @@ def test_stale_allowances_does_not_collide_on_same_object_different_codes(script
     # or last in the comprehension that builds the match map.
     assert script.stale_allowances([brk], [live, stale]) == [stale]
     assert script.stale_allowances([brk], [stale, live]) == [stale]
+
+
+def test_prune_allowlist_preserves_policy_fields_and_removes_exact_entries(tmp_path, script):
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "z_future_policy": {"enabled": True},
+                "schema_version": 1,
+                "extra_public_names": {"notebooklm": ["KeptName"]},
+                "allowed_breaks": [
+                    {
+                        "code": "removed-export",
+                        "object": "notebooklm.Stale",
+                        "reason": "shipped",
+                        "review_url": "https://example.invalid/review",
+                    },
+                    {
+                        "code": "removed-export",
+                        "object": "notebooklm.Live",
+                        "reason": "still intentional",
+                    },
+                    {
+                        "code": "removed-export",
+                        "object": "notebooklm.Stale",
+                        "reason": "different reason; keep",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale = [script.Allowance(code="removed-export", object="notebooklm.Stale", reason="shipped")]
+
+    removed = script.prune_allowlist(policy, stale)
+
+    assert removed == stale
+    rewritten = json.loads(policy.read_text(encoding="utf-8"))
+    assert rewritten["z_future_policy"] == {"enabled": True}
+    assert rewritten["extra_public_names"] == {"notebooklm": ["KeptName"]}
+    assert rewritten["allowed_breaks"] == [
+        {
+            "code": "removed-export",
+            "object": "notebooklm.Live",
+            "reason": "still intentional",
+        },
+        {
+            "code": "removed-export",
+            "object": "notebooklm.Stale",
+            "reason": "different reason; keep",
+        },
+    ]
+    assert policy.read_text(encoding="utf-8").endswith("\n")
+    before = policy.stat().st_mtime_ns
+    assert script.prune_allowlist(policy, stale) == []
+    assert policy.stat().st_mtime_ns == before
+
+
+def test_prune_allowlist_is_idempotent_and_pair_aware(tmp_path, script):
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "allowed_breaks": [
+                    {
+                        "code": "removed-member",
+                        "object": "notebooklm.client.NotebookLMClient.sources.get",
+                        "reason": "same pair",
+                    },
+                    {
+                        "code": "removed-member",
+                        "object": "notebooklm.NotebookLMClient.sources.get",
+                        "reason": "same pair",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pair_break = script.ApiBreak(
+        code="removed-member",
+        object="notebooklm.NotebookLMClient.sources.get",
+        detail="still breaking",
+    )
+    stale = script.stale_allowances(
+        [pair_break],
+        script.load_policy(policy)[0],
+    )
+
+    assert stale == []
+    before = policy.stat().st_mtime_ns
+    assert script.prune_allowlist(policy, stale) == []
+    assert policy.stat().st_mtime_ns == before
+
+
+def test_prune_allowlist_reports_malformed_and_rewrite_errors(tmp_path, script, monkeypatch):
+    malformed = tmp_path / "malformed.json"
+    malformed.write_text("{", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="invalid JSON"):
+        script.prune_allowlist(malformed, [])
+
+    policy = tmp_path / "policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "allowed_breaks": [
+                    {"code": "removed-export", "object": "notebooklm.X", "reason": "old"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        script.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("read-only filesystem"))
+    )
+    with pytest.raises(
+        RuntimeError, match="could not atomically rewrite allowlist.*read-only filesystem"
+    ):
+        script.prune_allowlist(
+            policy,
+            [script.Allowance("removed-export", "notebooklm.X", "old")],
+        )
 
 
 def test_check_stale_does_not_print_ok_when_stale_blocks(script, tmp_path, monkeypatch, capsys):
@@ -739,3 +1076,49 @@ def test_check_stale_does_not_print_ok_when_stale_blocks(script, tmp_path, monke
     assert "OK:" not in captured.err
     assert "stale" in captured.err.lower()
     assert "notebooklm.AlreadyBaked" in captured.err
+
+
+def test_latest_release_tag_skips_prereleases_and_nonrelease(script, tmp_path):
+    """The default baseline stays on the last STABLE release tag.
+
+    Pre-release (aN/bN/rcN) and non-release tags must not become the baseline,
+    else pushing an alpha would silently rebaseline the compat gate.
+    """
+    import subprocess
+
+    def git(*args):
+        subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    git("init")
+    git("config", "user.email", "t@t.t")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    git("config", "tag.gpgsign", "false")
+
+    (tmp_path / "f").write_text("1")
+    git("add", "f")
+    git("commit", "-m", "c1")
+    git("tag", "v0.7.3")
+
+    (tmp_path / "f").write_text("2")
+    git("commit", "-am", "c2")
+    git("tag", "docs-2026")  # stray non-release tag
+
+    (tmp_path / "f").write_text("3")
+    git("commit", "-am", "c3")
+    git("tag", "v0.8.0a1")  # pre-release
+
+    # Mid-cycle: baseline must skip BOTH the alpha and the stray tag.
+    assert script.latest_release_tag(tmp_path) == "v0.7.3"
+
+    (tmp_path / "f").write_text("4")
+    git("commit", "-am", "c4")
+    git("tag", "v0.8.0")  # final stable
+
+    assert script.latest_release_tag(tmp_path) == "v0.8.0"

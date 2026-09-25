@@ -120,6 +120,44 @@ class TestWaitHappy:
         assert "cited_only" not in payload
 
 
+@pytest.mark.parametrize("option", ["--run-id", "--task-id"])
+def test_status_exact_run_aliases_pin_the_single_poll(runner_and_mocks, option: str) -> None:
+    runner, factory = runner_and_mocks
+    client = factory(HAPPY_POLL)
+
+    result = runner.invoke(
+        cli,
+        ["research", "status", "-n", "nb_123", option, "task_exact", "--json"],
+        obj=inject_client(client),
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["task_id"] == "task_abc"
+    client.research.poll.assert_awaited_once_with("nb_123", "task_exact")
+
+
+@pytest.mark.parametrize("option", ["--run-id", "--task-id"])
+def test_wait_exact_run_aliases_thread_the_wait_discriminator(
+    runner_and_mocks, option: str
+) -> None:
+    runner, factory = runner_and_mocks
+    client = factory(HAPPY_POLL)
+
+    result = runner.invoke(
+        cli,
+        ["research", "wait", "-n", "nb_123", option, "task_exact", "--json"],
+        obj=inject_client(client),
+    )
+
+    assert result.exit_code == 0
+    client.research.wait_for_completion.assert_awaited_once_with(
+        "nb_123",
+        "task_exact",
+        timeout=1800.0,
+        initial_interval=5.0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Timeout path — research never completes
 # ---------------------------------------------------------------------------
@@ -206,7 +244,24 @@ class TestWaitCancelled:
         assert payload["error"] is True
         assert payload["code"] == "CANCELLED"
         # Resume hint surfaces the research-specific command.
-        assert "notebooklm research status" in payload.get("resume_hint", "")
+        assert payload["resume_hint"] == "notebooklm research status"
+
+    def test_cancelled_exact_run_resume_hint_stays_pinned(self, runner_and_mocks):
+        runner, _ = runner_and_mocks
+        mock_client = create_mock_client()
+        mock_client.research.poll = AsyncMock(side_effect=KeyboardInterrupt)
+
+        result = runner.invoke(
+            cli,
+            ["research", "wait", "-n", "nb_123", "--run-id", "task_exact", "--json"],
+            obj=inject_client(mock_client),
+        )
+
+        assert result.exit_code == 130
+        payload = json.loads(result.output)
+        assert payload["resume_hint"] == (
+            "notebooklm research status -n nb_123 --run-id task_exact"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +340,7 @@ class TestWaitImportAll:
             "nb_123",
             "task_abc",
             [{"url": "http://example.com", "title": "Source 1", "result_type": 1}],
-            max_elapsed=300,
+            max_elapsed=1800,
         )
 
     def test_import_all_json(self, runner_and_mocks):
@@ -314,7 +369,7 @@ class TestWaitImportAll:
             "nb_123",
             "task_abc",
             [{"url": "http://example.com", "title": "Source 1", "result_type": 1}],
-            max_elapsed=300,
+            max_elapsed=1800,
             json_output=True,
         )
 
@@ -354,7 +409,7 @@ class TestWaitImportAll:
             "nb_123",
             "task_abc",
             [{"url": "https://example.com/cited", "title": "Cited", "result_type": 1}],
-            max_elapsed=300,
+            max_elapsed=1800,
         )
 
     def test_import_all_cited_only_json(self, runner_and_mocks):
@@ -404,7 +459,7 @@ class TestWaitImportAll:
             "nb_123",
             "task_abc",
             [{"url": "https://example.com/cited", "title": "Cited", "result_type": 1}],
-            max_elapsed=300,
+            max_elapsed=1800,
             json_output=True,
         )
 
@@ -453,3 +508,106 @@ class TestTaskIdPinning:
         # Second call: task_id pinned to the value discovered on the first poll.
         second_call = poll_mock.await_args_list[1]
         assert second_call.kwargs.get("task_id") == "task_pinned"
+
+
+# ---------------------------------------------------------------------------
+# #1964 — a run that found nothing explains itself instead of saying "failed"
+# ---------------------------------------------------------------------------
+
+
+# Status code 3 + source tag 2 is the live-captured shape of a Drive search
+# that matched no file (see docs/rpc-reference.md).
+DRIVE_NO_MATCH_POLL = {
+    "status": "failed",
+    "task_id": "task_abc",
+    "query": "Example Document.md",
+    "status_code": 3,
+    "source_type": 2,
+}
+
+
+class TestWaitNoResults:
+    def test_empty_drive_search_explains_itself_in_text_mode(self, runner_and_mocks):
+        """Regression for #1964: the user used to get a bare "Research failed"
+        with nothing actionable."""
+        runner, factory = runner_and_mocks
+        result = runner.invoke(
+            cli,
+            ["research", "wait", "-n", "nb_123"],
+            obj=inject_client(factory(DRIVE_NO_MATCH_POLL)),
+        )
+
+        assert result.exit_code == 1
+        out = _strip_ansi(result.output)
+        assert "found no matches" in out
+        assert "Google Drive" in out
+        # The remediation is the actionable half — without it the user knows
+        # what happened but not what to do.
+        assert "document id" in out
+
+    def test_empty_drive_search_reason_on_json_surface(self, runner_and_mocks):
+        runner, factory = runner_and_mocks
+        result = runner.invoke(
+            cli,
+            ["research", "wait", "-n", "nb_123", "--json"],
+            obj=inject_client(factory(DRIVE_NO_MATCH_POLL)),
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["status"] == "failed"
+        assert "found no matches" in payload["reason_message"]
+        assert "document id" in payload["hint"]
+
+    def test_unnameable_failure_keeps_the_bare_wording(self, runner_and_mocks):
+        """A failure with no termination reason must not grow empty
+        reason/hint keys — the historical shape stands."""
+        runner, factory = runner_and_mocks
+        result = runner.invoke(
+            cli,
+            ["research", "wait", "-n", "nb_123", "--json"],
+            obj=inject_client(factory({"status": "failed", "query": "q"})),
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["status"] == "failed"
+        assert "reason_message" not in payload
+        assert "hint" not in payload
+
+
+class TestStatusNoResults:
+    def test_status_text_mode_explains_empty_drive_search(self, runner_and_mocks):
+        runner, factory = runner_and_mocks
+        result = runner.invoke(
+            cli,
+            ["research", "status", "-n", "nb_123"],
+            obj=inject_client(factory(DRIVE_NO_MATCH_POLL)),
+        )
+
+        out = _strip_ansi(result.output)
+        assert "Status: failed" in out
+        assert "found no matches" in out
+        assert "document id" in out
+
+    def test_status_json_shape_is_unchanged(self, runner_and_mocks):
+        """``research status --json`` emits the byte-stable public dict, so the
+        new fields deliberately do NOT appear there (the same call #1922 made
+        for ``status_code``)."""
+        runner, factory = runner_and_mocks
+        result = runner.invoke(
+            cli,
+            ["research", "status", "-n", "nb_123", "--json"],
+            obj=inject_client(factory(DRIVE_NO_MATCH_POLL)),
+        )
+
+        payload = json.loads(result.output)
+        assert set(payload) == {
+            "task_id",
+            "status",
+            "query",
+            "sources",
+            "summary",
+            "report",
+            "tasks",
+        }

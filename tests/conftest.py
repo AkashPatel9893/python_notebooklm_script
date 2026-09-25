@@ -1,9 +1,10 @@
-"""Shared test fixtures."""
-
+import functools
 import importlib.util
 import json
 import os
 import re
+from pathlib import Path
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -11,6 +12,20 @@ from notebooklm.auth import AuthTokens
 from notebooklm.rpc import RPCMethod
 
 _PLAYWRIGHT_INSTALLED = importlib.util.find_spec("playwright") is not None
+
+# Reality probes are intentionally an explicit, small set. Inferring the
+# expected set from markers would let a deleted or deselected probe disappear
+# while the required lane still passed.
+REQUIRED_REALITY_PROBES = frozenset(
+    {
+        "tests/unit/cli/test_playwright_login_coverage.py::"
+        "test_probe_source_detects_both_states_against_real_playwright",
+        "tests/unit/cli/test_playwright_login_coverage.py::"
+        "test_chromium_launches_headless_against_real_playwright",
+    }
+)
+_REALITY_DEPENDENCY_MARKERS = frozenset({"requires_playwright", "requires_chromium"})
+_REALITY_REPORTS: dict[str, list[tuple[str, str]]] = {}
 
 
 # Mirror of ``tests/vcr_config._is_vcr_record_mode`` — duplicated (not imported)
@@ -20,6 +35,7 @@ _PLAYWRIGHT_INSTALLED = importlib.util.find_spec("playwright") is not None
 # value and split the config into a half-recording state; ``test_home_isolation``
 # pins the parity. (#1263)
 _VCR_RECORD_ENV = "NOTEBOOKLM_VCR_RECORD"
+_ANDROID_GRPC_RECORD_ENV = "NOTEBOOKLM_ANDROID_GRPC_RECORD"
 
 
 def _vcr_recording() -> bool:
@@ -27,7 +43,20 @@ def _vcr_recording() -> bool:
     return os.environ.get(_VCR_RECORD_ENV, "").casefold() in ("1", "true", "yes")
 
 
-def _should_use_real_home(*, e2e: bool, vcr: bool, recording: bool) -> bool:
+def _android_grpc_recording() -> bool:
+    """Whether the test-only Android gRPC seam is recording live traffic."""
+
+    return os.environ.get(_ANDROID_GRPC_RECORD_ENV, "").casefold() in ("1", "true", "yes")
+
+
+def _should_use_real_home(
+    *,
+    e2e: bool,
+    vcr: bool,
+    recording: bool,
+    grpc_cassette: bool = False,
+    grpc_recording: bool = False,
+) -> bool:
     """Whether a test should see the developer's real ``~/.notebooklm`` profile
     rather than an isolated tmp ``NOTEBOOKLM_HOME``.
 
@@ -38,8 +67,10 @@ def _should_use_real_home(*, e2e: bool, vcr: bool, recording: bool) -> bool:
       path read out of ``NOTEBOOKLM_HOME``. Replay runs and non-VCR tests stay
       isolated, so the suite is reproducible and a stray ``NOTEBOOKLM_VCR_RECORD``
       on a normal run never lets a test touch the real profile (issue #1263).
+    - **Android gRPC cassette** tests follow the same rule under the separate
+      ``NOTEBOOKLM_ANDROID_GRPC_RECORD=1`` opt-in.
     """
-    return e2e or (vcr and recording)
+    return e2e or (vcr and recording) or (grpc_cassette and grpc_recording)
 
 
 def _isolation_home(request, tmp_path):
@@ -62,6 +93,8 @@ def _isolation_home(request, tmp_path):
         e2e=request.node.get_closest_marker("e2e") is not None,
         vcr=request.node.get_closest_marker("vcr") is not None,
         recording=_vcr_recording(),
+        grpc_cassette=request.node.get_closest_marker("grpc_cassette") is not None,
+        grpc_recording=_android_grpc_recording(),
     ):
         return None
     return str(tmp_path / "notebooklm-home")
@@ -79,11 +112,12 @@ def _isolate_notebooklm_home(request, tmp_path, monkeypatch):
     ``NOTEBOOKLM_HOME`` at a tmp dir gives every test the same empty-storage
     view CI sees, so the suite is reproducible across machines.
 
-    Two opt-outs use the real ``~/.notebooklm/`` profile instead (see
+    Three opt-outs use the real ``~/.notebooklm/`` profile instead (see
     :func:`_should_use_real_home` / :func:`_isolation_home`): ``@pytest.mark.e2e``
     tests (mint live tokens) and ``@pytest.mark.vcr`` tests while recording
-    (``NOTEBOOKLM_VCR_RECORD=1``) — the latter lets a cassette be recorded
-    through pytest rather than a standalone script (issue #1263).
+    (``NOTEBOOKLM_VCR_RECORD=1``), plus ``@pytest.mark.grpc_cassette`` tests
+    while ``NOTEBOOKLM_ANDROID_GRPC_RECORD=1``. The recording opt-ins let each
+    cassette kind resolve real auth through pytest; replay remains isolated.
     """
     home = _isolation_home(request, tmp_path)
     if home is not None:
@@ -91,48 +125,66 @@ def _isolate_notebooklm_home(request, tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_poke_state():
-    """Reset module-level rotation guards between tests.
+def _isolate_backend_preference(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep ambient backend preferences out of non-live constructor tests.
 
-    The ``notebooklm.auth`` rotation throttle keeps two pieces of module-global
-    state that persist across tests and would otherwise leak:
+    E2E runs deliberately use ``NOTEBOOKLM_BACKEND`` to select the backend
+    under test, so preserve the caller's explicit choice for those tests.
+    """
+    if request.node.get_closest_marker("e2e") is None:
+        monkeypatch.delenv("NOTEBOOKLM_BACKEND", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_poke_state():
+    """Reset process-owned auth lifecycle state between tests.
+
+    The process-default rotation owner keeps two pieces of state that persist
+    across tests and would otherwise leak:
 
     1. ``_LAST_POKE_ATTEMPT_MONOTONIC`` (``dict[Path | None, float]``) — keyed
        per-profile. Without clearing, the first test to poke any profile sets
        the timestamp and subsequent tests in that file see "we just poked"
        and silently skip the POST they're asserting on.
-    2. ``_POKE_LOCKS_BY_LOOP`` (``WeakKeyDictionary[loop, dict[..., Lock]]``) —
+    2. ``_POKE_LOCKS_BY_LOOP`` (``WeakKeyDictionary[loop, WeakValueDictionary[..., Lock]]``) —
        in production each per-loop entry is reclaimed automatically when its
        loop is GC'd. In tests the loop typically outlives the explicit
        cleanup point (pytest-asyncio's loop teardown happens after fixtures
        run), so we clear it eagerly to keep tests independent.
     3. ``_SECONDARY_BINDING_WARNED`` — one-shot flag for the Tier 2 cookie
        warning. Reset so tests can independently observe the warning fire.
+    4. ``LegacyPromotionScheduler.process_default()`` — the detached retryable
+       legacy-account promotion (ADR-0033 PR 5.1). A read of
+       a legacy-only profile schedules a background writer, so teardown must
+       JOIN it before clearing: a worker still running when the next test
+       starts would write into a ``tmp_path`` that test believes it owns, and
+       a leftover active-path entry would suppress the very promotion another
+       test is asserting on (``tmp_path`` uniqueness makes real path collisions
+       unlikely, but the drain makes the durable half deterministic).
     """
-    from notebooklm import auth as _auth
     from notebooklm._auth import cookie_policy as _cookie_policy
-    from notebooklm._auth import storage as _auth_storage
+    from notebooklm._auth import keepalive as _keepalive
+    from notebooklm._auth.profile_migration import LegacyPromotionScheduler
 
-    # ``_LAST_POKE_ATTEMPT_MONOTONIC`` and ``_POKE_LOCKS_BY_LOOP`` are shared
-    # by identity across ``notebooklm.auth`` and ``notebooklm._auth.keepalive``
-    # (the auth-module re-export captures the same dict object). ``.clear()``
-    # mutates in place so reaching through either reference is equivalent.
-    #
-    # ``_SECONDARY_BINDING_WARNED`` lives on the cookie_policy seam since D1
-    # PR-2 retired the ``_AuthFacadeModule`` write-through. Reset on the
-    # owner directly; the auth-module re-export captured at import time was
-    # never the canonical store.
-    # ``_FLOCK_UNAVAILABLE_WARNED`` is reset for the same reason — the
-    # storage seam owns the flag.
-    _auth._LAST_POKE_ATTEMPT_MONOTONIC.clear()
-    _auth._POKE_LOCKS_BY_LOOP.clear()
-    _cookie_policy._SECONDARY_BINDING_WARNED = False
-    _auth_storage._FLOCK_UNAVAILABLE_WARNED = False
+    scheduler = LegacyPromotionScheduler.process_default()
+
+    # Rotation reset checks that no per-loop poke lock is still held.  The
+    # cookie-warning reset takes the same lock as the production claim path,
+    # so teardown cannot race an in-flight warning decision.
+    _keepalive._reset_poke_state_for_tests()
+    _cookie_policy._reset_secondary_binding_warning_for_tests()
+    scheduler._reset_for_tests()
     yield
-    _auth._LAST_POKE_ATTEMPT_MONOTONIC.clear()
-    _auth._POKE_LOCKS_BY_LOOP.clear()
-    _cookie_policy._SECONDARY_BINDING_WARNED = False
-    _auth_storage._FLOCK_UNAVAILABLE_WARNED = False
+    # Join first, then reset every process owner. Clearing any owner while a
+    # detached promotion is still alive would let that worker enter the next
+    # test's lifecycle after teardown had declared the process quiescent.
+    scheduler.drain(30.0)
+    _keepalive._reset_poke_state_for_tests()
+    _cookie_policy._reset_secondary_binding_warning_for_tests()
+    scheduler._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -145,10 +197,11 @@ def _synthetic_error_mode(request, monkeypatch):
     auto-reverted on teardown). Without the marker, the env var is left
     untouched — preserving the spec's "opt-in" contract.
 
-    Set BEFORE the client constructs its HTTP transport (markers are read at
-    setup time): the transport wrapper in ``_core.py:_get_error_injection_mode``
-    reads the env var only during ``Session.open()``, so the var must be
-    in place before the fixture under test enters its ``async with`` block.
+    Set before the client constructs its runtime and enters the middleware chain
+    (markers are read at setup time): ``_error_injection._get_error_injection_mode``
+    is consulted by the construction guard and by ``ErrorInjectionMiddleware``, so
+    the var must be in place before the fixture under test enters its
+    ``async with`` block.
 
     Production behavior is unchanged when the marker is absent.
     """
@@ -167,10 +220,10 @@ def _synthetic_error_mode(request, monkeypatch):
             f"@pytest.mark.synthetic_error: invalid mode {mode!r}; valid modes are {sorted(valid)}."
         )
     # Import the env-var name from the production module so a future rename
-    # in ``_core.py`` cascades automatically; the constant is also exposed
+    # in ``_web/transport/error_injection.py`` cascades automatically; the constant is also exposed
     # from ``tests/vcr_config.py`` but importing from the canonical seam
     # is the production-faithful path.
-    from notebooklm._error_injection import ERROR_INJECT_ENV_VAR
+    from notebooklm._web.transport.error_injection import ERROR_INJECT_ENV_VAR
 
     monkeypatch.setenv(ERROR_INJECT_ENV_VAR, mode)
 
@@ -203,8 +256,102 @@ def _mock_keepalive_poke(request):
     )
 
 
+def pytest_addoption(parser):
+    """Register the dev-only ``--update-baselines`` regen flag (ADR-0022).
+
+    When set, the regenerable-baseline freeze test
+    (``test_baseline_matches_committed_file``) REWRITES each committed baseline
+    file from ``derive()`` instead of asserting. ``scripts/regen_baselines.py``
+    is the discoverable wrapper that shells ``pytest ... --update-baselines``.
+
+    **Dev-only-regen invariant (ADR-0022):** CI must NEVER pass this flag — it
+    only ever diffs. The ``update_baselines`` fixture additionally refuses to
+    regenerate when a CI environment is detected, so wiring the flag into a CI
+    command can't silently rewrite baselines; it fails loudly instead.
+    """
+    parser.addoption(
+        "--update-baselines",
+        action="store_true",
+        default=False,
+        help=(
+            "DEV ONLY: rewrite committed baseline fixtures from live code instead "
+            "of asserting against them. CI must never pass this (it only diffs). "
+            "Prefer `python scripts/regen_baselines.py`."
+        ),
+    )
+    parser.addoption(
+        "--allow-growth",
+        action="store_true",
+        default=False,
+        help=(
+            "DEV ONLY: explicitly acknowledge growth in shrink-only baselines. "
+            "Valid only together with --update-baselines."
+        ),
+    )
+    parser.addoption(
+        "--require-reality",
+        action="store_true",
+        default=False,
+        help=(
+            "Require every expected external-reality probe to be collected and "
+            "pass exactly once; intended for the explicit browser CI lane."
+        ),
+    )
+    parser.addoption(
+        "--run-historical",
+        action="store_true",
+        default=False,
+        help=(
+            "Explicit opt-in to collect and run historical qualification tests. "
+            "Without this flag, tests in tests/qualification/historical/ are ignored."
+        ),
+    )
+
+
+@pytest.fixture
+def update_baselines(request) -> bool:
+    """Whether the dev-only baseline regen was requested (``--update-baselines``).
+
+    Enforces the dev-only-regen invariant: if the flag is set while a CI
+    environment is detected (``CI`` env var truthy, as GitHub Actions and most
+    CI providers set), this fails the test rather than silently rewriting the
+    committed baselines. Locally (no ``CI``), the flag enables regen.
+    """
+    requested = bool(request.config.getoption("--update-baselines"))
+    if requested and os.environ.get("CI", "").strip():
+        raise pytest.UsageError(
+            "--update-baselines must not be used in CI: baselines are dev-only "
+            "regenerated and CI only diffs (ADR-0022). Unset CI or drop the flag."
+        )
+    return requested
+
+
+@pytest.fixture
+def allow_baseline_growth(request) -> bool:
+    """Whether shrink-only baseline growth was explicitly acknowledged."""
+    return bool(request.config.getoption("--allow-growth"))
+
+
 def pytest_configure(config):
     """Register custom markers and configure test environment."""
+    allow_growth = bool(config.getoption("--allow-growth"))
+    if allow_growth and not config.getoption("--update-baselines"):
+        raise pytest.UsageError("--allow-growth requires --update-baselines")
+    if allow_growth and os.environ.get("CI", "").strip():
+        raise pytest.UsageError(
+            "--allow-growth must not be used in CI: growth acknowledgement is a local, "
+            "reviewed baseline-regeneration action (ADR-0022)."
+        )
+
+    xdist_active = (
+        config.getoption("numprocesses", default=None) not in (None, 0)
+        or config.getoption("dist", default="no") != "no"
+    )
+    if config.getoption("--require-reality") and xdist_active:
+        raise pytest.UsageError(
+            "--require-reality cannot be combined with xdist; run the required "
+            "reality lane serially so the controller can account for every probe"
+        )
     config.addinivalue_line(
         "markers",
         "vcr: marks tests that use VCR cassettes (may be skipped if cassettes unavailable)",
@@ -230,12 +377,66 @@ def pytest_configure(config):
         "code path via ``patch.dict('sys.modules', {'playwright': None})``. "
         "CI always installs the browser extra so marked tests run there.",
     )
+    config.addinivalue_line(
+        "markers",
+        "historical: historical qualification tests; explicit opt-in only via --run-historical",
+    )
+    config.addinivalue_line(
+        "markers",
+        "pr_contract: PR-critical contract and boundary checks required on PR lanes",
+    )
+    config.addinivalue_line(
+        "markers",
+        "compat_smoke: secondary-OS and platform compatibility smoke tests",
+    )
     # Disable Rich/Click formatting in tests to avoid ANSI escape codes in output
     # This ensures consistent test assertions regardless of -s flag
     # NO_COLOR disables colors, TERM=dumb disables all formatting (bold, etc.)
     # Force these values to ensure consistent behavior across all environments
     os.environ["NO_COLOR"] = "1"
     os.environ["TERM"] = "dumb"
+
+
+def pytest_ignore_collect(collection_path, config) -> bool | None:
+    """Ignore collection of historical qualification tests unless --run-historical is passed."""
+    if not config.getoption("--run-historical", default=False):
+        normalized = Path(collection_path).resolve().as_posix()
+        if "tests/qualification/historical" in normalized:
+            return True
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _load_platform_manifest(rootpath: str) -> frozenset[str]:
+    manifest_path = Path(rootpath) / "tests" / "fixtures" / "ci-platform-selection.json"
+    if not manifest_path.is_file():
+        return frozenset()
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return frozenset(data.get("paths", []))
+    except Exception:
+        return frozenset()
+
+
+@functools.lru_cache(maxsize=1)
+def _load_pr_contract_nodes(rootpath: str) -> frozenset[str]:
+    """Return ledger nodes that must enter the canonical PR contract lane.
+
+    The relevance ledger is the reviewed source of routing decisions.  Tests
+    may retain broad ``repo_lint`` module marks, so applying the effective
+    marker here prevents a ledger-only PR contract from disappearing from both
+    the routine selector and the explicit contract selector.
+    """
+    ledger_path = Path(rootpath) / "tests" / "fixtures" / "test_relevance_ledger.json"
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        return frozenset(
+            entry["nodeid"]
+            for entry in data["entries"]
+            if entry.get("decision") == "pr_contract" and isinstance(entry.get("nodeid"), str)
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return frozenset()
 
 
 def pytest_collection_modifyitems(config, items):
@@ -246,14 +447,146 @@ def pytest_collection_modifyitems(config, items):
     raising ``ImportError`` at runtime. CI installs the extra, so this is a
     no-op there.
     """
+    if not config.getoption("--run-historical", default=False):
+        remaining = []
+        deselected = []
+        for item in items:
+            if item.get_closest_marker("historical"):
+                deselected.append(item)
+            else:
+                remaining.append(item)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = remaining
+
+    pr_contract_nodes = _load_pr_contract_nodes(str(config.rootpath))
+    for item in items:
+        nodeid = item.nodeid.split("[", 1)[0]
+        if nodeid in pr_contract_nodes and not item.get_closest_marker("pr_contract"):
+            item.add_marker(pytest.mark.pr_contract)
+        if item.get_closest_marker("pr_contract") and not item.get_closest_marker("repo_lint"):
+            item.add_marker(pytest.mark.repo_lint)
+
+    platform_paths = _load_platform_manifest(str(config.rootpath))
+    if platform_paths:
+        for item in items:
+            node_rel = item.nodeid.split("::")[0].replace("\\", "/")
+            if any(node_rel == p or node_rel.startswith(f"{p}/") for p in platform_paths):
+                item.add_marker(pytest.mark.compat_smoke)
+
     if _PLAYWRIGHT_INSTALLED:
+        chromium_available = None
+        for item in items:
+            if "requires_chromium" not in item.keywords:
+                continue
+            if chromium_available is None:
+                chromium_available = _chromium_available()
+            if not chromium_available:
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=(
+                            "Chromium is not installed or launchable; run: "
+                            "uv run playwright install chromium"
+                        )
+                    )
+                )
         return
     skip_marker = pytest.mark.skip(
         reason="playwright not installed; install with: uv sync --extra browser"
     )
     for item in items:
-        if "requires_playwright" in item.keywords:
+        if _REALITY_DEPENDENCY_MARKERS.intersection(item.keywords):
             item.add_marker(skip_marker)
+
+
+def _chromium_available() -> bool:
+    """Return whether Playwright can launch the installed Chromium executable."""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            if not os.path.isfile(playwright.chromium.executable_path):
+                return False
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                return True
+            finally:
+                browser.close()
+    except Exception:
+        return False
+
+
+def _is_xdist_worker(config) -> bool:
+    """Required reality accounting belongs to the xdist controller only."""
+    return getattr(config, "workerinput", None) is not None
+
+
+def pytest_collection_finish(session) -> None:
+    """Validate the exact reality-probe set after all selection filters apply."""
+    if not session.config.getoption("--require-reality") or _is_xdist_worker(session.config):
+        return
+
+    selected = {item.nodeid: item for item in session.items}
+    missing = sorted(REQUIRED_REALITY_PROBES - selected.keys())
+    unexpected = sorted(
+        item.nodeid
+        for item in session.items
+        if "reality" in item.keywords and item.nodeid not in REQUIRED_REALITY_PROBES
+    )
+    invalid_dependencies = sorted(
+        item.nodeid
+        for item in session.items
+        if item.nodeid in REQUIRED_REALITY_PROBES
+        and not _REALITY_DEPENDENCY_MARKERS.intersection(item.keywords)
+    )
+    unmarked_expected = sorted(
+        nodeid
+        for nodeid in REQUIRED_REALITY_PROBES
+        if nodeid in selected and "reality" not in selected[nodeid].keywords
+    )
+    if missing or unexpected or invalid_dependencies or unmarked_expected:
+        problems = []
+        if missing:
+            problems.append(f"missing expected probes: {missing}")
+        if unexpected:
+            problems.append(f"unexpected reality probes: {unexpected}")
+        if invalid_dependencies:
+            problems.append(f"probes lack a recognized dependency marker: {invalid_dependencies}")
+        if unmarked_expected:
+            problems.append(f"expected probes lack the reality marker: {unmarked_expected}")
+        raise pytest.UsageError(
+            "--require-reality collection contract failed: " + "; ".join(problems)
+        )
+
+    _REALITY_REPORTS.clear()
+    for nodeid in REQUIRED_REALITY_PROBES:
+        _REALITY_REPORTS[nodeid] = []
+
+
+def pytest_runtest_logreport(report) -> None:
+    """Record every phase so skipped/setup-error probes cannot count as passes."""
+    if report.nodeid in _REALITY_REPORTS:
+        _REALITY_REPORTS[report.nodeid].append((report.when, report.outcome))
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    """Turn a missing or non-passing reality call phase into a hard failure."""
+    if not session.config.getoption("--require-reality") or _is_xdist_worker(session.config):
+        return
+
+    failures = []
+    for nodeid in sorted(REQUIRED_REALITY_PROBES):
+        reports = _REALITY_REPORTS.get(nodeid, [])
+        calls = [outcome for phase, outcome in reports if phase == "call"]
+        if calls != ["passed"] or any(outcome != "passed" for _phase, outcome in reports):
+            failures.append(f"{nodeid}: phases={reports!r}")
+    if failures:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        terminal = session.config.pluginmanager.get_plugin("terminalreporter")
+        if terminal is not None:
+            terminal.write_line("--require-reality execution contract failed:")
+            for failure in failures:
+                terminal.write_line(f"  {failure}")
 
 
 @pytest.fixture
@@ -343,8 +676,26 @@ def build_rpc_response():
 
 
 @pytest.fixture
+def rpc_request_params():
+    """Decode the positional params out of an outgoing ``batchexecute`` request.
+
+    The inverse of :func:`build_rpc_response` for assertions on request shape:
+    unwraps the ``f.req`` form body and returns the params list the client sent.
+    Shared here rather than duplicated per test module, since both tiers assert on
+    wire shape and ``tests/_guardrails/test_no_cross_test_imports.py`` forbids one
+    test module importing another.
+    """
+
+    def _params(request) -> list:
+        outer = json.loads(parse_qs(request.content.decode())["f.req"][0])
+        return json.loads(outer[0][0][1])
+
+    return _params
+
+
+@pytest.fixture
 def mock_get_conversation_id(httpx_mock, build_rpc_response):
-    """Register a batchexecute response for ``ChatAPI.get_conversation_id``.
+    """Register batchexecute responses for an existing conversation.
 
     After issue #659, ``ChatAPI.ask`` calls ``get_conversation_id``
     (wire-level ``hPTbtc``) post-ask for new conversations to recover the
@@ -352,7 +703,8 @@ def mock_get_conversation_id(httpx_mock, build_rpc_response):
     chat response. Any test that exercises the new-conversation path
     through ``client.chat.ask(...)`` without a ``conversation_id``
     argument must register a response, or the SDK will time out retrying
-    the unmocked call.
+    the unmocked call. The optional ``khqZz`` response gives that id one
+    existing turn when ``ask`` probes implicit follow-up state (#1973).
 
     Usage::
 
@@ -379,9 +731,49 @@ def mock_get_conversation_id(httpx_mock, build_rpc_response):
             method="POST",
             is_reusable=reusable,
         )
+        turns_response = build_rpc_response(
+            RPCMethod.GET_CONVERSATION_TURNS,
+            [[[None, None, 1, "Existing question?"]]],
+        )
+        httpx_mock.add_response(
+            url=re.compile(r".*batchexecute.*rpcids=khqZz.*"),
+            content=turns_response.encode(),
+            method="POST",
+            is_optional=True,
+            is_reusable=True,
+        )
         return conv_id
 
     return _add
+
+
+@pytest.fixture
+def legacy_vcr_follow_up_probe(monkeypatch):
+    """Supply the prior-turn count omitted from legacy chat cassettes.
+
+    The old recordings contain the current-conversation lookup and chat POST,
+    but not the pre-POST ``khqZz`` count fetch added across #1973 and #1976.
+    Keep those recordings immutable; dedicated characterization tests exercise
+    the real request and its empty, non-empty, multi-turn, and failure branches.
+    """
+
+    from notebooklm._chat import ChatAPI
+
+    async def _count_prior_server_turns(
+        self: ChatAPI,
+        notebook_id: str,
+        conversation_id: str,
+    ) -> int:
+        """Replay a legacy cassette whose current conversation had one prior turn."""
+        return 1
+
+    monkeypatch.setattr(ChatAPI, "_count_prior_server_turns", _count_prior_server_turns)
+
+
+@pytest.fixture
+def legacy_vcr_add_url_baseline():
+    """Compatibility no-op for recordings made before URL creation became one-send."""
+    return None
 
 
 @pytest.fixture

@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import notebooklm._sources as _sources_mod
-from notebooklm._sources import SourcesAPI
+from notebooklm._web.sources import WebSourcesAPI
 from notebooklm.types import (
+    DriveSourceStatus,
     Source,
     SourceError,
     SourceNotFoundError,
@@ -15,6 +16,7 @@ from notebooklm.types import (
     SourceStatus,
     SourceTimeoutError,
 )
+from tests._fixtures.fake_core import make_fake_core
 
 
 class TestSourceStatus:
@@ -63,6 +65,88 @@ class TestSourceStatusProperties:
         assert source.is_ready is True
 
 
+class TestDriveSourceStatusProperties:
+    """#2111 — Drive-side health is a SEPARATE axis from ingestion status.
+
+    ``SourceSettings.status`` (what ``is_ready`` reads) reports NotebookLM's own
+    ingestion pipeline and stays ``READY`` after the underlying Drive file is
+    deleted or unshared; ``userDriveSourceStatus`` is the only Drive-side
+    signal. These tests pin that the two never contaminate each other.
+    """
+
+    def test_drive_status_defaults_to_none(self):
+        """A source with no Drive claim (the overwhelming majority) reads None."""
+        source = Source(id="src_1")
+        assert source.drive_status is None
+        assert source.is_drive_degraded is False
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            DriveSourceStatus.INACCESSIBLE,
+            DriveSourceStatus.SYNCING,
+            DriveSourceStatus.DELETED,
+            DriveSourceStatus.GEN_AI_ACCESS_DENIED,
+        ],
+        ids=["inaccessible", "syncing", "deleted", "gen_ai_access_denied"],
+    )
+    def test_degraded_members_report_degraded(self, status):
+        source = Source(id="src_1", status=SourceStatus.READY, drive_status=status)
+        assert source.is_drive_degraded is True
+        # The behaviour the issue is about: ingestion still reports ready, and
+        # this library deliberately does NOT flip that (see is_ready's docstring).
+        assert source.is_ready is True
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            None,
+            DriveSourceStatus.ACTIVE,
+            DriveSourceStatus.UNKNOWN,
+        ],
+        ids=["absent", "active", "unknown"],
+    )
+    def test_non_degraded_members_report_healthy(self, status):
+        """Absent / ACTIVE / an unmodelled code are not degradation.
+
+        ``UNKNOWN`` in particular: a state we cannot name is not evidence that
+        anything is wrong. Callers who want to fail closed read ``drive_status``.
+        """
+        assert Source(id="src_1", drive_status=status).is_drive_degraded is False
+
+    def test_drive_status_does_not_change_ingestion_predicates(self):
+        """A degraded Drive file leaves is_processing / is_error alone."""
+        source = Source(
+            id="src_1",
+            status=SourceStatus.PROCESSING,
+            drive_status=DriveSourceStatus.DELETED,
+        )
+        assert source.is_processing is True
+        assert source.is_error is False
+        assert source.is_ready is False
+        assert source.is_drive_degraded is True
+
+    def test_every_enum_member_is_classified(self):
+        """No member of the enum is left unclassified by is_drive_degraded.
+
+        Guards the case where a future backend value is added to the enum but
+        nobody decides what it means for health — the predicate would answer
+        for it by accident.
+        """
+        classified = {
+            member: Source(id="s", drive_status=member).is_drive_degraded
+            for member in DriveSourceStatus
+        }
+        assert classified == {
+            DriveSourceStatus.UNKNOWN: False,
+            DriveSourceStatus.INACCESSIBLE: True,
+            DriveSourceStatus.SYNCING: True,
+            DriveSourceStatus.ACTIVE: False,
+            DriveSourceStatus.DELETED: True,
+            DriveSourceStatus.GEN_AI_ACCESS_DENIED: True,
+        }
+
+
 class TestSourceExceptions:
     """Tests for source exception classes."""
 
@@ -101,15 +185,15 @@ class TestWaitUntilReady:
     @pytest.fixture
     def sources_api(self):
         """Create a SourcesAPI with mocked core."""
-        core = MagicMock()
-        return SourcesAPI(core, uploader=MagicMock())
+        core = make_fake_core()
+        return WebSourcesAPI(core, supervisor=core, uploader=MagicMock())
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_ready(self, sources_api):
         """Test that wait_until_ready returns immediately if source is ready."""
         ready_source = Source(id="src_1", title="Test", status=SourceStatus.READY)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = ready_source
 
             result = await sources_api.wait_until_ready("nb_1", "src_1", timeout=10.0)
@@ -132,7 +216,7 @@ class TestWaitUntilReady:
                 return processing_source
             return ready_source
 
-        with patch.object(sources_api, "_get_or_none", side_effect=mock_get):
+        with patch.object(sources_api, "get_or_none", side_effect=mock_get):
             result = await sources_api.wait_until_ready(
                 "nb_1", "src_1", timeout=10.0, initial_interval=0.01
             )
@@ -147,7 +231,7 @@ class TestWaitUntilReady:
         # audio-tolerance gate doesn't keep polling and trigger a timeout.
         error_source = Source(id="src_1", status=SourceStatus.ERROR, _type_code=3)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = error_source
 
             with pytest.raises(SourceProcessingError) as exc_info:
@@ -174,7 +258,7 @@ class TestWaitUntilReady:
                 return transient_error
             return ready
 
-        with patch.object(sources_api, "_get_or_none", side_effect=mock_get):
+        with patch.object(sources_api, "get_or_none", side_effect=mock_get):
             result = await sources_api.wait_until_ready(
                 "nb_1", "src_audio", timeout=10.0, initial_interval=0.01
             )
@@ -204,7 +288,7 @@ class TestWaitUntilReady:
                 return transient_error
             return ready
 
-        with patch.object(sources_api, "_get_or_none", side_effect=mock_get):
+        with patch.object(sources_api, "get_or_none", side_effect=mock_get):
             result = await sources_api.wait_until_ready(
                 "nb_1", "src_x", timeout=10.0, initial_interval=0.01
             )
@@ -219,7 +303,7 @@ class TestWaitUntilReady:
         """
         pdf_error = Source(id="src_pdf", status=SourceStatus.ERROR, _type_code=3)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = pdf_error
 
             with pytest.raises(SourceProcessingError) as exc_info:
@@ -231,7 +315,7 @@ class TestWaitUntilReady:
     @pytest.mark.asyncio
     async def test_raises_not_found_error_when_source_missing(self, sources_api):
         """Test that wait_until_ready raises SourceNotFoundError when source not found."""
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = None
 
             with pytest.raises(SourceNotFoundError) as exc_info:
@@ -244,7 +328,7 @@ class TestWaitUntilReady:
         """Test that wait_until_ready raises SourceTimeoutError on timeout."""
         processing_source = Source(id="src_1", status=SourceStatus.PROCESSING)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = processing_source
 
             with pytest.raises(SourceTimeoutError) as exc_info:
@@ -278,7 +362,7 @@ class TestWaitUntilReady:
             await original_sleep(0.001)  # Minimal actual sleep
 
         with (
-            patch.object(sources_api, "_get_or_none", side_effect=mock_get),
+            patch.object(sources_api, "get_or_none", side_effect=mock_get),
             patch.object(_sources_mod.asyncio, "sleep", side_effect=mock_sleep),
         ):
             await sources_api.wait_until_ready(
@@ -302,15 +386,15 @@ class TestWaitUntilRegistered:
 
     @pytest.fixture
     def sources_api(self):
-        core = MagicMock()
-        return SourcesAPI(core, uploader=MagicMock())
+        core = make_fake_core()
+        return WebSourcesAPI(core, supervisor=core, uploader=MagicMock())
 
     @pytest.mark.asyncio
     async def test_wait_until_registered_returns_on_processing(self, sources_api):
         """Status=PROCESSING (1) on first poll → return immediately."""
         processing = Source(id="src_1", status=SourceStatus.PROCESSING, _type_code=8)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = processing
 
             result = await sources_api.wait_until_registered("nb_1", "src_1", timeout=10.0)
@@ -323,7 +407,7 @@ class TestWaitUntilRegistered:
         """Status=READY (2) on first poll → return immediately."""
         ready = Source(id="src_1", status=SourceStatus.READY, _type_code=8)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = ready
 
             result = await sources_api.wait_until_registered("nb_1", "src_1", timeout=10.0)
@@ -345,7 +429,7 @@ class TestWaitUntilRegistered:
                 return None  # Not yet visible in listing
             return processing
 
-        with patch.object(sources_api, "_get_or_none", side_effect=mock_get):
+        with patch.object(sources_api, "get_or_none", side_effect=mock_get):
             result = await sources_api.wait_until_registered(
                 "nb_1", "src_1", timeout=10.0, initial_interval=0.01
             )
@@ -368,7 +452,7 @@ class TestWaitUntilRegistered:
                 return transient_error
             return processing
 
-        with patch.object(sources_api, "_get_or_none", side_effect=mock_get):
+        with patch.object(sources_api, "get_or_none", side_effect=mock_get):
             result = await sources_api.wait_until_registered(
                 "nb_1", "src_audio", timeout=10.0, initial_interval=0.01
             )
@@ -381,7 +465,7 @@ class TestWaitUntilRegistered:
         """Status=ERROR for a non-transient type (e.g. PDF type_code=3) → raise immediately."""
         pdf_error = Source(id="src_pdf", status=SourceStatus.ERROR, _type_code=3)
 
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = pdf_error
 
             with pytest.raises(SourceProcessingError):
@@ -390,7 +474,7 @@ class TestWaitUntilRegistered:
     @pytest.mark.asyncio
     async def test_wait_until_registered_times_out(self, sources_api):
         """If the source never registers, wait_until_registered raises SourceTimeoutError."""
-        with patch.object(sources_api, "_get_or_none", new_callable=AsyncMock) as mock_get:
+        with patch.object(sources_api, "get_or_none", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = None
 
             with pytest.raises(SourceTimeoutError):
@@ -405,8 +489,8 @@ class TestWaitForSources:
     @pytest.fixture
     def sources_api(self):
         """Create a SourcesAPI with mocked core."""
-        core = MagicMock()
-        return SourcesAPI(core, uploader=MagicMock())
+        core = make_fake_core()
+        return WebSourcesAPI(core, supervisor=core, uploader=MagicMock())
 
     @pytest.mark.asyncio
     async def test_waits_for_multiple_sources(self, sources_api):

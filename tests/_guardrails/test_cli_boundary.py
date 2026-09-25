@@ -35,6 +35,8 @@ from collections.abc import Iterator
 
 import pytest
 
+from ._adapter_import_boundary import adapter_violations, scan_path, scan_source
+
 CLI_ROOT = pathlib.Path(__file__).resolve().parents[2] / "src" / "notebooklm" / "cli"
 HELPERS_PATH = CLI_ROOT / "helpers.py"
 OPTIONS_PATH = CLI_ROOT / "options.py"
@@ -61,6 +63,7 @@ CLI_COMMAND_MODULES = {
     "agent",
     "artifact",
     "chat",
+    "collection",
     "doctor",
     "download",
     "generate",
@@ -370,7 +373,9 @@ def _violations(tree: ast.AST) -> list[str]:  # noqa: C901 - flat dispatch on im
                 if mod_parts and mod_parts[0] == "notebooklm":
                     if len(mod_parts) >= 2:
                         sub_parts = mod_parts[1:]
-                        # ``notebooklm._app`` is the sanctioned shared layer.
+                        # ``notebooklm._app`` is the sole sanctioned private
+                        # package: CLI browser operations use the public auth
+                        # facade or app orchestration, never ``_browser``.
                         if _is_app_path(sub_parts):
                             continue
                         # Rule 1 (any private segment) or Rule 2 (rpc layer).
@@ -393,7 +398,8 @@ def _violations(tree: ast.AST) -> list[str]:  # noqa: C901 - flat dispatch on im
             elif node.level >= 2:
                 # Relative parent-package import (cli reaches into notebooklm/*).
                 if mod:
-                    # ``from .._app...`` / ``from ..._app...`` — sanctioned layer.
+                    # ``from .._app...`` / ``from ..._app...`` — sole sanctioned
+                    # private package.
                     if _is_app_path(mod_parts):
                         continue
                     # Rule 1 (any private segment) or Rule 2 (rpc layer).
@@ -428,7 +434,8 @@ def _violations(tree: ast.AST) -> list[str]:  # noqa: C901 - flat dispatch on im
                 if not (len(parts) >= 2 and parts[0] == "notebooklm"):
                     continue
                 sub_parts = parts[1:]
-                # ``import notebooklm._app[.x]`` is the sanctioned shared layer.
+                # ``import notebooklm._app[.x]`` is the sole sanctioned private
+                # package import.
                 if _is_app_path(sub_parts):
                     continue
                 # Rule 1 (any private segment) or Rule 2 (rpc layer).
@@ -519,6 +526,11 @@ def test_no_private_module_imports_in_cli():
     for path in sorted(CLI_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         bad = _violations(tree)
+        bad.extend(
+            adapter_violations(
+                scan_path(path), relative=f"cli/{path.relative_to(CLI_ROOT).as_posix()}"
+            )
+        )
         if bad:
             offenders.append((str(path.relative_to(CLI_ROOT.parent)), bad))
     assert not offenders, (
@@ -833,3 +845,67 @@ def test_cli_boundary_allows_sanctioned_app_layer_imports(source: str) -> None:
 def test_cli_boundary_app_allowlist_is_exact_not_prefix(source: str, expected: str) -> None:
     """The ``_app`` allowlist must not leak to other ``_app``-prefixed packages."""
     assert expected in _violations(ast.parse(source))
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "from notebooklm._auth.cookie_policy import build_cookie_domain_allowlist\n",
+            "from notebooklm._auth.cookie_policy import ...",
+        ),
+        ("from .._auth.tokens import AuthTokens\n", "from .._auth.tokens import ..."),
+        ("from notebooklm._auth import tokens\n", "from notebooklm._auth import ..."),
+        ("from .._auth import storage\n", "from .._auth import ..."),
+        ("import notebooklm._auth.cookie_policy\n", "import notebooklm._auth.cookie_policy"),
+        (
+            "from notebooklm._browser.browser_capture import run_browser_capture\n",
+            "from notebooklm._browser.browser_capture import ...",
+        ),
+        (
+            "from .._browser.headless_reauth import headless_reauth_readiness\n",
+            "from .._browser.headless_reauth import ...",
+        ),
+        (
+            "from ..._browser.oauth_token import capture_oauth_token\n",
+            "from ..._browser.oauth_token import ...",
+        ),
+        (
+            "from notebooklm._browser import browser_capture\n",
+            "from notebooklm._browser import ...",
+        ),
+        (
+            "import notebooklm._browser.browser_capture\n",
+            "import notebooklm._browser.browser_capture",
+        ),
+        (
+            "import notebooklm._browser.headless_reauth\n",
+            "import notebooklm._browser.headless_reauth",
+        ),
+        (
+            "from notebooklm._browser.headless_reauth import attempt_headless_reauth\n",
+            "from notebooklm._browser.headless_reauth import ...",
+        ),
+    ],
+)
+def test_cli_boundary_blocks_all_auth_and_browser_private_imports(
+    source: str,
+    expected: str,
+) -> None:
+    assert expected in _violations(ast.parse(source))
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "from ..mcp import server\n",
+        "from .. import server\n",
+        "if TYPE_CHECKING:\n    from .._web import assembly\n",
+        "__import__('notebooklm.server.app')\n",
+    ),
+)
+def test_cli_scanner_resolves_relative_type_only_and_literal_dynamic_edges(source: str) -> None:
+    """The shared resolver covers forms the legacy AST matcher cannot classify alone."""
+    assert adapter_violations(
+        scan_source(source, package="notebooklm.cli"), relative="cli/source.py"
+    )

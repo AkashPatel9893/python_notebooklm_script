@@ -9,13 +9,82 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from notebooklm._notebook_metadata import (
-    NotebookMetadataService,
-    create_default_source_lister,
-)
-from notebooklm.exceptions import RPCError
+from notebooklm._notebook_metadata import NotebookMetadataService, reconcile_copy_mapping
+from notebooklm._web.notebooks import create_default_source_lister
+from notebooklm._web.sources import WebSourcesAPI
+from notebooklm.exceptions import DecodingError, RPCError
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import Notebook, NotebookMetadata, Source, SourceType
+from tests._fixtures.fake_core import declared_spawn_child
+
+
+def test_reconcile_copy_mapping_preserves_order_duplicate_set_and_partial_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    items = [("source-b", "copy-b"), ("source-a", "copy-a")]
+    copy_logger = logging.getLogger("tests.copy_mapping")
+
+    with caplog.at_level(logging.WARNING, logger=copy_logger.name):
+        result = reconcile_copy_mapping(
+            ["source-a", "source-a", "source-b", "source-c"],
+            items,
+            original_id=lambda item: item[0],
+            operation="CopySourcesAsync",
+            item_label="source",
+            target_notebook_id="target",
+            method_id="copy.method",
+            malformed_count=1,
+            raw_response="raw",
+            empty_error=LookupError("missing"),
+            warning_logger=copy_logger,
+        )
+
+    assert result is items
+    assert result == [("source-b", "copy-b"), ("source-a", "copy-a")]
+    assert caplog.messages == [
+        "CopySourcesAsync copied 2 of 4 source(s) into target; not copied: source-c"
+    ]
+
+
+def test_reconcile_copy_mapping_preserves_empty_exception_identity() -> None:
+    empty_error = LookupError("missing")
+
+    with pytest.raises(LookupError) as raised:
+        reconcile_copy_mapping(
+            ["source-a"],
+            [],
+            original_id=lambda item: item,
+            operation="CopySourcesAsync",
+            item_label="source",
+            target_notebook_id="target",
+            method_id="copy.method",
+            malformed_count=0,
+            raw_response=None,
+            empty_error=empty_error,
+            warning_logger=logging.getLogger("tests.copy_mapping"),
+        )
+
+    assert raised.value is empty_error
+
+
+def test_reconcile_copy_mapping_preserves_malformed_raw_response() -> None:
+    with pytest.raises(DecodingError) as raised:
+        reconcile_copy_mapping(
+            ["artifact-a"],
+            [],
+            original_id=lambda item: item,
+            operation="CopyArtifactsAsync",
+            item_label="artifact",
+            target_notebook_id="target",
+            method_id="copy.method",
+            malformed_count=1,
+            raw_response="[['broken']]",
+            empty_error=LookupError("missing"),
+            warning_logger=logging.getLogger("tests.copy_mapping"),
+        )
+
+    assert raised.value.method_id == "copy.method"
+    assert raised.value.raw_response == "[['broken']]"
 
 
 class RecordingRpc:
@@ -69,7 +138,7 @@ async def test_metadata_service_uses_injected_lister_and_builds_source_summaries
             Source(id="src_pdf", title="Design Paper", _type_code=3),  # SourceType.PDF
         ]
     )
-    service = NotebookMetadataService(get_notebook, source_lister)
+    service = NotebookMetadataService(get_notebook, source_lister, spawn_child=declared_spawn_child)
 
     metadata = await service.get_metadata("nb_123")
 
@@ -107,7 +176,7 @@ async def test_metadata_service_fetches_notebook_and_sources_concurrently() -> N
 
     source_lister = MagicMock()
     source_lister.list = AsyncMock(side_effect=list_sources)
-    service = NotebookMetadataService(get_notebook, source_lister)
+    service = NotebookMetadataService(get_notebook, source_lister, spawn_child=declared_spawn_child)
 
     metadata_task = asyncio.create_task(service.get_metadata("nb_123"))
     await asyncio.wait_for(get_started.wait(), timeout=1)
@@ -128,7 +197,7 @@ async def test_metadata_service_preserves_empty_source_warning(
     get_notebook = AsyncMock(return_value=Notebook(id="nb_123", title="Sparse", sources_count=2))
     source_lister = MagicMock()
     source_lister.list = AsyncMock(return_value=[])
-    service = NotebookMetadataService(get_notebook, source_lister)
+    service = NotebookMetadataService(get_notebook, source_lister, spawn_child=declared_spawn_child)
 
     with caplog.at_level(logging.WARNING, logger="notebooklm._notebooks"):
         metadata = await service.get_metadata("nb_123")
@@ -143,7 +212,7 @@ async def test_metadata_service_propagates_notebook_lookup_errors() -> None:
     get_notebook = AsyncMock(side_effect=error)
     source_lister = MagicMock()
     source_lister.list = AsyncMock(return_value=[Source(id="src_1")])
-    service = NotebookMetadataService(get_notebook, source_lister)
+    service = NotebookMetadataService(get_notebook, source_lister, spawn_child=declared_spawn_child)
 
     with pytest.raises(RuntimeError, match="notebook lookup failed"):
         await service.get_metadata("nb_123")
@@ -157,7 +226,7 @@ async def test_metadata_service_propagates_source_listing_errors() -> None:
     get_notebook = AsyncMock(return_value=Notebook(id="nb_123", title="Notebook"))
     source_lister = MagicMock()
     source_lister.list = AsyncMock(side_effect=RuntimeError("source listing failed"))
-    service = NotebookMetadataService(get_notebook, source_lister)
+    service = NotebookMetadataService(get_notebook, source_lister, spawn_child=declared_spawn_child)
 
     with pytest.raises(RuntimeError, match="source listing failed"):
         await service.get_metadata("nb_123")
@@ -180,10 +249,42 @@ async def test_default_source_lister_uses_phase8_listing_service() -> None:
     assert rpc.calls == [
         (
             RPCMethod.GET_NOTEBOOK,
-            ["nb_123", None, [2], None, 0],
+            # #1549: GET_NOTEBOOK tail migrated to the nested template block.
+            [
+                "nb_123",
+                None,
+                [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
+                None,
+                0,
+            ],
             "/notebook/nb_123",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_default_source_lister_matches_sources_api_list_for_metadata_path() -> None:
+    """The direct web fallback and injected base-typed lister decode identically."""
+    rpc = RecordingRpc(
+        [
+            [
+                "Notebook",
+                [
+                    source_entry("src_web", title="Web"),
+                    source_entry(
+                        "src_pdf",
+                        title="Paper",
+                        metadata=[None, 11, None, None, 3],
+                    ),
+                ],
+            ]
+        ]
+    )
+    uploader = MagicMock()
+    sources_api = WebSourcesAPI(rpc, supervisor=MagicMock(), uploader=uploader)
+    source_lister = create_default_source_lister(rpc)
+
+    assert await source_lister.list("nb_123") == await sources_api.list("nb_123")
 
 
 @pytest.mark.asyncio

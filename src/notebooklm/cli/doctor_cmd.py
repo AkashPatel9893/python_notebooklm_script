@@ -3,7 +3,7 @@
 Commands:
     doctor   Check profile setup, auth, and migration status
 
-The four checks + automatic fixes + health aggregation live in the
+The doctor checks + automatic fixes + health aggregation live in the
 transport-neutral :mod:`notebooklm._app.doctor`. This module owns the Rich
 rendering, the ``--json`` envelope, and the exit codes, and forwards the path
 helpers (read off this module at call time so the
@@ -15,7 +15,9 @@ import click
 from rich.table import Table
 
 from .._app.doctor import DoctorPaths, DoctorReport, run_checks
+from ..auth import check_headless_reauth_readiness
 from ..paths import (
+    get_browser_profile_dir,
     get_config_path,
     get_home_dir,
     get_path_info,
@@ -24,6 +26,7 @@ from ..paths import (
 )
 from .error_handler import exit_with_code, handle_errors
 from .rendering import console, json_output_response
+from .services.auth_source import AuthSource
 
 
 def _doctor_paths() -> DoctorPaths:
@@ -32,13 +35,63 @@ def _doctor_paths() -> DoctorPaths:
     Each callable is resolved off the module global at call time so a
     ``patch("notebooklm.cli.doctor_cmd.<helper>", ...)`` test seam lands.
     """
+    auth = AuthSource.from_click_context(click.get_current_context(silent=True))
     return DoctorPaths(
-        get_path_info=get_path_info,
+        get_path_info=lambda: get_path_info(
+            profile=auth.profile,
+            storage_path=auth.storage_override,
+        ),
         get_home_dir=get_home_dir,
         get_profile_dir=get_profile_dir,
-        get_storage_path=get_storage_path,
+        get_storage_path=lambda: (
+            auth.storage_override
+            if auth.storage_override is not None
+            else get_storage_path(profile=auth.profile)
+        ),
         get_config_path=get_config_path,
+        headless_reauth_check=_headless_reauth_check,
     )
+
+
+def _headless_reauth_check() -> dict[str, str]:
+    """Map the L3 readiness probe to the standard ``{status, detail}`` check shape.
+
+    The transport-neutral ``_app.doctor`` core receives this credential-free,
+    browser-free probe as a ready-made check row from the CLI adapter.
+
+    ``warn`` (never ``fail``) when L3 is unavailable: it is an optional, opt-in
+    fallback, so a missing persistent profile or an absent ``browser`` extra is
+    not a broken install — only an unavailable enhancement. The coarse auth
+    facade imports the browser implementation only when this
+    check runs and never imports Playwright merely to resolve the function.
+
+    ``doctor`` is a read-only diagnostic, so resolving the browser-profile dir
+    is wrapped: path resolution can raise ``ValueError`` / ``OSError``, and the
+    readiness probe can also raise ``RuntimeError`` while checking browser
+    availability. Each is degraded to a ``warn`` row rather than crashing the
+    whole command — consistent with the other doctor checks, which all map
+    malformed inputs to a status instead of raising.
+
+    This L3 row reads the live :class:`AuthSource` independently of the other
+    doctor paths so root ``--storage`` and ``--profile`` select the same browser
+    directory as runtime re-auth.
+    """
+    try:
+        auth = AuthSource.from_click_context(click.get_current_context(silent=True))
+        browser_profile = get_browser_profile_dir(
+            profile=auth.profile,
+            storage_path=auth.storage_override,
+        )
+        available, detail = check_headless_reauth_readiness(browser_profile=browser_profile)
+    except (ValueError, OSError, RuntimeError) as exc:
+        return {
+            "status": "warn",
+            "detail": f"unavailable: could not resolve the browser profile ({type(exc).__name__})",
+        }
+    return {
+        "status": "pass" if available else "warn",
+        "detail": detail,
+    }
 
 
 def register_doctor_command(cli):
@@ -68,7 +121,7 @@ def register_doctor_command(cli):
 
 def _run_doctor(fix_issues: bool, *, json_output: bool) -> None:
     """Run doctor checks and emit either JSON or rich text output."""
-    # The four checks + automatic fixes + health aggregation are
+    # The doctor checks + automatic fixes + health aggregation are
     # transport-neutral and live in ``_app.doctor``. Path helpers are forwarded
     # via ``_doctor_paths`` (read off this module at call time so the
     # ``patch("...doctor_cmd.get_storage_path")`` seam lands); an unexpected
@@ -121,6 +174,13 @@ def _display_results(report: DoctorReport):
 
     console.print(table)
 
+    if checks.get("auth", {}).get("guidance") == "refresh_authentication":
+        console.print(
+            "[yellow]Re-run 'notebooklm login'; on Windows (Chrome 127+ App-Bound "
+            "Encryption) use '--browser-cookies firefox' or set up "
+            "'notebooklm login --master-token'.[/yellow]"
+        )
+
     if fixes_applied:
         console.print()
         for fix in fixes_applied:
@@ -140,4 +200,19 @@ def _display_results(report: DoctorReport):
                 "[yellow]Run 'notebooklm doctor --fix' to create the profile directory.[/yellow]"
             )
     elif not has_failures:
-        console.print("\n[green]All checks passed.[/green]")
+        if checks.get("auth", {}).get("status") == "warn":
+            # A warn on the auth row means the session looks present (SID) but is
+            # missing __Secure-1PSIDTS, so real RPCs may still fail (#1753).
+            # Printing the green "All checks passed." here would greenlight the
+            # exact unusable state this check is meant to surface — render an
+            # auth-specific advisory instead (the guidance after the table carries
+            # the full Firefox / master-token remediation). The exit code stays 0: a warn
+            # is not a hard failure, and the cookie can still be re-minted at
+            # runtime. Other benign warns (optional headless re-auth, profile-dir
+            # permissions) keep the green footer, unchanged.
+            console.print(
+                "\n[yellow]Auth check raised a warning: the session may not be "
+                "usable. See the authentication guidance above for how to fix it.[/yellow]"
+            )
+        else:
+            console.print("\n[green]All checks passed.[/green]")

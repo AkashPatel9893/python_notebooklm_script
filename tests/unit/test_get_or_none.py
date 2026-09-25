@@ -19,16 +19,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from notebooklm._artifacts import ArtifactsAPI
 from notebooklm._lookup import unwrap_or_raise
-from notebooklm._mind_map import NoteBackedMindMapService
-from notebooklm._mind_maps_api import MindMapsAPI
-from notebooklm._note_service import NoteService
-from notebooklm._notebooks import NotebooksAPI
-from notebooklm._notes import NotesAPI
-from notebooklm._sources import SourcesAPI
-from notebooklm.exceptions import RPCError
-from notebooklm.types import MindMap, MindMapKind, Source
+from notebooklm._web.artifacts import WebArtifactsAPI
+from notebooklm._web.mind_maps import NoteBackedMindMapService, WebMindMapsAPI
+from notebooklm._web.notebooks import WebNotebooksAPI
+from notebooklm._web.notes import NoteService, WebNotesAPI
+from notebooklm._web.sources import WebSourcesAPI
+from notebooklm.exceptions import ClientError, NotebookNotFoundError, RPCError
+from notebooklm.types import ArtifactListing, MindMap, MindMapKind, Source
+from tests._fixtures.fake_core import make_fake_core
 
 # ---------------------------------------------------------------------------
 # unwrap_or_raise helper (in isolation)
@@ -59,34 +58,33 @@ class TestUnwrapOrRaise:
 # ---------------------------------------------------------------------------
 
 
-def _make_notebooks_api(rpc_call: AsyncMock) -> NotebooksAPI:
+def _make_notebooks_api(rpc_call: AsyncMock) -> WebNotebooksAPI:
     # ADR-0007: configure the rpc_call seam via constructor injection
     # (``make_fake_core(rpc_call=...)``) rather than dotted AsyncMock attribute
     # assignment, which the forbidden-monkeypatch lint rejects.
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=rpc_call)
-    return NotebooksAPI(core.rpc_executor, sources_api=MagicMock())
+    return WebNotebooksAPI(core.rpc_executor, supervisor=core, sources_api=MagicMock())
 
 
 @pytest.fixture
 def sources_api():
-    return SourcesAPI(MagicMock(), uploader=MagicMock())
+    return WebSourcesAPI(MagicMock(), supervisor=MagicMock(), uploader=MagicMock())
 
 
 @pytest.fixture
 def artifacts_api():
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock(), get_source_ids=AsyncMock(return_value=[]))
     mind_maps = MagicMock(spec=NoteBackedMindMapService)
     mind_maps.list_mind_maps = AsyncMock(return_value=[])
     notebooks = MagicMock()
     notebooks.get_source_ids = AsyncMock(return_value=[])
-    return ArtifactsAPI(
+    return WebArtifactsAPI(
         rpc=core,
-        drain=core,
-        lifecycle=core,
+        supervisor=core,
         notebooks=notebooks,
         mind_maps=mind_maps,
         note_service=MagicMock(spec=NoteService),
@@ -95,12 +93,12 @@ def artifacts_api():
 
 @pytest.fixture
 def notes_api():
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock())
-    note_service = NoteService(core)
+    note_service = NoteService(core, supervisor=core)
     mind_maps = NoteBackedMindMapService(note_service)
-    return NotesAPI(notes=note_service, mind_maps=mind_maps)
+    return WebNotesAPI(supervisor=core, notes=note_service, mind_maps=mind_maps)
 
 
 @pytest.fixture
@@ -112,7 +110,14 @@ def mind_maps_api():
     artifacts = MagicMock()
     artifacts.list = AsyncMock(return_value=[])
     notebooks = MagicMock()
-    return MindMapsAPI(rpc=rpc, mind_maps=mind_maps, artifacts=artifacts, notebooks=notebooks)
+    return WebMindMapsAPI(
+        rpc=rpc,
+        supervisor=make_fake_core(),
+        mind_maps=mind_maps,
+        artifacts=artifacts,
+        notebooks=notebooks,
+        notes=MagicMock(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +150,89 @@ class TestNotebooksGetOrNone:
         api = _make_notebooks_api(AsyncMock(side_effect=RPCError("boom")))
         with pytest.raises(RPCError):
             await api.get_or_none("nb_1")
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_grpc_not_found(self):
+        # The live backend answers an unknown id with a proper RPC error (gRPC
+        # status 5), which the decoder raises as ClientError — a *sibling* of
+        # NotebookNotFoundError under RPCError, not an ancestor. Before #2132
+        # this propagated straight out of the sanctioned None-on-miss lookup.
+        api = _make_notebooks_api(
+            AsyncMock(side_effect=ClientError("The server rejected this request.", rpc_code=5))
+        )
+        assert await api.get_or_none("nb_missing") is None
+
+    @pytest.mark.asyncio
+    async def test_grpc_not_found_as_string_code_also_returns_none(self):
+        # ``rpc_code`` is typed ``str | int | None`` — a string "5" is the same
+        # status and must not slip past the comparison.
+        api = _make_notebooks_api(AsyncMock(side_effect=ClientError("rejected", rpc_code="5")))
+        assert await api.get_or_none("nb_missing") is None
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_is_not_a_miss(self):
+        # The decoder routes status 7 (PERMISSION_DENIED) through the SAME
+        # ClientError branch as status 5. A notebook the caller may not read is
+        # not a notebook that does not exist: collapsing it to None would tell
+        # the caller the resource is absent and hide the access failure.
+        api = _make_notebooks_api(AsyncMock(side_effect=ClientError("denied", rpc_code=7)))
+        with pytest.raises(ClientError):
+            await api.get_or_none("nb_forbidden")
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_rpc_code_is_not_a_miss(self):
+        # The decoder also puts non-numeric labels in ``rpc_code``; the
+        # comparison must answer "not a miss" rather than raise on int().
+        api = _make_notebooks_api(
+            AsyncMock(side_effect=ClientError("boom", rpc_code="USER_DISPLAYABLE_ERROR"))
+        )
+        with pytest.raises(ClientError):
+            await api.get_or_none("nb_1")
+
+    @pytest.mark.asyncio
+    async def test_get_raises_typed_not_found_on_grpc_not_found(self):
+        # get_or_none only works because get() honours its documented contract.
+        # Pin the translation at the source, not just its downstream effect.
+        api = _make_notebooks_api(AsyncMock(side_effect=ClientError("rejected", rpc_code=5)))
+        with pytest.raises(NotebookNotFoundError):
+            await api.get("nb_missing")
+
+    @pytest.mark.asyncio
+    async def test_translation_carries_the_diagnostic_onto_the_typed_error(self):
+        # Status 5 also means "the notebook is under another signed-in
+        # account", and the decoder synthesises that guidance into its message.
+        # Every adapter renders str(exc), never __cause__, so the guidance has
+        # to survive on the raised exception itself — not only in the chain.
+        original = ClientError(
+            "The server rejected this request (not found). "
+            "If you have multiple Google accounts signed in, "
+            "this is commonly an account-routing mismatch.",
+            rpc_code=5,
+            raw_response="wire-bytes",
+        )
+        api = _make_notebooks_api(AsyncMock(side_effect=original))
+
+        with pytest.raises(NotebookNotFoundError) as caught:
+            await api.get("nb_missing")
+
+        raised = caught.value
+        assert "nb_missing" in str(raised)
+        assert "account-routing mismatch" in str(raised)
+        # The wire status and debugging context ride along too, so a caller can
+        # branch on the code without re-reading the chained cause.
+        assert raised.rpc_code == 5
+        assert raised.raw_response == "wire-bytes"
+        assert raised.__cause__ is original
+
+    @pytest.mark.asyncio
+    async def test_plain_absence_message_has_no_trailing_separator(self):
+        # The degenerate-payload path supplies no diagnostic, so the message
+        # must stay exactly as it always read — the detail separator is only
+        # appended when there is something to append.
+        api = _make_notebooks_api(AsyncMock(return_value=[[]]))
+        with pytest.raises(NotebookNotFoundError) as caught:
+            await api.get("nb_missing")
+        assert str(caught.value) == "Notebook not found: nb_missing"
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +275,9 @@ class TestArtifactsGetOrNone:
     async def test_returns_artifact_on_hit(self, artifacts_api):
         found = MagicMock()
         found.id = "art_1"
-        artifacts_api.list = AsyncMock(return_value=[found])
+        artifacts_api.list_with_status = AsyncMock(
+            return_value=ArtifactListing(items=(found,), is_complete=True)
+        )
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             result = await artifacts_api.get_or_none("nb_1", "art_1")
@@ -195,7 +285,9 @@ class TestArtifactsGetOrNone:
 
     @pytest.mark.asyncio
     async def test_returns_none_on_miss(self, artifacts_api):
-        artifacts_api.list = AsyncMock(return_value=[])
+        artifacts_api.list_with_status = AsyncMock(
+            return_value=ArtifactListing(items=(), is_complete=True)
+        )
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             result = await artifacts_api.get_or_none("nb_1", "missing")
@@ -203,7 +295,7 @@ class TestArtifactsGetOrNone:
 
     @pytest.mark.asyncio
     async def test_propagates_rpc_error(self, artifacts_api):
-        artifacts_api.list = AsyncMock(side_effect=RPCError("boom"))
+        artifacts_api.list_with_status = AsyncMock(side_effect=RPCError("boom"))
         with pytest.raises(RPCError):
             await artifacts_api.get_or_none("nb_1", "art_1")
 
@@ -232,6 +324,21 @@ class TestNotesGetOrNone:
             warnings.simplefilter("error", DeprecationWarning)
             result = await notes_api.get_or_none("nb_1", "missing")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_id_match_reads_through_note_row_adapter(self, notes_api):
+        """The id-slot comparison goes through ``NoteRow.id`` (#1485).
+
+        ``NoteRow.id`` stringifies the raw slot (the unified ``SourceRow.id``
+        convention), so a non-string wire id still matches its string form
+        instead of silently flipping a found note to not-found.
+        """
+        notes_api._get_all_notes_and_mind_maps = AsyncMock(
+            return_value=[[12345, ["12345", "Body", None, None, "Title"]]]
+        )
+        result = await notes_api.get_or_none("nb_1", "12345")
+        assert result is not None
+        assert result.id == "12345"
 
     @pytest.mark.asyncio
     async def test_propagates_rpc_error(self, notes_api):

@@ -20,11 +20,11 @@ from pathlib import Path
 
 import pytest
 
-from _helpers.client_factory import build_client_shell_for_tests
-from notebooklm._auth_refresh_retry import RefreshBudget
+from notebooklm._web.transport.auth_refresh_retry import RefreshBudget
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
 from notebooklm.rpc import AuthError, RPCMethod
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 _UNIT_CONFTEST_SPEC = importlib.util.spec_from_file_location(
     "unit_conftest_make_core",
@@ -36,6 +36,7 @@ _UNIT_CONFTEST_SPEC.loader.exec_module(_unit_conftest)
 make_core = _unit_conftest.make_core
 
 EVENT_TIMEOUT_S = 5.0
+TEST_EPOCH = 1
 
 
 def _auth_tokens() -> AuthTokens:
@@ -46,8 +47,9 @@ def _auth_tokens() -> AuthTokens:
     )
 
 
-async def _noop_refresh() -> AuthTokens:
+async def _noop_refresh(expected_epoch: int) -> AuthTokens:
     """Throwaway callback — never invoked by the construction test."""
+    assert expected_epoch == TEST_EPOCH
     return _auth_tokens()
 
 
@@ -74,15 +76,15 @@ def test_construct_outside_event_loop_with_callback() -> None:
 
     # Eager construction would have blown up under the prior code path.
     core_with_cb = build_client_shell_for_tests(auth=_auth_tokens(), refresh_callback=_noop_refresh)
-    assert core_with_cb._collaborators.auth_coord._refresh_lock is None, (
+    assert core_with_cb._web_runtime.auth_coord._refresh_lock is None, (
         "Lazy-init contract: lock must remain None until first refresh."
     )
-    assert core_with_cb._collaborators.auth_coord._refresh_callback is _noop_refresh
+    assert core_with_cb._web_runtime.auth_coord._refresh_callback is _noop_refresh
 
     # And the no-callback path stays the same (also lazy / also None).
     core_without_cb = build_client_shell_for_tests(auth=_auth_tokens())
-    assert core_without_cb._collaborators.auth_coord._refresh_lock is None
-    assert core_without_cb._collaborators.auth_coord._refresh_callback is None
+    assert core_without_cb._web_runtime.auth_coord._refresh_lock is None
+    assert core_without_cb._web_runtime.auth_coord._refresh_callback is None
 
 
 # --------------------------------------------------------------------------- #
@@ -95,15 +97,16 @@ async def _trigger_refresh(core: NotebookLMClient) -> object:
     (matches the helper in ``test_refresh_state_machine.py`` so this
     test pins the same code path). The NotebookLMClient-level
     ``_try_refresh_and_retry`` delegate was inlined in PR #4b — callers
-    now reach the executor through ``core._rpc_executor``.
+    now reach the executor through ``core._web_runtime.executor``.
     """
-    return await core._rpc_executor.try_refresh_and_retry(
+    return await core._web_runtime.executor.try_refresh_and_retry(
         RPCMethod.LIST_NOTEBOOKS,
         [],
         "/",
         False,
         AuthError("simulated"),
         _refresh_budget=RefreshBudget(),
+        _resource_epoch=TEST_EPOCH,
     )
 
 
@@ -120,8 +123,9 @@ async def test_refresh_lock_allocated_on_first_await() -> None:
     call_count = 0
     core_box: list[NotebookLMClient] = []
 
-    async def cb() -> AuthTokens:
+    async def cb(expected_epoch: int) -> AuthTokens:
         nonlocal call_count
+        assert expected_epoch == TEST_EPOCH
         call_count += 1
         tokens = AuthTokens(
             csrf_token="CSRF_REFRESHED",
@@ -144,10 +148,10 @@ async def test_refresh_lock_allocated_on_first_await() -> None:
         async def fake_retry(*args: object, **kwargs: object) -> str:
             return "ok"
 
-        core._rpc_executor.rpc_call = fake_retry  # type: ignore[method-assign]
+        core._web_runtime.executor.rpc_call = fake_retry  # type: ignore[method-assign]
 
         # Pre-refresh invariant: lock is unallocated even after ``open()``.
-        assert core._collaborators.auth_coord._refresh_lock is None, (
+        assert core._web_runtime.auth_coord._refresh_lock is None, (
             "Lock must remain unallocated until the first refresh attempt."
         )
 
@@ -156,14 +160,14 @@ async def test_refresh_lock_allocated_on_first_await() -> None:
         assert result == "ok"
         assert call_count == 1, f"Refresh callback must fire exactly once, got {call_count}"
         # Post-refresh invariant: lock is now allocated and is a real asyncio.Lock.
-        assert core._collaborators.auth_coord._refresh_lock is not None, (
+        assert core._web_runtime.auth_coord._refresh_lock is not None, (
             "Lock must be allocated by the first ``_await_refresh`` call."
         )
-        assert isinstance(core._collaborators.auth_coord._refresh_lock, asyncio.Lock)
+        assert isinstance(core._web_runtime.auth_coord._refresh_lock, asyncio.Lock)
         # And the refresh task ran to completion, matching the single-flight
         # state-machine pinning in ``test_refresh_state_machine.py``.
-        assert core._collaborators.auth_coord._refresh_task is not None
-        assert core._collaborators.auth_coord._refresh_task.done()
+        assert core._web_runtime.auth_coord._refresh_task is not None
+        assert core._web_runtime.auth_coord._refresh_task.done()
         assert core.auth.csrf_token == "CSRF_REFRESHED"
 
 
@@ -178,7 +182,8 @@ async def test_refresh_lock_instance_stable_across_calls() -> None:
     parallel).
     """
 
-    async def cb() -> AuthTokens:
+    async def cb(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == TEST_EPOCH
         return AuthTokens(
             csrf_token="R",
             session_id="S",
@@ -190,14 +195,14 @@ async def test_refresh_lock_instance_stable_across_calls() -> None:
         async def fake_retry(*args: object, **kwargs: object) -> str:
             return "ok"
 
-        core._rpc_executor.rpc_call = fake_retry  # type: ignore[method-assign]
+        core._web_runtime.executor.rpc_call = fake_retry  # type: ignore[method-assign]
 
         await _trigger_refresh(core)
-        first_lock = core._collaborators.auth_coord._refresh_lock
+        first_lock = core._web_runtime.auth_coord._refresh_lock
         assert first_lock is not None
 
         await _trigger_refresh(core)
-        second_lock = core._collaborators.auth_coord._refresh_lock
+        second_lock = core._web_runtime.auth_coord._refresh_lock
 
         assert second_lock is first_lock, (
             "Lazy-init must be idempotent — same lock instance across refreshes "

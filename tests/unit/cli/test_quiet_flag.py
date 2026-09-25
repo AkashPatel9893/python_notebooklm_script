@@ -28,6 +28,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+import notebooklm.cli.helpers as helpers_module
 from notebooklm.notebooklm_cli import cli
 from notebooklm.types import Artifact, Note, Notebook, Source
 
@@ -56,7 +58,7 @@ def _reset_notebooklm_logger():
 @pytest.fixture
 def mock_auth():
     """Auth fixture local to this file (mirrors the cli conftest pattern)."""
-    with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock:
+    with patch.object(helpers_module, "load_auth_from_storage") as mock:
         mock.return_value = {
             "SID": "test",
             "__Secure-1PSIDTS": "test_1psidts",
@@ -71,8 +73,9 @@ def mock_auth():
 @pytest.fixture
 def fetch_tokens():
     """Mock ``fetch_tokens_with_domains`` so the auth path resolves cleanly."""
-    with patch(
-        "notebooklm.auth.fetch_tokens_with_domains",
+    with patch.object(
+        auth_module,
+        "fetch_tokens_with_domains",
         new_callable=AsyncMock,
         return_value=("csrf", "session"),
     ) as mock:
@@ -185,7 +188,7 @@ class TestQuietArtifactDelete:
         mock_client.artifacts.list = AsyncMock(
             return_value=[Artifact(id="art_123", title="Test", _artifact_type=4, status=3)]
         )
-        mock_client.notes.list_mind_maps = AsyncMock(return_value=[])
+        mock_client.mind_maps.list_note_backed = AsyncMock(return_value=[])
         mock_client.artifacts.delete = AsyncMock(return_value=None)
 
         result = runner.invoke(
@@ -214,7 +217,7 @@ class TestQuietArtifactDelete:
         mock_client.artifacts.list = AsyncMock(
             return_value=[Artifact(id="art_456", title="JsonTest", _artifact_type=4, status=3)]
         )
-        mock_client.notes.list_mind_maps = AsyncMock(return_value=[])
+        mock_client.mind_maps.list_note_backed = AsyncMock(return_value=[])
         mock_client.artifacts.delete = AsyncMock(return_value=None)
 
         result = runner.invoke(
@@ -245,7 +248,7 @@ class TestQuietArtifactDelete:
         mock_client.artifacts.list = AsyncMock(
             return_value=[Artifact(id="art_789", title="Loud", _artifact_type=4, status=3)]
         )
-        mock_client.notes.list_mind_maps = AsyncMock(return_value=[])
+        mock_client.mind_maps.list_note_backed = AsyncMock(return_value=[])
         mock_client.artifacts.delete = AsyncMock(return_value=None)
 
         result = runner.invoke(

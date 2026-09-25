@@ -17,9 +17,10 @@ These tests pin:
 
 Wave 8 of the session-decoupling plan (ADR-0014 Rule 2 Corollary): the
 chat-local ``ChatRuntime`` Protocol was deleted; ``ChatAPI`` takes its
-four direct collaborators (RpcCaller, RuntimeTransport, ReqidCounter,
-LoopGuard) by keyword argument. ``save_answer_as_note`` only touches
-the ``rpc`` collaborator, so the other three are mocked without specs.
+five direct collaborators (RpcCaller, RuntimeTransport, ReqidCounter,
+LoopGuard, NotebookSourceIdProvider) by keyword argument.
+``save_answer_as_note`` only touches the ``rpc`` collaborator, so the
+other four are mocked without specs.
 """
 
 from __future__ import annotations
@@ -29,9 +30,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from notebooklm._chat import ChatAPI
-from notebooklm._runtime.contracts import RpcCaller
+from notebooklm._web.chat import WebChatAPI
+from notebooklm._web.contracts import RpcCaller
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import AskResult, ChatReference
+from tests._fixtures.fake_core import make_fake_core
 
 
 @pytest.fixture
@@ -52,15 +55,16 @@ def chat_api(mock_rpc: MagicMock) -> ChatAPI:
 
     A ``MagicMock(get_source_ids=AsyncMock(...))`` notebooks resolver
     is injected so the ``NotebooksAPI`` fallback in
-    ``ChatAPI.__init__`` does not try to wrap ``rpc``; the
+    ``WebChatAPI.__init__`` does not try to wrap ``rpc``; the
     ``NotebookSourceIdProvider`` protocol surface is small enough that
     a ``MagicMock`` with a single async stub satisfies it without
     falling into ADR-0007's forbidden-attribute-assignment lint
     (the stub is passed via constructor injection).
     """
     notebooks = MagicMock(get_source_ids=AsyncMock(return_value=[]))
-    return ChatAPI(
+    return WebChatAPI(
         rpc=mock_rpc,
+        supervisor=make_fake_core(),
         transport=MagicMock(),
         reqid=MagicMock(),
         loop_guard=MagicMock(),
@@ -203,3 +207,45 @@ class TestSaveAnswerAsNote:
         note = await chat_api.save_answer_as_note("nb-1", ask_result)
         assert note.content == "The answer is X [1]."
         assert note.notebook_id == "nb-1"
+
+    @pytest.mark.asyncio
+    async def test_created_at_populated_wrapped_shape(
+        self, chat_api: ChatAPI, mock_rpc: MagicMock
+    ) -> None:
+        """``save_answer_as_note`` decodes the creation timestamp from the
+        note metadata envelope (``note[2][2][0]``) in the wrapped shape
+        (issue #1529). Pin the EPOCH INT (TZ-invariant), not a wall-time
+        string."""
+        mock_rpc.rpc_call.return_value = [
+            [
+                "note-id",
+                "One fruit mentioned is apples [1].",
+                [2, "400237754469", [1778936820, 976814000]],
+                [[]],
+                "ServerTitle",
+                [],
+            ]
+        ]
+        ask_result = _make_ask_result()
+        note = await chat_api.save_answer_as_note("nb-1", ask_result)
+        assert note.created_at is not None
+        assert int(note.created_at.timestamp()) == 1778936820
+
+    @pytest.mark.asyncio
+    async def test_created_at_populated_flat_shape(
+        self, chat_api: ChatAPI, mock_rpc: MagicMock
+    ) -> None:
+        """``save_answer_as_note`` decodes the timestamp from the FLAT
+        response shape too (``result`` is the inner envelope; issue #1529)."""
+        mock_rpc.rpc_call.return_value = [
+            "note-id",
+            "answer",
+            [2, "400237754469", [1778936820, 976814000]],
+            [[]],
+            "ServerTitle",
+            [],
+        ]
+        ask_result = _make_ask_result()
+        note = await chat_api.save_answer_as_note("nb-1", ask_result)
+        assert note.created_at is not None
+        assert int(note.created_at.timestamp()) == 1778936820

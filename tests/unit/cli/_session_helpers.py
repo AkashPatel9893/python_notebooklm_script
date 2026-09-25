@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import notebooklm.auth as auth_module
+import notebooklm.cli._chromium_profiles as chromium_profiles
+
 # ---------------------------------------------------------------------------
 # Account-metadata read helpers (D1 PR-3: session-CLI tests read account
 # metadata via the canonical reader; both the legacy sibling-``context.json``
@@ -76,12 +79,12 @@ def _account_exists(storage_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Multi-account rookiepy mock (login --account / --all-accounts flow)
+# Multi-account rookie-cookies mock (login --account / --all-accounts flow)
 # ---------------------------------------------------------------------------
 
 
-def _multiaccount_rookiepy_mock() -> MagicMock:
-    """Build a rookiepy mock that returns SID-bearing cookies for any domain query.
+def _multiaccount_rookie_cookies_mock() -> MagicMock:
+    """Build a rookie-cookies mock that returns SID-bearing cookies for any domain query.
 
     Account enumeration is controlled by a separately-patched
     ``enumerate_accounts`` coroutine in each test that calls this.
@@ -93,7 +96,7 @@ def _multiaccount_rookiepy_mock() -> MagicMock:
             "value": f"{name}-value",
             "path": "/",
             "secure": True,
-            "expires": 9999,
+            "expires": 4102444800,
             "http_only": False,
         }
         for name in ("SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSIDTS")
@@ -156,7 +159,7 @@ def _chromium_fanout_setup(
                 "value": f"SID-from-{dir_name}",
                 "path": "/",
                 "secure": True,
-                "expires": 9999,
+                "expires": 4102444800,
                 "http_only": False,
             },
             {
@@ -165,7 +168,7 @@ def _chromium_fanout_setup(
                 "value": f"SIDTS-from-{dir_name}",
                 "path": "/",
                 "secure": True,
-                "expires": 9999,
+                "expires": 4102444800,
                 "http_only": False,
             },
         ]
@@ -183,7 +186,7 @@ def _install_chromium_fanout_patches(
 ):
     """Install all fan-out patches for the test body.
 
-    Patches discovery, per-profile cookie reads, ``rookiepy`` (so the
+    Patches discovery, per-profile cookie reads, ``rookie_cookies`` (so the
     optional-dep import inside ``read_chromium_profile_cookies``
     succeeds), and ``enumerate_accounts`` so each profile yields its own
     account list.
@@ -215,18 +218,22 @@ def _install_chromium_fanout_patches(
         raise AssertionError(f"unexpected enumerate_accounts call (SID={sid!r})")
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.dict("sys.modules", {"rookiepy": MagicMock()}))
+        stack.enter_context(patch.dict("sys.modules", {"rookie_cookies": MagicMock()}))
         stack.enter_context(
-            patch(
-                "notebooklm.cli._chromium_profiles.discover_chromium_profiles",
+            patch.object(
+                chromium_profiles,
+                "discover_chromium_profiles",
                 side_effect=fake_discover,
             )
         )
         stack.enter_context(
-            patch(
-                "notebooklm.cli._chromium_profiles.read_chromium_profile_cookies",
+            patch.object(
+                chromium_profiles,
+                "read_chromium_profile_cookies",
                 side_effect=fake_read,
             )
         )
-        stack.enter_context(patch("notebooklm.auth.enumerate_accounts", side_effect=fake_enumerate))
+        stack.enter_context(
+            patch.object(auth_module, "enumerate_accounts", side_effect=fake_enumerate)
+        )
         yield

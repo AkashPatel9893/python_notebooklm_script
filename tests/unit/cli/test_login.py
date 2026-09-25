@@ -12,9 +12,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import notebooklm._app.login_browser as login_browser
+import notebooklm.cli.playwright_login_io as playwright_login_io_module
 import notebooklm.cli.services.playwright_login as _pl
-from _fixtures import patch_session_login_dual
+import notebooklm.cli.session_cmd as session_cmd_module
+from notebooklm._auth import account as _auth_account
+from notebooklm._env import get_base_host
 from notebooklm.notebooklm_cli import cli
+from tests._fixtures import patch_session_login_dual
 
 from .conftest import create_mock_client
 
@@ -50,6 +55,25 @@ def _required_cookie_state() -> dict:
     }
 
 
+def _invoke_login_with_launch_failure(runner, tmp_path, launch_error, *cli_args):
+    """Run ``notebooklm login <cli_args>`` with the browser launch raising ``launch_error``.
+
+    ``launch_persistent_context`` is the only failure point that matters here:
+    it raises before a context exists, which is what routes the error into the
+    friendly launch-failure branch instead of the generic bug-report handler.
+    """
+    with (
+        patch.object(_pl, "ensure_chromium_installed"),
+        patch("playwright.sync_api.sync_playwright") as mock_pw,
+        patch_session_login_dual("get_storage_path", return_value=tmp_path / "storage.json"),
+        patch.object(login_browser, "get_browser_profile_dir", return_value=tmp_path / "profile"),
+    ):
+        mock_launch = mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
+        mock_launch.side_effect = Exception(launch_error)
+
+        return runner.invoke(cli, ["login", *cli_args])
+
+
 def _storage_account(storage_file):
     data = json.loads(storage_file.read_text())
     return data.get("notebooklm", {}).get("account")
@@ -59,11 +83,12 @@ class TestLoginUrlValidation:
     def test_url_matches_default_base_host(self, monkeypatch):
         monkeypatch.delenv("NOTEBOOKLM_BASE_URL", raising=False)
 
-        from notebooklm.cli.services.playwright_login import (
+        from notebooklm._browser.browser_capture import (
             url_matches_base_host as _url_matches_base_host,
         )
 
         assert _url_matches_base_host("https://notebooklm.google.com/notebook/abc")
+        assert _url_matches_base_host("https://notebook.google.com/notebook/abc")
         assert not _url_matches_base_host(
             "https://example.com/path?next=https://notebooklm.google.com/"
         )
@@ -71,17 +96,18 @@ class TestLoginUrlValidation:
     def test_url_matches_enterprise_base_host(self, monkeypatch):
         monkeypatch.setenv("NOTEBOOKLM_BASE_URL", "https://notebooklm.cloud.google.com")
 
-        from notebooklm.cli.services.playwright_login import (
+        from notebooklm._browser.browser_capture import (
             url_matches_base_host as _url_matches_base_host,
         )
 
         assert _url_matches_base_host("https://notebooklm.cloud.google.com/notebook/abc")
         assert not _url_matches_base_host("https://notebooklm.google.com/notebook/abc")
+        assert not _url_matches_base_host("https://notebook.google.com/notebook/abc")
 
     def test_connection_error_help_uses_enterprise_base_host(self, monkeypatch):
         monkeypatch.setenv("NOTEBOOKLM_BASE_URL", "https://notebooklm.cloud.google.com")
 
-        from notebooklm.cli.services.playwright_login import (
+        from notebooklm._browser.browser_capture import (
             connection_error_help as _connection_error_help,
         )
 
@@ -195,15 +221,15 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=tmp_path / "storage.json"),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=tmp_path / "profile",
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_context.pages = [mock_page]
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
@@ -247,28 +273,68 @@ class TestLoginCommand:
         self, runner, tmp_path, browser, expected_label, expected_install_url_fragment
     ):
         """--browser msedge|chrome shows helpful error when the browser is not installed."""
-        with (
-            patch.object(_pl, "ensure_chromium_installed"),
-            patch("playwright.sync_api.sync_playwright") as mock_pw,
-            patch_session_login_dual("get_storage_path", return_value=tmp_path / "storage.json"),
-            patch.object(
-                _pl,
-                "get_browser_profile_dir",
-                return_value=tmp_path / "profile",
-            ),
-        ):
-            mock_launch = (
-                mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
-            )
-            mock_launch.side_effect = Exception(
-                f"Executable doesn't exist at /{browser}\nFailed to launch"
-            )
-
-            result = runner.invoke(cli, ["login", "--browser", browser])
+        result = _invoke_login_with_launch_failure(
+            runner,
+            tmp_path,
+            f"Executable doesn't exist at /{browser}\nFailed to launch",
+            "--browser",
+            browser,
+        )
 
         assert result.exit_code == 1
         assert f"{expected_label} not found" in result.output
         assert expected_install_url_fragment in result.output
+
+    @pytest.mark.parametrize(
+        ("launch_error", "expected_fragment"),
+        [
+            # Issue #2004: a Windows execution veto (AppLocker / WDAC / Defender)
+            # reaching the Node driver as libuv's UV_UNKNOWN.
+            (
+                "BrowserType.launch_persistent_context: spawn UNKNOWN",
+                "refused to start the browser",
+            ),
+            # Safety net for a missing `playwright install chromium`.
+            (
+                "Executable doesn't exist at /root/.cache/ms-playwright/chromium-1/chrome",
+                "playwright install chromium",
+            ),
+        ],
+    )
+    @pytest.mark.requires_playwright
+    def test_login_bundled_chromium_launch_failure_is_actionable(
+        self, runner, tmp_path, launch_error, expected_fragment
+    ):
+        """A bundled-Chromium launch failure must not surface as "please report a bug".
+
+        Before #2004 the friendly launch branch was gated on CHANNEL_BROWSERS,
+        which excludes the *default* browser — so every bundled launch failure
+        fell through to a bare ``raise`` and exited 2 with the bug-report hint.
+        """
+        result = _invoke_login_with_launch_failure(runner, tmp_path, launch_error)
+
+        assert result.exit_code == 1
+        assert expected_fragment in result.output
+        assert "This may be a bug" not in result.output
+
+    @pytest.mark.requires_playwright
+    def test_login_unclassified_launch_failure_still_reaches_the_bug_report_path(
+        self, runner, tmp_path
+    ):
+        """Un-gating must not over-swallow: an unrecognized failure still propagates.
+
+        ``classify_launch_failure`` returns ``None`` for anything it has no
+        specific advice for, and that must keep falling through to the bare
+        ``raise`` → ``handle_errors`` → exit 2. Pinning this stops a future
+        broadening of the markers from silently converting real bugs into a
+        confident, wrong hint.
+        """
+        result = _invoke_login_with_launch_failure(
+            runner, tmp_path, "Timeout 30000ms exceeded while starting the browser"
+        )
+
+        assert result.exit_code == 2
+        assert "This may be a bug" in result.output
 
     @pytest.fixture
     def mock_login_browser_with_storage(self, tmp_path):
@@ -290,18 +356,36 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=tmp_path / "profile",
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_context.pages = [mock_page]
-            # storage_state() now returns a dict; atomic_write_json writes it.
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            # Real Playwright pages expose their owning BrowserContext via
+            # ``page.context``; wire it so tests can reach the context from the
+            # yielded page (e.g. to make ``storage_state()`` raise) without
+            # rebuilding this harness.
+            mock_page.context = mock_context
+            # Real captures are validated before persistence. Keep this shared
+            # control-flow fixture minimally authenticated so these tests stay
+            # about navigation/render behavior rather than bypassing auth policy.
+            mock_context.storage_state.return_value = {
+                "cookies": [
+                    {"name": "SID", "value": "sid", "domain": ".google.com", "path": "/"},
+                    {
+                        "name": "__Secure-1PSIDTS",
+                        "value": "psidts",
+                        "domain": ".google.com",
+                        "path": "/",
+                    },
+                ],
+                "origins": [],
+            }
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
             )
@@ -317,6 +401,9 @@ class TestLoginCommand:
                 'Page.goto: Navigation to "https://accounts.google.com/" is interrupted by '
                 'another navigation to "https://notebooklm.google.com/"'
             ),
+            # #2257: a superseded navigation reports this instead of the prose
+            # above, and it must be treated as the same benign race.
+            "Page.goto: net::ERR_ABORTED; maybe frame was detached?",
         ],
     )
     @pytest.mark.requires_playwright
@@ -378,8 +465,12 @@ class TestLoginCommand:
         goto_calls = mock_page.goto.call_args_list
         # 3 calls: initial NOTEBOOKLM_URL, then accounts.google.com, then NOTEBOOKLM_URL
         assert len(goto_calls) == 3
-        assert goto_calls[1].kwargs.get("wait_until") == "commit"
-        assert goto_calls[2].kwargs.get("wait_until") == "commit"
+        # Every goto in the login flow must use an early lifecycle state, NOT the
+        # Playwright default "load" -- the NotebookLM SPA never fires "load", so a
+        # load-gated goto hangs (#1697). Assert the invariant (not the literal
+        # "commit") so a future switch to "domcontentloaded" doesn't spuriously fail.
+        for call in goto_calls:
+            assert call.kwargs.get("wait_until") in {"commit", "domcontentloaded"}
 
     def test_login_auto_detect_skipped_when_already_logged_in(
         self, runner, mock_login_browser_with_storage
@@ -398,13 +489,13 @@ class TestLoginCommand:
     ):
         """When the initial page is on accounts.google.com, wait_for_url is called."""
         mock_page = mock_login_browser_with_storage
-        # Initial URL is on Google login, then wait_for_url "succeeds" and the
-        # next reads of mock_page.url return the NotebookLM host for the
-        # subsequent cookie-forcing navigation.
+        # Initial URL is on Google login, then wait_for_url reaches the personal
+        # app alias used by the Gemini Notebook rebrand.
         mock_page.url = "https://accounts.google.com/signin"
 
-        def succeed(url, **kwargs):
-            mock_page.url = "https://notebooklm.google.com/"
+        def succeed(predicate, **kwargs):
+            assert predicate("https://notebook.google.com/")
+            mock_page.url = "https://notebook.google.com/"
 
         mock_page.wait_for_url.side_effect = succeed
 
@@ -414,7 +505,32 @@ class TestLoginCommand:
         mock_page.wait_for_url.assert_called_once()
         # Verify timeout=300_000 (5 minutes) is passed
         assert mock_page.wait_for_url.call_args.kwargs.get("timeout") == 300_000
+        # The detector must NOT inherit Playwright's default wait_until="load":
+        # The app host is a streaming SPA that never fires "load", so a
+        # load-gated wait hangs the full 5 min even though login already succeeded
+        # (#1697). Assert the invariant rather than the literal "commit".
+        assert mock_page.wait_for_url.call_args.kwargs.get("wait_until") in {
+            "commit",
+            "domcontentloaded",
+        }
         assert "Login detected" in result.output
+
+    def test_login_forwards_custom_browser_timeout(self, runner, mock_login_browser_with_storage):
+        """The public timeout controls Playwright's human sign-in wait."""
+        mock_page = mock_login_browser_with_storage
+        mock_page.url = "https://accounts.google.com/signin"
+
+        def succeed(predicate, **kwargs):
+            assert predicate("https://notebooklm.google.com/")
+            mock_page.url = "https://notebooklm.google.com/"
+
+        mock_page.wait_for_url.side_effect = succeed
+
+        result = runner.invoke(cli, ["login", "--browser-timeout", "420"])
+
+        assert result.exit_code == 0
+        assert mock_page.wait_for_url.call_args.kwargs["timeout"] == 420_000
+        assert "Waiting for login (up to 420 seconds)" in result.output
 
     @pytest.mark.requires_playwright
     def test_login_auto_detect_timeout_exits_with_helpful_message(
@@ -460,10 +576,10 @@ class TestLoginCommand:
         mock_page.url = "https://accounts.google.com/signin"
 
         def wait_succeeds(url, **kwargs):
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
 
         def goto_drifts(url, **kwargs):
-            if "notebooklm" in url:
+            if get_base_host() in url:
                 mock_page.url = "https://accounts.google.com/AccountChooser"
 
         mock_page.wait_for_url.side_effect = wait_succeeds
@@ -497,7 +613,7 @@ class TestLoginCommand:
 
         mock_page.goto.side_effect = goto_side_effect
 
-        with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+        with patch("time.sleep"):
             result = runner.invoke(cli, ["login"])
 
         assert result.exit_code == 0
@@ -525,7 +641,7 @@ class TestLoginCommand:
 
         mock_page.goto.side_effect = goto_side_effect
 
-        with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+        with patch("time.sleep"):
             result = runner.invoke(cli, ["login"])
 
         assert result.exit_code == 0
@@ -544,7 +660,7 @@ class TestLoginCommand:
 
         mock_page.goto.side_effect = goto_side_effect
 
-        with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+        with patch("time.sleep"):
             result = runner.invoke(cli, ["login"])
 
         assert result.exit_code == 1
@@ -569,7 +685,7 @@ class TestLoginCommand:
 
         mock_page.goto.side_effect = goto_side_effect
 
-        with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+        with patch("time.sleep"):
             result = runner.invoke(cli, ["login"])
 
         assert result.exit_code != 0
@@ -592,7 +708,7 @@ class TestLoginCommand:
 
         mock_page.goto.side_effect = goto_side_effect
 
-        with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+        with patch("time.sleep"):
             result = runner.invoke(cli, ["login"])
 
         assert result.exit_code == 1
@@ -619,18 +735,18 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_context.pages = [mock_page]
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
             )
@@ -656,18 +772,18 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_context.pages = [mock_page]
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
             )
@@ -694,16 +810,16 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch_session_login_dual("_sync_server_language_to_config"),
+            patch.object(_auth_account, "enumerate_accounts", new=_enum),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_page.content.return_value = "<html></html>"
             mock_context.pages = [mock_page]
             mock_context.storage_state.return_value = _required_cookie_state()
@@ -734,7 +850,7 @@ class TestLoginCommand:
         # after Playwright's sync context has torn down its event loop.
         mock_context = MagicMock()
         mock_page = MagicMock()
-        mock_page.url = "https://notebooklm.google.com/"
+        mock_page.url = f"https://{get_base_host()}/"
         mock_page.content.return_value = "<html></html>"
         mock_context.pages = [mock_page]
         mock_context.storage_state.return_value = _required_cookie_state()
@@ -755,7 +871,14 @@ class TestLoginCommand:
         def fake_sync_playwright():
             return FakeSyncPlaywright()
 
-        def fake_repair(storage_path, io, *, page_html=None, quiet=False):
+        def fake_repair(
+            storage_path,
+            *,
+            emit_event,
+            run_async,
+            page_html=None,
+            quiet=False,
+        ):
             repair_calls.append(
                 {
                     "storage_path": storage_path,
@@ -770,13 +893,14 @@ class TestLoginCommand:
         with (
             patch.object(_pl, "ensure_chromium_installed"),
             patch("playwright.sync_api.sync_playwright", side_effect=fake_sync_playwright),
-            patch(
-                "notebooklm.cli.services.playwright_login.repair_playwright_account_metadata",
+            patch.object(
+                login_browser,
+                "repair_playwright_account_metadata",
                 side_effect=fake_repair,
             ),
         ):
             playwright_login.run_playwright_login(
-                playwright_login.PlaywrightLoginPlan(
+                login_browser.BrowserLoginPlan(
                     browser="chromium",
                     browser_profile=browser_dir,
                     storage_path=storage_file,
@@ -812,16 +936,16 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch_session_login_dual("_sync_server_language_to_config"),
+            patch.object(_auth_account, "enumerate_accounts", new=_enum),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_page.content.return_value = '<script>"bob@example.com"</script>'
             mock_context.pages = [mock_page]
             mock_context.storage_state.return_value = _required_cookie_state()
@@ -859,16 +983,16 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch_session_login_dual("_sync_server_language_to_config"),
+            patch.object(_auth_account, "enumerate_accounts", new=_enum),
         ):
             mock_context = MagicMock()
             mock_page_stale = MagicMock()
-            mock_page_stale.url = "https://notebooklm.google.com/"
+            mock_page_stale.url = f"https://{get_base_host()}/"
             mock_page_stale.content.return_value = '<script>"alice@example.com"</script>'
             goto_count = 0
 
@@ -881,7 +1005,7 @@ class TestLoginCommand:
 
             mock_page_stale.goto.side_effect = stale_goto
             mock_page_recovered = MagicMock()
-            mock_page_recovered.url = "https://notebooklm.google.com/"
+            mock_page_recovered.url = f"https://{get_base_host()}/"
             mock_page_recovered.content.return_value = '<script>"bob@example.com"</script>'
             mock_context.pages = [mock_page_stale]
             mock_context.new_page.return_value = mock_page_recovered
@@ -928,16 +1052,16 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
+            patch_session_login_dual("_sync_server_language_to_config"),
+            patch.object(_auth_account, "enumerate_accounts", new=_enum),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_page.content.return_value = "<html></html>"
             mock_context.pages = [mock_page]
             mock_context.storage_state.return_value = _required_cookie_state()
@@ -966,9 +1090,9 @@ class TestLoginCommand:
 
         with (
             patch_session_login_dual("get_storage_path", return_value=storage_file),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
-            patch(
-                "notebooklm.cli.session_cmd.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(_auth_account, "enumerate_accounts", new=_enum),
+            patch.object(
+                session_cmd_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf_ok", "session_ok")
@@ -1003,9 +1127,9 @@ class TestLoginCommand:
 
         with (
             patch_session_login_dual("get_storage_path", return_value=storage_file),
-            patch("notebooklm.auth.enumerate_accounts", new=_enum),
-            patch(
-                "notebooklm.cli.session_cmd.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(_auth_account, "enumerate_accounts", new=_enum),
+            patch.object(
+                session_cmd_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf_ok", "session_ok")
@@ -1032,10 +1156,10 @@ class TestLoginCommand:
 
         with (
             patch_session_login_dual("get_storage_path", return_value=storage_file),
-            patch(
-                "notebooklm.cli.session_cmd.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                session_cmd_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
-            patch("notebooklm.cli.session_cmd.repair_after_refresh") as mock_repair,
+            patch.object(session_cmd_module, "repair_after_refresh") as mock_repair,
         ):
             mock_fetch.return_value = ("csrf_ok", "session_ok")
             result = runner.invoke(cli, ["auth", "refresh"])
@@ -1068,18 +1192,18 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             mock_context = MagicMock()
             mock_page = MagicMock()
-            mock_page.url = "https://notebooklm.google.com/"
+            mock_page.url = f"https://{get_base_host()}/"
             mock_context.pages = [mock_page]
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
             )
@@ -1114,14 +1238,18 @@ class TestLoginCommand:
         with (
             patch_session_login_dual("get_storage_path", return_value=tmp_path / "s.json"),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            # ``prepare_login_paths`` (in ``services.playwright_login``) owns
+            # ``prepare_login_paths`` (in ``_app.login_browser``) owns
             # the ``--fresh`` rmtree; patch the consumer module's ``shutil``
             # (#1367 removed the ``session_cmd`` stdlib re-export).
-            patch.object(_pl.shutil, "rmtree", side_effect=OSError("locked")) as mock_rmtree,
+            patch.object(
+                login_browser.shutil,
+                "rmtree",
+                side_effect=OSError("locked"),
+            ) as mock_rmtree,
         ):
             result = runner.invoke(cli, ["login", "--fresh"])
 
@@ -1143,11 +1271,11 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             from playwright.sync_api import Error as PlaywrightError
@@ -1155,7 +1283,7 @@ class TestLoginCommand:
             mock_context = MagicMock()
             mock_page_stale = MagicMock()
             mock_page_fresh = MagicMock()
-            mock_page_fresh.url = "https://notebooklm.google.com/"
+            mock_page_fresh.url = f"https://{get_base_host()}/"
             mock_page_fresh.goto.side_effect = None
 
             # Stale page raises TargetClosedError on every call
@@ -1165,14 +1293,14 @@ class TestLoginCommand:
             mock_context.pages = [mock_page_stale]
             # new_page() returns a working fresh page
             mock_context.new_page.return_value = mock_page_fresh
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
 
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
             )
             mock_launch.return_value = mock_context
 
-            with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+            with patch("time.sleep"):
                 result = runner.invoke(cli, ["login"])
 
         assert result.exit_code == 0
@@ -1196,11 +1324,11 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             from playwright.sync_api import Error as PlaywrightError
@@ -1208,7 +1336,7 @@ class TestLoginCommand:
             mock_context = MagicMock()
             mock_page_stale = MagicMock()
             mock_page_fresh = MagicMock()
-            mock_page_fresh.url = "https://notebooklm.google.com/"
+            mock_page_fresh.url = f"https://{get_base_host()}/"
             mock_page_fresh.goto.side_effect = None
 
             # Initial navigation succeeds (auto-login via cached session)
@@ -1224,10 +1352,10 @@ class TestLoginCommand:
                 raise PlaywrightError("Page.goto: Target page, context or browser has been closed")
 
             mock_page_stale.goto.side_effect = stale_goto_side_effect
-            mock_page_stale.url = "https://notebooklm.google.com/"
+            mock_page_stale.url = f"https://{get_base_host()}/"
             mock_context.pages = [mock_page_stale]
             mock_context.new_page.return_value = mock_page_fresh
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
 
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
@@ -1252,11 +1380,11 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             from playwright.sync_api import Error as PlaywrightError
@@ -1264,7 +1392,7 @@ class TestLoginCommand:
             mock_context = MagicMock()
             mock_page_stale = MagicMock()
             mock_page_recovered = MagicMock()
-            mock_page_recovered.url = "https://notebooklm.google.com/"
+            mock_page_recovered.url = f"https://{get_base_host()}/"
 
             goto_call_count = 0
 
@@ -1276,14 +1404,14 @@ class TestLoginCommand:
                 raise PlaywrightError("Page.goto: Target page, context or browser has been closed")
 
             mock_page_stale.goto.side_effect = stale_goto_side_effect
-            mock_page_stale.url = "https://notebooklm.google.com/"
+            mock_page_stale.url = f"https://{get_base_host()}/"
             mock_page_recovered.goto.side_effect = PlaywrightError(
                 'Page.goto: Navigation to "https://accounts.google.com/" is interrupted by '
                 'another navigation to "https://notebooklm.google.com/"'
             )
             mock_context.pages = [mock_page_stale]
             mock_context.new_page.return_value = mock_page_recovered
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
 
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
@@ -1307,11 +1435,11 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             from playwright.sync_api import Error as PlaywrightError
@@ -1324,14 +1452,14 @@ class TestLoginCommand:
             )
             mock_context.pages = [mock_page]
             mock_context.new_page.return_value = mock_page  # new pages also fail
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
 
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
             )
             mock_launch.return_value = mock_context
 
-            with patch("notebooklm.cli.services.playwright_login.time.sleep"):
+            with patch("time.sleep"):
                 result = runner.invoke(cli, ["login"])
 
         assert result.exit_code == 1
@@ -1354,11 +1482,11 @@ class TestLoginCommand:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=storage_file),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=browser_dir,
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
             patch("builtins.input", return_value=""),
         ):
             from playwright.sync_api import Error as PlaywrightError
@@ -1378,14 +1506,14 @@ class TestLoginCommand:
                 raise PlaywrightError("Page.goto: Target page, context or browser has been closed")
 
             mock_page_stale.goto.side_effect = stale_goto_side_effect
-            mock_page_stale.url = "https://notebooklm.google.com/"
+            mock_page_stale.url = f"https://{get_base_host()}/"
             # Recovered page also raises TargetClosedError on goto
             mock_page_recovered.goto.side_effect = PlaywrightError(
                 "Page.goto: Target page, context or browser has been closed"
             )
             mock_context.pages = [mock_page_stale]
             mock_context.new_page.return_value = mock_page_recovered
-            mock_context.storage_state.return_value = {"cookies": [], "origins": []}
+            mock_context.storage_state.return_value = _required_cookie_state()
 
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
@@ -1396,6 +1524,57 @@ class TestLoginCommand:
 
         assert result.exit_code == 1
         assert "browser" in result.output.lower() and "closed" in result.output.lower()
+
+    @pytest.mark.requires_playwright
+    def test_login_browser_closed_during_storage_capture_shows_help(
+        self, runner, mock_login_browser_with_storage
+    ):
+        """TargetClosed at the final ``storage_state()`` capture surfaces BROWSER_CLOSED_HELP (#1514).
+
+        Every in-flow Playwright call (recover_page, the navigation retry
+        loop, wait_for_url, cookie-forcing) already maps TargetClosedError to
+        BROWSER_CLOSED_HELP + exit 1. Closing the browser in the narrow window
+        before ``context.storage_state()`` used to fall through the outer
+        handler's bare ``raise`` instead — exit 2 + "Unexpected error" + the
+        bug-report hint, for something that isn't a bug.
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
+        mock_page = mock_login_browser_with_storage
+        mock_page.context.storage_state.side_effect = PlaywrightError(
+            "BrowserContext.storage_state: Target page, context or browser has been closed"
+        )
+
+        result = runner.invoke(cli, ["login"])
+
+        assert result.exit_code == 1
+        assert "browser window was closed" in result.output.lower()
+        assert "Unexpected error" not in result.output
+        assert "Authentication saved" not in result.output
+
+    @pytest.mark.requires_playwright
+    def test_login_non_target_closed_error_during_storage_capture_propagates(
+        self, runner, mock_login_browser_with_storage
+    ):
+        """A non-TargetClosed failure at ``storage_state()`` keeps the exit-2 contract.
+
+        Counter-case for the #1514 fix: only TargetClosed gets the friendly
+        browser-closed help; any other failure at the capture site still
+        propagates through the outer handler's bare ``raise`` to
+        ``handle_errors`` ("Unexpected error: ..." + exit 2).
+        """
+        from playwright.sync_api import Error as PlaywrightError
+
+        mock_page = mock_login_browser_with_storage
+        mock_page.context.storage_state.side_effect = PlaywrightError(
+            "BrowserContext.storage_state: Protocol error (Storage.getCookies)"
+        )
+
+        result = runner.invoke(cli, ["login"])
+
+        assert result.exit_code == 2
+        assert "Unexpected error" in result.output
+        assert "browser window was closed" not in result.output.lower()
 
 
 class TestLoginNoTraceback:
@@ -1432,11 +1611,11 @@ class TestLoginNoTraceback:
             patch("playwright.sync_api.sync_playwright") as mock_pw,
             patch_session_login_dual("get_storage_path", return_value=tmp_path / "storage.json"),
             patch.object(
-                _pl,
+                login_browser,
                 "get_browser_profile_dir",
                 return_value=tmp_path / "profile",
             ),
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config"),
+            patch_session_login_dual("_sync_server_language_to_config"),
         ):
             mock_launch = (
                 mock_pw.return_value.__enter__.return_value.chromium.launch_persistent_context
@@ -1548,6 +1727,7 @@ class TestLoginLanguageSync:
     def test_sync_uses_explicit_storage_and_profile(self, tmp_path):
         """Language sync should use the freshly written login target."""
         from notebooklm.cli.session_cmd import _sync_server_language_to_config
+        from notebooklm.options import ClientConfig, WebBackendConfig, WebRequestOptions
 
         config_path = tmp_path / "config.json"
         storage_path = tmp_path / "profiles" / "work" / "storage_state.json"
@@ -1569,6 +1749,7 @@ class TestLoginLanguageSync:
         mock_client_cls.from_storage.assert_called_once_with(
             path=str(storage_path),
             profile="work",
+            config=ClientConfig(backend=WebBackendConfig(request=WebRequestOptions())),
         )
         config = json.loads(config_path.read_text())
         assert config["language"] == "fr"
@@ -1582,7 +1763,7 @@ class TestLoginLanguageSync:
             # The warning is now emitted through the injected ``LoginIO`` sink
             # (#1393); with no sink passed, the default ``PlaywrightLoginIO``
             # resolves and forwards ``emit`` to ``playwright_login_io.console``.
-            patch("notebooklm.cli.playwright_login_io.console") as mock_console,
+            patch.object(playwright_login_io_module, "console") as mock_console,
         ):
             # Raise from the sync `from_storage` call itself.
             mock_client_cls.from_storage = MagicMock(side_effect=Exception("Network error"))

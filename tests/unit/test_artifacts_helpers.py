@@ -1,4 +1,4 @@
-"""Unit tests for module-level helpers in ``notebooklm._artifact.formatters``.
+"""Unit tests for Web positional data-table helpers.
 
 Focuses on ``_extract_data_table_rows`` — the named extractor that replaces
 the raw ``raw_data[0][0][0][0][4][2]`` deep-index chain in
@@ -15,7 +15,7 @@ import logging
 
 import pytest
 
-from notebooklm._artifact.formatters import (
+from notebooklm._web.artifact.table import (
     _extract_data_table_rows,
     _parse_data_table,
 )
@@ -149,3 +149,26 @@ def test_parse_data_table_happy_path() -> None:
 
     assert headers == ["Col1", "Col2"]
     assert rows == [["A", "B"]]
+
+
+def test_parse_data_table_skips_malformed_row_sections() -> None:
+    """Per-row malformed sections are skipped, not fatal: a non-list row, a
+    short (<3) row, and a row whose cell-array slot is a non-list are all
+    dropped while the valid header + data rows parse. Pins the soft per-row
+    skip contract preserved across the #1491 ``safe_index`` migration of the
+    ``row_section[2]`` read (the ``len(row_section) < 3`` guard keeps it a
+    no-op; a present non-list ``cell_array`` is also skipped)."""
+    rows_array = [
+        [0, 1, ["H1", "H2"]],  # header (valid)
+        "not-a-list",  # non-list row_section -> skip
+        [0, 1],  # short (<3) row_section -> skip
+        [0, 1, "non-list-cell-array"],  # cell_array not a list -> skip
+        [0, 1, ["v1", "v2"]],  # data row (valid)
+    ]
+    # rows_array lives at raw_data[0][0][0][0][4][2] (mirrors the happy-path test).
+    raw_data = [[[[[0, 100, None, None, [6, 7, rows_array]]]]]]
+
+    headers, rows = _parse_data_table(raw_data, cell_text_extractor=lambda cell: cell)
+
+    assert headers == ["H1", "H2"]
+    assert rows == [["v1", "v2"]]

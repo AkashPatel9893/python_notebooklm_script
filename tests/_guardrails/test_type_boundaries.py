@@ -13,13 +13,13 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from scripts._tracked_files import tracked_files
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "src" / "notebooklm"
 TYPES_PATH = SRC_ROOT / "types.py"
 PRIVATE_TYPES_ROOT = SRC_ROOT / "_types"
 CLI_ROOT = SRC_ROOT / "cli"
-PUBLIC_DOC_ROOTS = (PROJECT_ROOT / "README.md", PROJECT_ROOT / "docs")
 INTERNAL_ARCHITECTURE_DOCS = {
     PROJECT_ROOT / "docs" / "development.md",
     PROJECT_ROOT / "docs" / "rpc-development.md",
@@ -29,6 +29,9 @@ INTERNAL_ARCHITECTURE_DOCS = {
 # Add names here only for explicit facade wrappers that must keep a public
 # monkeypatch seam while delegating implementation to a private _types module.
 ALLOWED_TYPES_WRAPPER_BODIES: set[str] = set()
+# Structural callback Protocols may live in the import-light ``_types`` leaf
+# without becoming value types on the long-standing ``notebooklm.types`` facade.
+PRIVATE_CALLBACK_PROTOCOLS = frozenset({"SaveCookiesToStorage"})
 PRIVATE_NOTEBOOKLM_IMPORT_RE = re.compile(
     r"\b(?:from\s+notebooklm(?:\._(?!_)\w+(?:\.\w+)*|\s+import\s+_(?!_)\w+)\b"
     r"|import\s+notebooklm\._(?!_)\w+(?:\.\w+)*\b)"
@@ -99,15 +102,14 @@ def _cli_private_types_import_offenders(path: Path) -> list[str]:
 
 
 def _iter_public_docs() -> list[Path]:
-    docs: list[Path] = []
-    for root in PUBLIC_DOC_ROOTS:
-        if root.is_file():
-            docs.append(root)
-        elif root.is_dir():
-            docs.extend(
-                path for path in root.rglob("*.md") if path not in INTERNAL_ARCHITECTURE_DOCS
-            )
-    return sorted(docs)
+    tracked = tracked_files(PROJECT_ROOT, fallback_globs=("README.md", "docs/**/*.md"))
+    return sorted(
+        path
+        for path in tracked
+        if path.suffix == ".md"
+        and (path == PROJECT_ROOT / "README.md" or path.is_relative_to(PROJECT_ROOT / "docs"))
+        and path not in INTERNAL_ARCHITECTURE_DOCS
+    )
 
 
 def _public_docs_private_import_offenders() -> list[str]:
@@ -168,7 +170,11 @@ def _private_type_module_symbols() -> tuple[set[str], set[str]]:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in tree.body:
-            if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+            if (
+                isinstance(node, ast.ClassDef)
+                and not node.name.startswith("_")
+                and node.name not in PRIVATE_CALLBACK_PROTOCOLS
+            ):
                 public_type_names.add(node.name)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith(
                 "_"

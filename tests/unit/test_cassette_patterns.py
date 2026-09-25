@@ -22,6 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from tests import vcr_config
 from tests.cassette_patterns import (
     DISPLAY_NAME_FALSE_POSITIVES,
@@ -46,6 +47,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # would itself trip GitHub secret scanning. The value is obviously fake.
 FAKE_GOOGLE_API_KEY = "AIza" + "FAKE0" * 7
 assert len(FAKE_GOOGLE_API_KEY) == 39  # AIza + 35
+
+# Synthetic current-format Google authorization key. Runtime concatenation
+# keeps a contiguous credential-shaped literal out of the source file.
+FAKE_GOOGLE_AUTH_KEY = "AQ." + "FAKE0" * 10
+assert len(FAKE_GOOGLE_AUTH_KEY) == 53  # AQ. + 50
 
 # ---------------------------------------------------------------------------
 # Exports
@@ -151,6 +157,28 @@ def test_email_is_scrubbed_unquoted(provider: str) -> None:
     scrubbed = scrub_string(text)
     assert provider not in scrubbed
     assert "SCRUBBED_EMAIL@example.com" in scrubbed
+
+
+@pytest.mark.parametrize("suffix", ["x", "_other"])
+def test_email_provider_prefix_is_not_scrubbed_or_reported_as_a_leak(suffix: str) -> None:
+    """Provider-domain prefixes within a larger identifier are not email addresses."""
+    from tests.cassette_patterns import _DETECT_EMAIL, is_clean
+
+    text = f"alice@gmail.com{suffix}"
+    assert scrub_string(text) == text
+    assert not list(_DETECT_EMAIL.finditer(text))
+    assert is_clean(text) == (True, [])
+
+
+@pytest.mark.parametrize("suffix", [".", ". Next"])
+def test_email_with_sentence_punctuation_is_scrubbed_and_reported_as_a_leak(suffix: str) -> None:
+    """A period ending a sentence is not part of the provider-domain identifier."""
+    from tests.cassette_patterns import _DETECT_EMAIL, is_clean
+
+    text = f"alice@gmail.com{suffix}"
+    assert scrub_string(text) == f"SCRUBBED_EMAIL@example.com{suffix}"
+    assert list(_DETECT_EMAIL.finditer(text))
+    assert is_clean(text) == (False, ["Leak (email): 'alice@gmail.com'"])
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +427,20 @@ def test_longer_than_canonical_api_key_is_fully_scrubbed_no_partial_leak() -> No
     assert find_credential_leaks(text)
 
 
+def test_google_authorization_key_is_scrubbed_and_detected_in_unknown_field() -> None:
+    """An ``AQ.`` key is scrubbed and rejected without a known carrier name."""
+    text = f'{{"SomeUnknownField":"{FAKE_GOOGLE_AUTH_KEY}"}}'
+
+    scrubbed = scrub_string(text)
+
+    assert FAKE_GOOGLE_AUTH_KEY not in scrubbed
+    assert "AQ." not in scrubbed
+    assert "SCRUBBED" in scrubbed
+    assert is_clean(scrubbed)[0]
+    assert not is_clean(text)[0]
+    assert any("auth token" in leak for leak in find_credential_leaks(text))
+
+
 # ---------------------------------------------------------------------------
 # find_credential_leaks — high-severity-only subset (for fixture scanning)
 # ---------------------------------------------------------------------------
@@ -414,6 +456,17 @@ def test_find_credential_leaks_flags_auth_token() -> None:
     """A raw ``g.a000-`` auth token is reported by the credential-only scanner."""
     leaks = find_credential_leaks("Cookie: SID=g.a000-abcdefghijklmnop")
     assert any("auth token" in leak for leak in leaks)
+
+
+def test_find_credential_leaks_flags_durable_master_token() -> None:
+    """A raw ``aas_et/`` token is scrubbed and rejected outside known fields."""
+    master_token = "aas_et/mastertokenunderunknownfield"
+    raw = f'{{"unknown":"{master_token}"}}'
+
+    scrubbed = scrub_string(raw)
+
+    assert master_token not in scrubbed
+    assert any("auth token" in leak for leak in find_credential_leaks(raw))
 
 
 def test_find_credential_leaks_ignores_placeholder_fixture_content() -> None:
@@ -447,7 +500,8 @@ def test_find_credential_leaks_ignores_placeholder_fixture_content() -> None:
 # source file carries NO contiguous static credential-shaped literal — a 64-char
 # hex or 40+ char base64 string written inline would itself trip secret scanning
 # (Betterleaks flags it as a generic API key). The shapes are also distinct from
-# the known g.a000-/sidts-/ya29./AIza prefixes, and the deterministic mixes keep
+# the known ``aas_et/`` / ``g.a000-`` / ``sidts-`` / ``ya29.`` / ``AIza``
+# prefixes, and the deterministic mixes keep
 # the base64 entropy well above the 4.0 bits/char floor.
 NOVEL_BASE64_TOKEN = "".join(
     ("kJ8sLm2NpQr5TvWx", "Yz0AbCdEfGhIjKlM", "nOpQrStUvWxYz123", "45678AbCdEf")
@@ -923,6 +977,56 @@ def test_display_name_inside_wrb_payload_scrubbed() -> None:
     assert "SCRUBBED_AVATAR_URL" in scrubbed
 
 
+def test_gbar_config_display_name_scrubbed_and_detected() -> None:
+    """The Google account CONFIG positional name is redacted structurally."""
+    raw = (
+        '[["SCRUBBED_EMAIL@example.com","","opaque",0,0,null,"",1,'
+        '"Alice Example","https://lh3.googleusercontent.com/a/avatar=s32"]]'
+    )
+    ok, leaks = is_clean(
+        raw.replace("https://lh3.googleusercontent.com/a/avatar=s32", "SCRUBBED_AVATAR_URL")
+    )
+    assert not ok
+    assert any("gbar display name" in leak for leak in leaks)
+
+    scrubbed = scrub_string(raw)
+    assert "Alice Example" not in scrubbed
+    assert '"SCRUBBED_NAME","SCRUBBED_AVATAR_URL"' in scrubbed
+    assert is_clean(scrubbed) == (True, [])
+
+
+def test_gbar_config_account_id_scrubbed_and_detected() -> None:
+    """The opaque account-linked CONFIG value never reaches a cassette."""
+    raw = (
+        '[["SCRUBBED_EMAIL@example.com","","opaque-account-identifier",'
+        '0,0,null,"",1,"SCRUBBED_NAME","SCRUBBED_AVATAR_URL"]]'
+    )
+    ok, leaks = is_clean(raw)
+    assert not ok
+    assert any("gbar account ID" in leak for leak in leaks)
+
+    scrubbed = scrub_string(raw)
+    assert "opaque-account-identifier" not in scrubbed
+    assert "SCRUBBED_ACCOUNT_ID" in scrubbed
+    assert is_clean(scrubbed) == (True, [])
+
+
+def test_account_menu_display_name_scrubbed_and_detected() -> None:
+    """A profile-menu name adjacent to the account email cannot survive."""
+    raw = (
+        '<div class="build-name">Alice Example</div>'
+        '<div class="build-email">SCRUBBED_EMAIL@example.com</div>'
+    )
+    ok, leaks = is_clean(raw)
+    assert not ok
+    assert any("account-menu display name" in leak for leak in leaks)
+
+    scrubbed = scrub_string(raw)
+    assert "Alice Example" not in scrubbed
+    assert "SCRUBBED_NAME" in scrubbed
+    assert is_clean(scrubbed) == (True, [])
+
+
 def test_avatar_url_a_path_scrubbed() -> None:
     """The ``/a/`` avatar URL form is scrubbed to SCRUBBED_AVATAR_URL."""
     url = "https://lh3.googleusercontent.com/a/ACg8ocImrMoQR5mQnUHZzuc6Tat88aWfSwMre0nCoCanft5bLuZ3dTV0=s512"
@@ -1099,7 +1203,9 @@ def test_display_name_false_positives_mirror_shape_lint() -> None:
     # that ``_``-prefixed module avoids a test-imports-test dependency on
     # ``test_cassette_shapes``. ``tests/`` is on ``sys.path`` so the
     # ``_guardrails`` package resolves.
-    from _guardrails._cassette_shape_lint import DISPLAY_NAME_FALSE_POSITIVES as SHAPE_LINT_FPS
+    from tests._guardrails._cassette_shape_lint import (
+        DISPLAY_NAME_FALSE_POSITIVES as SHAPE_LINT_FPS,
+    )
 
     # Shape-lint stores entries as ``\"Name\"``; the scrub registry stores
     # bare names. Strip the escape wrapping to compare apples-to-apples.
@@ -1111,3 +1217,29 @@ def test_display_name_false_positives_mirror_shape_lint() -> None:
         "update BOTH tests/cassette_patterns.py and "
         "tests/_guardrails/_cassette_shape_lint.py"
     )
+
+
+def test_detect_email_is_linear_on_long_pathological_input() -> None:
+    """_DETECT_EMAIL anchored lookbehind prevents polynomial backtracking."""
+    import time
+
+    from tests.cassette_patterns import _DETECT_EMAIL, is_clean
+
+    def scan_duration(length: int) -> float:
+        t0 = time.perf_counter()
+        matches = list(_DETECT_EMAIL.finditer("a" * length))
+        assert not matches
+        return time.perf_counter() - t0
+
+    small_duration = scan_duration(25_000)
+    long_path = "a" * 100_000
+    long_duration = scan_duration(len(long_path))
+    # A fourfold input must not grow superlinearly. The fixed allowance avoids
+    # making this regression test depend on CI scheduling noise for tiny runs.
+    assert long_duration <= small_duration * 8 + 0.5, (
+        f"_DETECT_EMAIL scaling regressed: {small_duration:.3f}s for 25k vs "
+        f"{long_duration:.3f}s for 100k"
+    )
+
+    ok, leaks = is_clean(f"https://example.com/{long_path}")
+    assert ok

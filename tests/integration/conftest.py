@@ -1,7 +1,8 @@
 """Shared fixtures for integration tests."""
 
 import importlib.util
-from collections.abc import Awaitable, Callable
+import os
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -25,15 +26,147 @@ _vcr_config = importlib.util.module_from_spec(_vcr_config_spec)
 _vcr_config_spec.loader.exec_module(_vcr_config)
 _is_vcr_record_mode = _vcr_config._is_vcr_record_mode
 
+_ANDROID_GRPC_RECORD_ENV = "NOTEBOOKLM_ANDROID_GRPC_RECORD"
+
+
+def _is_android_grpc_record_mode() -> bool:
+    """Return whether live Android gRPC cassette recording is explicit."""
+    return os.environ.get(_ANDROID_GRPC_RECORD_ENV, "").casefold() in ("1", "true", "yes")
+
+
+@pytest.fixture(scope="session")
+def android_record_scratch() -> Iterator[Any]:
+    """Disposable live notebook for Android cassette *recording*; ``None`` on replay.
+
+    Created and deleted through a plain (unrecorded) client in their own event
+    loops, so scratch setup traffic never lands in a cassette. Session-scoped so
+    every recorded family sees the same notebook, source, and note.
+    """
+    if not _is_android_grpc_record_mode():
+        yield None
+        return
+    import asyncio
+
+    from tests._helpers.android_grpc_harness import (
+        create_scratch_notebook,
+        delete_scratch_notebook,
+    )
+
+    scratch = asyncio.run(create_scratch_notebook())
+    try:
+        yield scratch
+    finally:
+        asyncio.run(delete_scratch_notebook(scratch))
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Any:
+    """Expose the call-phase outcome to fixtures (``item.rep_call``)."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.when == "call":
+        item.rep_call = report  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def android_grpc_cassette(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    android_record_scratch: Any,
+) -> Iterator[Callable[[str], Any]]:
+    """Bind a ``@pytest.mark.grpc_cassette`` test to ``tests/cassettes/android/<name>_recorded.grpc.json``.
+
+    Returns an async context manager yielding ``(client, values)``; see
+    ``tests/_helpers/android_grpc_harness.py`` for the record/replay contract.
+    While recording, a finished staging file replaces the committed cassette
+    only if the test itself passed, so a failing post-hoc assertion never
+    commits an invalid re-recording.
+    """
+    from tests._helpers.android_grpc_harness import (
+        android_cassette_client,
+        discard_recording,
+        promote_recording,
+    )
+
+    recorded: list[tuple[Path, Path]] = []
+
+    def bind(name: str, *, phenotype_http: bool = False) -> Any:
+        path = ANDROID_CASSETTES_DIR / f"{name}_recorded.grpc.json"
+        return android_cassette_client(
+            path,
+            monkeypatch=monkeypatch,
+            scratch=android_record_scratch,
+            phenotype_cassette_path=(
+                ANDROID_CASSETTES_DIR / f"{name}_phenotype.yaml" if phenotype_http else None
+            ),
+            on_recorded=lambda staging, target: recorded.append((staging, target)),
+        )
+
+    yield bind
+
+    report = getattr(request.node, "rep_call", None)
+    passed = report is not None and report.passed
+    for staging, target in recorded:
+        if passed:
+            promote_recording(staging, target)
+        else:
+            discard_recording(staging)
+            print(f"Discarded recording for {target.name}: the test did not pass.")
+
+
+@pytest.fixture
+def android_usage_grpc_cassette(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[str], Any]]:
+    """Bind account-scoped read-only cassettes without creating a scratch notebook."""
+
+    from tests._helpers.android_grpc_harness import (
+        android_cassette_client,
+        discard_recording,
+        promote_recording,
+    )
+
+    recorded: list[tuple[Path, Path]] = []
+
+    def bind(name: str) -> Any:
+        path = ANDROID_CASSETTES_DIR / f"{name}_recorded.grpc.json"
+        return android_cassette_client(
+            path,
+            monkeypatch=monkeypatch,
+            scratch=None,
+            require_scratch=False,
+            on_recorded=lambda staging, target: recorded.append((staging, target)),
+        )
+
+    yield bind
+
+    report = getattr(request.node, "rep_call", None)
+    passed = report is not None and report.passed
+    for staging, target in recorded:
+        if passed:
+            promote_recording(staging, target)
+        else:
+            discard_recording(staging)
+            print(f"Discarded recording for {target.name}: the test did not pass.")
+
+
 # =============================================================================
 # VCR Cassette Availability Check
 # =============================================================================
 
-CASSETTES_DIR = Path(__file__).parent.parent / "cassettes"
+# Cassettes are split by client tier (see ``tests/cassettes/README.md``).
+# Both tier constants are spelled out rather than derived at each use site: an
+# untiered ``CASSETTES_DIR`` that silently meant "web" is exactly what let the
+# Android fixture below resolve under ``web/`` when the tiers were introduced.
+CASSETTES_ROOT = Path(__file__).parent.parent / "cassettes"
+WEB_CASSETTES_DIR = CASSETTES_ROOT / "web"
+ANDROID_CASSETTES_DIR = CASSETTES_ROOT / "android"
 
-# Real cassettes live at the top level of ``tests/cassettes/``; illustrative
-# fixtures (``example_*.yaml``) live in ``tests/cassettes/examples/`` per the
-# naming convention documented in ``tests/cassettes/README.md``.
+# Real Web cassettes live at the top level of ``tests/cassettes/web/``;
+# illustrative fixtures (``example_*.yaml``) live in
+# ``tests/cassettes/web/examples/`` per the naming convention documented in
+# ``tests/cassettes/README.md``.
 #
 # This filter decides whether the VCR integration tier has anything to replay:
 # - Globbing ``*.yaml`` (non-recursive) naturally skips the ``examples/``
@@ -43,8 +176,8 @@ CASSETTES_DIR = Path(__file__).parent.parent / "cassettes"
 #   filter — if a future contributor lands an ``example_*.yaml`` file at the
 #   top level by mistake, it still won't count as a real recording.
 _real_cassettes = (
-    [f for f in CASSETTES_DIR.glob("*.yaml") if not f.name.startswith("example_")]
-    if CASSETTES_DIR.exists()
+    [f for f in WEB_CASSETTES_DIR.glob("*.yaml") if not f.name.startswith("example_")]
+    if WEB_CASSETTES_DIR.exists()
     else []
 )
 
@@ -150,11 +283,14 @@ def _has_use_cassette_decorator(item) -> bool:
 def pytest_collection_modifyitems(config, items):
     """Enforce the integration tier-VCR rule.
 
-    Every collected test under ``tests/integration/`` MUST be VCR-tier: it must carry
-    ``@pytest.mark.vcr``, be decorated with ``@notebooklm_vcr.use_cassette``,
-    or explicitly opt out with ``@pytest.mark.allow_no_vcr`` (for mock-only
-    or no-network tests that legitimately live under ``tests/integration/``
-    — e.g. ``test_skill_packaging.py``, ``concurrency/test_*``). Violations
+    Every collected test under ``tests/integration/`` MUST use a recorded seam: it must carry
+    ``@pytest.mark.vcr`` for Web HTTP, ``@pytest.mark.grpc_cassette`` for the
+    test-only Android gRPC channel adapter, be decorated with
+    ``@notebooklm_vcr.use_cassette``, or explicitly opt out with
+    ``@pytest.mark.allow_no_vcr`` (for mock-only
+    or no-network tests that legitimately live under ``tests/integration/`` —
+    e.g. ``test_auto_refresh.py``, ``test_sources_integration.py``,
+    ``concurrency/test_*``). Violations
     raise ``pytest.UsageError`` so the test suite refuses to collect rather
     than silently letting a new mock test slip into the integration tier.
     """
@@ -165,6 +301,8 @@ def pytest_collection_modifyitems(config, items):
             continue
         if item.get_closest_marker("vcr") is not None:
             continue
+        if item.get_closest_marker("grpc_cassette") is not None:
+            continue
         if item.get_closest_marker("allow_no_vcr") is not None:
             continue
         if _has_use_cassette_decorator(item):
@@ -173,8 +311,9 @@ def pytest_collection_modifyitems(config, items):
     if violations:
         joined = "\n  ".join(violations)
         raise pytest.UsageError(
-            "tests/integration/ tests must be VCR-tier. Add "
-            "@pytest.mark.vcr, @notebooklm_vcr.use_cassette, or — for "
+            "tests/integration/ tests must use a recorded seam. Add "
+            "@pytest.mark.vcr, @pytest.mark.grpc_cassette, "
+            "@notebooklm_vcr.use_cassette, or — for "
             "mock-only tests — @pytest.mark.allow_no_vcr. Violations:\n  "
             f"{joined}"
         )
@@ -242,27 +381,42 @@ def _has_active_vcr_cassette() -> bool:
     on ``notebooklm_vcr`` is the primary protection — this guard is a
     secondary belt-and-braces check for unbound requests.
     """
+    # vcrpy installs ``functools.wraps``-style stubs (``__wrapped__`` points
+    # back to the original) on its HTTP interception points. The exact point
+    # moved across versions: vcrpy <=8.1 patched
+    # ``httpcore.AsyncConnectionPool.handle_async_request``; vcrpy >=8.2 patches
+    # ``httpx.AsyncHTTPTransport.handle_async_request`` (the transport layer)
+    # instead. Probe both so the guard survives either vcrpy generation.
+    candidates = []
+    try:
+        import httpx  # type: ignore[import-not-found]
+
+        candidates.append((httpx.AsyncHTTPTransport, "handle_async_request"))
+    except ImportError:
+        pass
     try:
         import httpcore  # type: ignore[import-not-found]
 
-        # When a vcrpy cassette is active, httpcore's AsyncConnectionPool gets
-        # its ``handle_async_request`` patched with a vcr-aware wrapper. The
-        # wrapper has a ``__wrapped__`` reference back to the original. If we
-        # see a wrapper, a cassette context is active somewhere.
-        handle = getattr(httpcore.AsyncConnectionPool, "handle_async_request", None)
-        if handle is None:
-            return True
-        # vcrpy uses ``functools.wraps`` or sets ``__wrapped__`` on its stubs.
-        return getattr(handle, "__wrapped__", None) is not None
-    except (ImportError, AttributeError):
-        # If httpcore is missing or vcr stubs aren't introspectable, fall
-        # open — we shouldn't break tests on environmental quirks.
+        candidates.append((httpcore.AsyncConnectionPool, "handle_async_request"))
+    except ImportError:
+        pass
+
+    if not candidates:
+        # Neither library importable — fall open rather than break tests on
+        # environmental quirks.
+        return True
+    try:
+        return any(
+            getattr(getattr(cls, attr, None), "__wrapped__", None) is not None
+            for cls, attr in candidates
+        )
+    except AttributeError:
         return True
 
 
 @pytest.fixture(autouse=True)
 def _block_unbound_network_in_replay(request, monkeypatch):
-    """Refuse unbound httpx network requests when in VCR replay mode (P1-4).
+    """Refuse unbound HTTP or gRPC network access in cassette replay mode.
 
     Companion to the ``pytest_collection_modifyitems`` enforcement hook
     above: that hook gates **collection** by requiring every
@@ -278,37 +432,70 @@ def _block_unbound_network_in_replay(request, monkeypatch):
     existing ``_disable_keepalive_poke_for_vcr`` autouse. It only takes
     effect when:
 
-    1. VCR record mode is OFF (replay mode), and
+    Android gRPC cassette tests are stricter: unless
+    ``NOTEBOOKLM_ANDROID_GRPC_RECORD`` explicitly enables recording, both
+    ``grpc.aio.secure_channel`` and ``grpc.aio.insecure_channel`` fail closed.
+    A replay test therefore cannot reach C-core networking merely because it
+    forgot to inject :class:`ReplayGrpcModule`.
+
+    The HTTP guard takes effect when:
+
+    1. Web VCR record mode is OFF (replay mode), and
     2. The test is NOT marked ``allow_no_vcr``, and
     3. The test IS marked ``vcr`` OR carries a
        ``@notebooklm_vcr.use_cassette`` decorator OR uses the ``vcr``
-       pytest fixture (any of the three known cassette-binding paths).
+       pytest fixture (any of the three known cassette-binding paths)
+       OR is marked ``grpc_cassette``, and
+    4. For ``grpc_cassette`` tests, Android record mode
+       (``NOTEBOOKLM_ANDROID_GRPC_RECORD=1``) is OFF — recording loads and
+       refreshes real auth over HTTP, which is never part of a cassette.
 
-    When all three conditions hold, we wrap ``httpx.AsyncClient.send`` so
+    When these conditions hold, we wrap ``httpx.AsyncClient.send`` so
     that any request reaching it without an active vcrpy cassette context
     raises ``RuntimeError`` with a clear message instead of leaking
     traffic to the real backend.
     """
-    if _vcr_record_mode:
-        return  # Recording: real network calls are intentional.
-
-    if request.node.get_closest_marker("allow_no_vcr") is not None:
-        return  # Mock-only test legitimately doesn't use VCR.
-
     is_vcr_marked = request.node.get_closest_marker("vcr") is not None
+    is_grpc_cassette = request.node.get_closest_marker("grpc_cassette") is not None
+
+    if is_grpc_cassette and not _is_android_grpc_record_mode():
+        import grpc
+
+        def _refuse_grpc_channel(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise RuntimeError(
+                "Android gRPC cassette replay mode: refusing an unbound grpc.aio channel. "
+                "Inject ReplayGrpcModule, or set NOTEBOOKLM_ANDROID_GRPC_RECORD=1 "
+                "only while explicitly recording a sanitized cassette."
+            )
+
+        monkeypatch.setattr(grpc.aio, "secure_channel", _refuse_grpc_channel)
+        monkeypatch.setattr(grpc.aio, "insecure_channel", _refuse_grpc_channel)
+
+    if request.node.get_closest_marker("allow_no_vcr") is not None and not is_grpc_cassette:
+        return  # Mock-only test legitimately doesn't use Web VCR.
+
+    if _vcr_record_mode:
+        return  # Web recording: real HTTP calls are intentional.
+
+    if is_grpc_cassette and _is_android_grpc_record_mode():
+        # Android recording: the live client loads and refreshes real auth over
+        # HTTP before any gRPC call, and that traffic is never part of a cassette.
+        return
+
     has_decorator = _has_use_cassette_decorator(request.node)
     # ``vcr`` pytest fixture (pytest-vcr) binds a cassette via fixture
     # resolution rather than a marker; detect by name in ``fixturenames``.
     uses_vcr_fixture = "vcr" in getattr(request.node, "fixturenames", ())
 
-    if not (is_vcr_marked or has_decorator or uses_vcr_fixture):
+    if not (is_vcr_marked or is_grpc_cassette or has_decorator or uses_vcr_fixture):
         # Not a VCR-tier test (and not allow_no_vcr — that's already
         # filtered above). The collection hook should have rejected this
         # at collect time, so reaching here is a defensive no-op.
         return
 
     # Patch BOTH ``send`` and ``stream`` — the production RPC transport in
-    # ``src/notebooklm/_streaming_post.py`` uses ``client.stream(...)`` for the
+    # ``src/notebooklm/_web/transport/streaming_post.py`` uses ``client.stream(...)`` for the
     # streaming-chat endpoint, which httpx routes through a separate codepath
     # from ``send``. Patching only ``send`` would let an unbound streaming
     # request slip past the guard. The vcrpy stubs intercept at the lower

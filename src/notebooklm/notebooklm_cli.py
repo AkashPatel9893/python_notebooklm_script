@@ -6,6 +6,7 @@ Command structure:
   notebooklm status                   # Show current context
   notebooklm list                     # List notebooks
   notebooklm create <title>           # Create notebook
+  notebooklm copy <title>             # Copy current notebook
   notebooklm ask <question>           # Ask the current notebook a question
 
   notebooklm source <command>         # Source operations
@@ -21,11 +22,12 @@ Architecture:
     - It imports command groups from the ``notebooklm.cli`` package and
       registers them on the top-level Click group ``notebooklm``.
     - The ``cli/`` package contains the actual command implementations
-      (one module per command group: ``session``, ``notebook``, ``source``,
-      ``artifact``, ``generate``, ``download``, ``chat``, ``note``,
-      ``doctor``, ``profile``, ``agent``).
-    - Editing CLI behavior: change ``cli/<group>.py``. Editing CLI surface
-      (adding a new top-level command): import + register here.
+      (``*_cmd.py`` modules for command groups and top-level command
+      registration; shared runtime helpers live in sibling modules such as
+      ``options.py``, ``runtime.py``, and ``auth_runtime.py``).
+    - Editing CLI behavior: change the relevant ``cli/*_cmd.py`` module or
+      shared helper. Editing CLI surface (adding a new top-level command):
+      import + register it here.
 
 LLM-friendly design:
   # Set context once, then use simple commands
@@ -90,16 +92,18 @@ _configure_windows_runtime()
 
 import click
 
-from . import __version__
+from ._version_info import version_string
 
 # Import command groups from cli package
 from .cli import (
     agent,
     artifact,
+    collection,
     download,
     generate,
     label,
     language,
+    mcp,
     note,
     profile,
     register_chat_commands,
@@ -111,6 +115,7 @@ from .cli import (
     share,
     skill,
     source,
+    usage,
 )
 from .cli.grouped import SectionedGroup
 
@@ -129,7 +134,7 @@ __all__ = ["cli", "main"]
 
 
 @click.group(cls=SectionedGroup)
-@click.version_option(version=__version__, prog_name="NotebookLM CLI")
+@click.version_option(version=version_string(), prog_name="NotebookLM CLI")
 @click.option(
     "--storage",
     type=click.Path(exists=False),
@@ -141,6 +146,12 @@ __all__ = ["cli", "main"]
     "--profile",
     default=None,
     help="Profile name (default: from config or 'default'). Use 'notebooklm profile list' to see profiles.",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(("web", "android"), case_sensitive=True),
+    default=None,
+    help="Preferred API backend (default: $NOTEBOOKLM_BACKEND, else web).",
 )
 @click.option(
     "-v",
@@ -158,7 +169,7 @@ __all__ = ["cli", "main"]
     ),
 )
 @click.pass_context
-def cli(ctx, storage, profile, verbose, quiet):
+def cli(ctx, storage, profile, backend, verbose, quiet):
     """NotebookLM CLI.
 
     \b
@@ -223,6 +234,7 @@ def cli(ctx, storage, profile, verbose, quiet):
     # namespace (see :class:`notebooklm.cli.services.auth_source.AuthSource`).
     ctx.obj["storage_path"] = Path(storage).expanduser().resolve() if storage else None
     ctx.obj["profile"] = profile
+    ctx.obj["backend"] = backend
     # Mirror the root quiet flag for call sites that already read ctx.obj.
     # ``cli.runtime.is_quiet(ctx)`` remains the canonical reader.
     ctx.obj["quiet"] = bool(quiet)
@@ -251,11 +263,14 @@ cli.add_command(generate)
 cli.add_command(download)
 cli.add_command(note)
 cli.add_command(label)
+cli.add_command(collection)
 cli.add_command(share)
 cli.add_command(skill)
 cli.add_command(research)
 cli.add_command(language)
 cli.add_command(profile)
+cli.add_command(mcp)
+cli.add_command(usage)
 
 
 # =============================================================================

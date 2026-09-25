@@ -7,15 +7,13 @@ This file validates the Wave-2 classifications added to
 * ``DELETE_SOURCE``   → ``IDEMPOTENT_SET_OP``
 * ``DELETE_ARTIFACT`` → ``IDEMPOTENT_SET_OP``
 * ``REFRESH_SOURCE``  → ``AT_LEAST_ONCE_ACCEPTED`` (extra fetch is acceptable)
-* ``SHARE_NOTEBOOK``  → ``PROBE_THEN_CREATE`` (suppresses blind retry; uses
-                       ``GET_SHARE_STATUS`` as the probe RPC if a future
-                       wrapper is added)
+* ``SHARE_NOTEBOOK``  → ``NON_IDEMPOTENT_NO_RETRY`` (suppresses blind retry;
+                       no reliable probe/retry wrapper exists, so transport
+                       loss is surfaced as unconfirmed)
 
-It also exercises the P1-2 fix to ``NotebooksAPI.create``: a
-``NetworkError`` during the probe ``list()`` MUST propagate, not be
-silently coerced to "no match", so the caller learns the prior create
-may have committed server-side and the retry loop won't duplicate the
-resource.
+It also exercises the P1 create containment contract: notebook and source
+creates make one mutation request, perform no pre-create probe, never re-POST,
+and preserve conservative commit evidence across the full executor path.
 
 Tests use ``httpx.MockTransport`` — no cassettes, no network. They are
 opted out of the VCR tier enforcement via
@@ -31,10 +29,12 @@ import httpx
 import pytest
 
 import notebooklm._runtime.helpers as _runtime_helpers
-from _fixtures.kernel_test_helpers import install_http_client_for_test
-from notebooklm import NetworkError, NotebookLMClient
-from notebooklm._idempotency import IDEMPOTENCY_REGISTRY, IdempotencyPolicy
+from notebooklm import NotebookLMClient, ServerError
+from notebooklm._web.policy import IDEMPOTENCY_REGISTRY, IdempotencyPolicy
+from notebooklm.options import ClientConfig, RetryOptions
+from notebooklm.outcomes import CommitState
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
 
 pytestmark = pytest.mark.allow_no_vcr
 
@@ -64,23 +64,22 @@ def _list_notebooks_response(notebooks: list[tuple[str, str]]) -> str:
     return _wrb_response(RPCMethod.LIST_NOTEBOOKS.value, [raw])
 
 
-def _make_client_with_transport(
+async def _make_client_with_transport(
     transport: httpx.AsyncBaseTransport,
     auth_tokens,
     *,
     server_error_max_retries: int = 3,
 ) -> NotebookLMClient:
-    """Construct a ``NotebookLMClient`` wired to the supplied mock transport.
-
-    Bypasses the full ``Session.open()`` path so the test doesn't try
-    to build a real ``httpx.AsyncClient`` with cookies + connection pool.
-    """
+    """Open a real lifecycle generation, then install the mock transport."""
     client = NotebookLMClient(
         auth_tokens,
-        server_error_max_retries=server_error_max_retries,
+        config=ClientConfig(retry=RetryOptions(server_error_max_retries=server_error_max_retries)),
     )
+    await client.__aenter__()
+    kernel = client._web_runtime.kernel
+    await kernel.get_http_client(expected_epoch=1).aclose()
     install_http_client_for_test(
-        client._collaborators.kernel,
+        kernel,
         httpx.AsyncClient(
             transport=transport,
             headers={
@@ -129,12 +128,11 @@ def test_refresh_source_classified_at_least_once_accepted() -> None:
     assert entry.policy is IdempotencyPolicy.AT_LEAST_ONCE_ACCEPTED
 
 
-def test_share_notebook_classified_probe_then_create() -> None:
-    """``SHARE_NOTEBOOK`` is PROBE_THEN_CREATE — ``GET_SHARE_STATUS`` exists
-    as the server-side probe RPC, so a blind retry is unsafe and the
-    transport retry loop MUST be suppressed."""
+def test_share_notebook_classified_non_idempotent_no_retry() -> None:
+    """``SHARE_NOTEBOOK`` has no reliable probe wrapper and cannot replay."""
     entry = IDEMPOTENCY_REGISTRY.get_entry(RPCMethod.SHARE_NOTEBOOK)
-    assert entry.policy is IdempotencyPolicy.PROBE_THEN_CREATE
+    assert entry.policy is IdempotencyPolicy.NON_IDEMPOTENT_NO_RETRY
+    assert "no reliable probe/retry wrapper" in entry.notes
 
 
 # ===========================================================================
@@ -174,7 +172,7 @@ async def test_delete_notebook_retries_remain_enabled(
     monkeypatch.setattr(_runtime_helpers.asyncio, "sleep", _no_sleep)
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
+    client = await _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
     try:
         from notebooklm import ServerError
 
@@ -190,7 +188,7 @@ async def test_delete_notebook_retries_remain_enabled(
         # ``resolve_sleep`` seam (2 retries → 2 backoff sleeps).
         assert sleep_calls >= 1, "patched asyncio.sleep was never invoked"
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
 
 async def test_delete_source_retries_remain_enabled(
@@ -217,7 +215,7 @@ async def test_delete_source_retries_remain_enabled(
     monkeypatch.setattr(_runtime_helpers.asyncio, "sleep", _no_sleep)
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
+    client = await _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
     try:
         from notebooklm import ServerError
 
@@ -227,7 +225,7 @@ async def test_delete_source_retries_remain_enabled(
         # Bite-check: patched sleep observed between retries.
         assert sleep_calls >= 1, "patched asyncio.sleep was never invoked"
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
 
 async def test_delete_artifact_retries_remain_enabled(
@@ -254,7 +252,7 @@ async def test_delete_artifact_retries_remain_enabled(
     monkeypatch.setattr(_runtime_helpers.asyncio, "sleep", _no_sleep)
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
+    client = await _make_client_with_transport(transport, auth_tokens, server_error_max_retries=2)
     try:
         from notebooklm import ServerError
 
@@ -264,7 +262,7 @@ async def test_delete_artifact_retries_remain_enabled(
         # Bite-check: patched sleep observed between retries.
         assert sleep_calls >= 1, "patched asyncio.sleep was never invoked"
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
 
 # ===========================================================================
@@ -282,9 +280,9 @@ async def test_refresh_source_emits_rate_limited_warn(
     ≤2 lines (mirrors the registry's per-(method, variant) throttle)."""
     # Clear the rate-limit ledger so a window tripped by a prior test
     # doesn't suppress the WARN we expect here.
-    import notebooklm._idempotency as idemp_mod
+    import notebooklm._web.policy as policy_mod
 
-    monkeypatch.setattr(idemp_mod, "_at_least_once_last_logged", {})
+    monkeypatch.setattr(policy_mod, "_at_least_once_last_logged", {})
 
     invocations = 5
     refresh_count = 0
@@ -299,14 +297,14 @@ async def test_refresh_source_emits_rate_limited_warn(
         return httpx.Response(404, text="unexpected")
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens)
+    client = await _make_client_with_transport(transport, auth_tokens)
     try:
         with caplog.at_level(logging.WARNING, logger="notebooklm._idempotency"):
             for _ in range(invocations):
                 ok = await client.sources.refresh("nb_x", "src_x")
                 assert ok is None  # v0.8.0 (#1290): returns None on success
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
     warn_records = [
         r
@@ -324,17 +322,17 @@ async def test_refresh_source_emits_rate_limited_warn(
 
 
 # ===========================================================================
-# SHARE_NOTEBOOK — PROBE_THEN_CREATE suppresses the blind transport retry
+# SHARE_NOTEBOOK — no reliable probe, no blind retry, unconfirmed on transport loss
 # ===========================================================================
 
 
 async def test_share_notebook_does_not_retry_on_5xx(
     auth_tokens,
 ) -> None:
-    """``SHARE_NOTEBOOK`` is PROBE_THEN_CREATE, which forces
+    """``SHARE_NOTEBOOK`` is NON_IDEMPOTENT_NO_RETRY, which forces
     ``disable_internal_retries=True`` inside the executor — a 5xx MUST
-    surface immediately so the caller (or a future probe-then-create
-    wrapper) decides whether the ACL mutation landed before re-issuing.
+    surface immediately as unconfirmed because no reliable probe wrapper
+    can decide whether the ACL mutation landed before re-issuing.
 
     Today a blind retry would risk re-sending invitation emails or
     double-flipping public/private access; this test pins the policy.
@@ -348,7 +346,7 @@ async def test_share_notebook_does_not_retry_on_5xx(
             return httpx.Response(502, text="bad gateway")
         return httpx.Response(404, text="unexpected")
 
-    # No sleep-seam patch is needed here: PROBE_THEN_CREATE forces
+    # No sleep-seam patch is needed here: NON_IDEMPOTENT_NO_RETRY forces
     # ``disable_internal_retries=True`` → exactly 1 POST with no retry
     # loop, so no backoff sleep ever fires. The assertion below
     # (``share_count == 1``) is what pins the suppressed-retry policy;
@@ -356,20 +354,22 @@ async def test_share_notebook_does_not_retry_on_5xx(
     # ``asyncio.sleep`` adding wall-time but still surfacing the bug).
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=5)
+    client = await _make_client_with_transport(transport, auth_tokens, server_error_max_retries=5)
     try:
         from notebooklm import ServerError
 
-        with pytest.raises(ServerError):
+        with pytest.raises(ServerError) as exc_info:
             await client.sharing.set_public("nb_x", True)
-        # PROBE_THEN_CREATE forces disable_internal_retries=True → exactly 1 POST.
-        # Even with server_error_max_retries=5, the registry suppresses retries.
+        # NON_IDEMPOTENT_NO_RETRY forces disable_internal_retries=True → exactly 1 POST.
+        # Even with server_error_max_retries=5, the registry suppresses retries and the
+        # public workflow preserves the unresolved commit outcome explicitly.
         assert share_count == 1, (
-            f"SHARE_NOTEBOOK with PROBE_THEN_CREATE expected 1 POST "
+            f"SHARE_NOTEBOOK with NON_IDEMPOTENT_NO_RETRY expected 1 POST "
             f"(no blind retry), got {share_count}"
         )
+        assert exc_info.value.unconfirmed is True
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
 
 # ===========================================================================
@@ -381,25 +381,7 @@ async def test_notebooks_create_probe_propagates_network_error(
     auth_tokens,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A ``NetworkError`` raised by the probe ``list()`` MUST propagate
-    out of ``NotebooksAPI.create``, not be silently coerced to "no match".
-
-    Before the fix the probe's ``except Exception:`` clause swallowed
-    everything and returned ``None``, which let ``idempotent_create``
-    re-issue the create on the next attempt — potentially duplicating
-    the notebook if the original create actually committed server-side.
-
-    Test setup:
-      * LIST_NOTEBOOKS returns an empty baseline on the FIRST call so
-        ``baseline_ids = set()`` (the create can proceed).
-      * CREATE_NOTEBOOK fails with 502 → the executor's retry loop is
-        disabled because CREATE_NOTEBOOK is registered PROBE_THEN_CREATE,
-        so the failure surfaces as a single ``ServerError`` (treated as
-        a transport failure by ``idempotent_create``).
-      * The probe call to LIST_NOTEBOOKS then fails with a *transport-
-        layer* connection error that translates to ``NetworkError``.
-      * ``NetworkError`` MUST propagate out instead of being swallowed.
-    """
+    """Notebook create on 5xx sends once and performs no baseline/readback probe."""
     list_call_count = 0
     create_call_count = 0
 
@@ -433,41 +415,23 @@ async def test_notebooks_create_probe_propagates_network_error(
     monkeypatch.setattr(_runtime_helpers.asyncio, "sleep", _no_sleep)
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens)
+    client = await _make_client_with_transport(transport, auth_tokens)
     try:
-        with pytest.raises(NetworkError):
+        with pytest.raises(ServerError) as caught:
             await client.notebooks.create("Some Title")
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
-    # Bite-check: the retry-safe LIST_NOTEBOOKS / CREATE_NOTEBOOK 5xx path
-    # exercises the backoff sleep, so the patched seam was invoked —
-    # proving the object-form patch reached production ``resolve_sleep``.
-    assert sleep_calls >= 1, "patched asyncio.sleep was never invoked"
-
-    # Sanity check: the probe was actually attempted and the create fired
-    # once before the probe failed. LIST_NOTEBOOKS is retry-safe so the
-    # inner transport retry loop fires for the probe — we don't pin a
-    # precise count, only that the probe path was entered (>1 list call).
-    assert list_call_count >= 2, (
-        f"expected ≥2 LIST_NOTEBOOKS calls (baseline + probe), got {list_call_count}"
-    )
-    assert create_call_count >= 1, (
-        f"expected ≥1 CREATE_NOTEBOOK call before probe NetworkError, got {create_call_count}"
-    )
+    assert getattr(caught.value, "unconfirmed", False) is True
+    assert sleep_calls == 0
+    assert list_call_count == 0
+    assert create_call_count == 1
 
 
-async def test_notebooks_create_probe_swallows_non_network_exception(
+async def test_notebooks_create_probe_propagates_non_network_exception(
     auth_tokens,
 ) -> None:
-    """A non-network exception (decoding error, unexpected RPC failure)
-    during the probe MUST still be swallowed → return ``None`` →
-    ``idempotent_create`` retries the create.
-
-    This pins the *contract* that the P1-2 fix surgically widened the
-    propagation only for ``NetworkError``: random other failures inside
-    the probe path stay best-effort, matching the original intent.
-    """
+    """A second scripted create response is never consumed after a 5xx."""
     list_call_count = 0
     create_call_count = 0
     nb_id_after_retry = "nb_after_retry"
@@ -492,8 +456,8 @@ async def test_notebooks_create_probe_swallows_non_network_exception(
             create_call_count += 1
             if create_call_count == 1:
                 return httpx.Response(502, text="bad gateway")
-            # Second create succeeds — ``idempotent_create`` got the
-            # swallowed-None probe back and retried per contract.
+            # A second create would succeed if one were issued. It must not be:
+            # this response is the duplicate the assertion below rules out.
             return httpx.Response(
                 200,
                 text=_wrb_response(
@@ -511,14 +475,126 @@ async def test_notebooks_create_probe_swallows_non_network_exception(
         return httpx.Response(404, text="unexpected")
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens)
+    client = await _make_client_with_transport(transport, auth_tokens)
     try:
-        notebook = await client.notebooks.create(title)
+        with pytest.raises(ServerError) as caught:
+            await client.notebooks.create(title)
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
-    assert notebook.id == nb_id_after_retry
-    assert create_call_count == 2, (
-        f"expected 2 CREATE_NOTEBOOK calls (initial + retry after non-network "
-        f"probe failure), got {create_call_count}"
+    # The load-bearing assertion: no transport or outer retry may consume the
+    # scripted second response.
+    assert create_call_count == 1, (
+        f"expected 1 CREATE_NOTEBOOK call (the probe could not confirm, so no "
+        f"retry was permitted), got {create_call_count}"
+    )
+    assert getattr(caught.value, "unconfirmed", False) is True
+    assert list_call_count == 0
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["notebook", "url", "youtube", "drive", "file"],
+)
+@pytest.mark.asyncio
+async def test_create_families_send_once_without_preflight_or_repost(
+    auth_tokens,
+    tmp_path,
+    operation: str,
+) -> None:
+    """All demoted create families stop after one 5xx mutation attempt."""
+    expected_method = {
+        "notebook": RPCMethod.CREATE_NOTEBOOK,
+        "url": RPCMethod.ADD_SOURCE,
+        "youtube": RPCMethod.ADD_SOURCE,
+        "drive": RPCMethod.ADD_SOURCE,
+        "file": RPCMethod.ADD_SOURCE_FILE,
+    }[operation]
+    mutation_calls = 0
+    readback_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal mutation_calls, readback_calls
+        rpc_id = _rpc_id_in_request(request)
+        if rpc_id == expected_method.value:
+            mutation_calls += 1
+            return httpx.Response(502, text="bad gateway")
+        if rpc_id == RPCMethod.GET_NOTEBOOK.value:
+            readback_calls += 1
+            return httpx.Response(
+                200,
+                text=_wrb_response(RPCMethod.GET_NOTEBOOK.value, [["Notebook", []]]),
+            )
+        return httpx.Response(404, text=f"unexpected rpc_id={rpc_id}")
+
+    upload = tmp_path / "one-send.txt"
+    upload.write_text("payload")
+    client = await _make_client_with_transport(
+        httpx.MockTransport(handler), auth_tokens, server_error_max_retries=5
+    )
+    try:
+        with pytest.raises(Exception) as caught:
+            if operation == "notebook":
+                await client.notebooks.create("One send")
+            elif operation == "url":
+                await client.sources.add_url("nb", "https://example.com/article")
+            elif operation == "youtube":
+                await client.sources.add_url("nb", "https://youtube.com/watch?v=dQw4w9WgXcQ")
+            elif operation == "drive":
+                await client.sources.add_drive("nb", "drive-id", "Drive")
+            else:
+                await client.sources.add_file("nb", upload)
+    finally:
+        await client.close()
+
+    assert mutation_calls == 1
+    # File registration performs one read-only candidate inspection after
+    # uncertainty; no family performs the retired pre-create probe.
+    assert readback_calls == (1 if operation == "file" else 0)
+    assert getattr(caught.value, "commit_state", None) is CommitState.UNKNOWN
+    assert getattr(caught.value, "unconfirmed", False) is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "expected_commit_state"),
+    [
+        pytest.param(None, 429, CommitState.UNKNOWN, id="http-429"),
+        pytest.param(None, 502, CommitState.UNKNOWN, id="http-5xx"),
+        pytest.param(None, 401, CommitState.UNKNOWN, id="http-auth"),
+        pytest.param(httpx.WriteError, None, CommitState.UNKNOWN, id="write"),
+        pytest.param(httpx.ConnectError, None, CommitState.NOT_SENT, id="connect"),
+        pytest.param(httpx.PoolTimeout, None, CommitState.NOT_SENT, id="pool"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutation_transport_evidence_never_reposts(
+    auth_tokens,
+    failure: type[httpx.RequestError] | None,
+    status: int | None,
+    expected_commit_state: CommitState,
+) -> None:
+    """Never replay writes; preserve ambiguity only once transport dispatch is possible."""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure is not None:
+            raise failure("synthetic transport failure", request=request)
+        assert status is not None
+        return httpx.Response(status, text="synthetic status")
+
+    client = await _make_client_with_transport(
+        httpx.MockTransport(handler), auth_tokens, server_error_max_retries=5
+    )
+    try:
+        with pytest.raises(Exception) as caught:
+            await client.notebooks.create("One send")
+    finally:
+        await client.close()
+
+    assert calls == 1
+    assert getattr(caught.value, "commit_state", None) is expected_commit_state
+    assert getattr(caught.value, "unconfirmed", False) is (
+        expected_commit_state is CommitState.UNKNOWN
     )

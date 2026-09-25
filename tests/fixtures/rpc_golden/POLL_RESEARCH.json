@@ -61,7 +61,7 @@
       ]
     ]
   },
-  "mapper": "notebooklm._research_task_parser:parse_research_task_models",
+  "mapper": "notebooklm._web.rows.research_task:parse_research_task_models",
   "mapper_expected": [
     {
       "task_id": "SCRUBBED_RESEARCH_001",
@@ -72,7 +72,8 @@
           "url": "https://scrubbed.example.com/research/page-1",
           "title": "Scrubbed Research Source Title",
           "result_type": 1,
-          "research_task_id": "SCRUBBED_RESEARCH_001"
+          "research_task_id": "SCRUBBED_RESEARCH_001",
+          "hint": "Scrubbed snippet."
         }
       ],
       "summary": "Scrubbed research summary.",

@@ -1,11 +1,9 @@
 """Tests for client-owned composition primitives.
 
-Covers the helpers introduced by Stage B1 PR 1 and made live by Stage B1
-PR 2 of the post-refactoring plan
-(``docs/post-refactoring-plan-2026-05-27.md``):
+Covers the client-owned composition helpers in :mod:`notebooklm._web.transport.init`:
 
-- :class:`notebooklm._runtime.init.ClientInternals` dataclass
-- :func:`notebooklm._runtime.init.compose_client_internals`
+- :class:`notebooklm._web.transport.init.ClientInternals` dataclass
+- :func:`notebooklm._web.transport.init.compose_client_internals`
 - ``ClientComposed.bind_*`` write-once setters
 - ``ClientComposed`` required-property guards
 
@@ -23,19 +21,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import typing
+from dataclasses import fields
 from typing import Any
 
 import pytest
 
-from _helpers.client_factory import build_client_shell_for_tests
-from notebooklm._client_composed import ClientComposed
-from notebooklm._client_seams import ClientSeams
-from notebooklm._runtime.init import (
+from notebooklm._client_contracts import (
+    AndroidAssembly,
+    AndroidAssemblyConfig,
+    BackendAssembly,
+    FeatureNamespaces,
+    WebAssembly,
+    WebAssemblyConfig,
+)
+from notebooklm._runtime.init import RuntimeCollaborators, SharedRuntime, SharedRuntimeConfig
+from notebooklm._web.transport.composed import ClientComposed
+from notebooklm._web.transport.config import WebSessionConfig
+from notebooklm._web.transport.init import (
     ClientInternals,
+    WebRuntime,
     compose_client_internals,
 )
+from notebooklm._web.transport.seams import ClientSeams
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
+from notebooklm.options import ClientConfig, RuntimeOptions
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 def _make_auth() -> AuthTokens:
@@ -52,9 +64,95 @@ def _make_auth() -> AuthTokens:
     )
 
 
+def test_shared_runtime_config_retains_resolved_runtime_options() -> None:
+    assert [field.name for field in fields(SharedRuntimeConfig)] == [
+        "max_concurrent_rpcs",
+        "operation_timeout",
+    ]
+
+
+def test_web_session_config_owns_every_web_transport_setting() -> None:
+    assert {field.name for field in fields(WebSessionConfig)} == {
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "connect_timeout",
+        "limits",
+        "refresh_retry_delay",
+        "rate_limit_max_retries",
+        "server_error_max_retries",
+        "keepalive_interval",
+        "keepalive_storage_path",
+        "decode_response",
+        "sleep",
+        "is_auth_error",
+        "async_client_factory",
+    }
+
+
 # ---------------------------------------------------------------------------
 # compose_client_internals — client-owned composition root
 # ---------------------------------------------------------------------------
+
+
+def test_runtime_bundles_follow_backend_ownership_boundary() -> None:
+    assert RuntimeCollaborators is SharedRuntime
+    assert tuple(field.name for field in fields(SharedRuntime)) == (
+        "metrics",
+        "call_supervisor",
+        "config",
+    )
+    assert tuple(field.name for field in fields(WebRuntime)) == (
+        "reqid",
+        "auth_coord",
+        "kernel",
+        "cookie_persistence",
+        "web_transport",
+        "session_auth",
+        "composed",
+        "executor",
+        "source_uploader",
+    )
+
+
+def test_backend_assembly_is_complete_frozen_discriminated_graph() -> None:
+    assert set(typing.get_args(BackendAssembly)) == {WebAssembly, AndroidAssembly}
+    assert tuple(field.name for field in fields(FeatureNamespaces)) == (
+        "notebooks",
+        "sources",
+        "artifacts",
+        "chat",
+        "research",
+        "notes",
+        "mind_maps",
+        "settings",
+        "sharing",
+        "labels",
+        "collections",
+    )
+    assert WebAssembly.__dataclass_params__.frozen
+    assert AndroidAssembly.__dataclass_params__.frozen
+
+
+def test_backend_config_carriers_keep_runtime_options_on_the_shared_owner() -> None:
+    expected = ("backend", "retry", "transfers", "features", "shared_config")
+
+    assert tuple(field.name for field in fields(WebAssemblyConfig)) == (*expected, "request_policy")
+    assert tuple(field.name for field in fields(AndroidAssemblyConfig)) == expected
+
+
+@pytest.mark.parametrize("backend", ["web", "android"])
+@pytest.mark.parametrize("value", [-1.0, float("inf"), float("nan")])
+def test_backend_dependencies_reject_invalid_refresh_retry_delay(
+    backend: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="refresh_retry_delay must be finite and >= 0"):
+        build_client_shell_for_tests(
+            auth=_make_auth(),
+            backend=backend,  # type: ignore[arg-type]
+            refresh_retry_delay=value,
+        )
 
 
 def test_compose_client_internals_returns_client_internals() -> None:
@@ -63,12 +161,11 @@ def test_compose_client_internals_returns_client_internals() -> None:
     internals = compose_client_internals(auth=_make_auth(), composed=holder)
 
     assert isinstance(internals, ClientInternals)
-    assert holder.executor is internals.executor
-    assert holder.runtime_collaborators is internals.collaborators
-    assert holder.transport is internals.executor._transport
+    assert holder.executor is internals.web_runtime.executor
+    assert holder.transport is internals.web_runtime.executor._transport
     assert holder.chain_host._transport is holder.transport
     assert holder.chain_builder is not None
-    assert len(holder.middlewares) == 7
+    assert len(holder.middlewares) == 4
 
 
 def test_shell_helpers_carry_client_holders() -> None:
@@ -76,24 +173,29 @@ def test_shell_helpers_carry_client_holders() -> None:
     client = build_client_shell_for_tests(auth=_make_auth(), max_concurrent_rpcs=3)
 
     assert isinstance(client._seams, ClientSeams)
-    assert isinstance(client._composed, ClientComposed)
-    assert client._composed.max_concurrent_rpcs == 3
-    assert client._composed.runtime_collaborators is client._collaborators
-    assert client._composed.executor is client._rpc_executor
+    assert isinstance(client._web_runtime.composed, ClientComposed)
+    assert client._collaborators.call_supervisor._max_concurrent_rpcs == 3
+    assert client._web_runtime.composed.executor is client._web_runtime.executor
 
 
 def test_notebooklm_client_initializes_client_holders() -> None:
     """Production clients own the same holder shape returned by composition."""
-    client = NotebookLMClient(_make_auth(), max_concurrent_rpcs=2)
+    client = NotebookLMClient(
+        _make_auth(),
+        config=ClientConfig(runtime=RuntimeOptions(max_concurrent_rpcs=2)),
+    )
 
     assert isinstance(client._seams, ClientSeams)
-    assert isinstance(client._composed, ClientComposed)
-    assert client._composed.runtime_collaborators is client._collaborators
-    assert client._composed.max_concurrent_rpcs == 2
-    assert client._composed.executor is client._rpc_executor
-    assert client._composed.transport is client._rpc_executor._transport
+    assert isinstance(client._web_runtime.composed, ClientComposed)
+    assert client._collaborators.call_supervisor._max_concurrent_rpcs == 2
+    assert client._web_runtime.composed.executor is client._web_runtime.executor
+    assert client._web_runtime.composed.transport is client._web_runtime.executor._transport
+    assert not {"_composed", "_rpc_executor", "_source_uploader"} & vars(client).keys()
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Non-default legacy NotebookLMClient.*tuning arguments are deprecated:DeprecationWarning"
+)
 def test_invalid_max_concurrent_rpcs_rejected_before_zero_cap_semaphore() -> None:
     """Production and test construction reject invalid caps before composition use."""
     auth = _make_auth()
@@ -105,22 +207,49 @@ def test_invalid_max_concurrent_rpcs_rejected_before_zero_cap_semaphore() -> Non
         build_client_shell_for_tests(auth, max_concurrent_rpcs=0)
 
 
-def test_prebuilt_client_composed_cap_must_match_constructor_cap() -> None:
-    """A supplied holder cannot silently diverge from validated constructor args."""
-    holder = ClientComposed(max_concurrent_rpcs=5)
+@pytest.mark.filterwarnings(
+    "ignore:Non-default legacy NotebookLMClient.*tuning arguments are deprecated:DeprecationWarning"
+)
+@pytest.mark.parametrize(
+    "other_invalid",
+    [
+        {"rate_limit_max_retries": -1},
+        {"max_concurrent_uploads": 0},
+    ],
+)
+def test_max_concurrent_rpcs_keeps_phase_a_validation_precedence(
+    other_invalid: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError) as raised:
+        NotebookLMClient(
+            _make_auth(),
+            max_concurrent_rpcs=0,
+            **other_invalid,  # type: ignore[arg-type]
+        )
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"composed\.max_concurrent_rpcs must match max_concurrent_rpcs "
-            r"\(got composed\.max_concurrent_rpcs=5, max_concurrent_rpcs=10\)"
-        ),
-    ):
+    assert str(raised.value) == "max_concurrent_rpcs must be >= 1, got 0"
+
+
+def test_direct_web_composition_keeps_owned_validation_precedence() -> None:
+    with pytest.raises(ValueError) as raised:
         compose_client_internals(
             auth=_make_auth(),
-            max_concurrent_rpcs=10,
-            composed=holder,
+            rate_limit_max_retries=-1,
+            max_concurrent_rpcs=0,
         )
+
+    assert str(raised.value) == "rate_limit_max_retries must be >= 0, got -1"
+
+
+def test_prebuilt_client_composed_has_no_runtime_policy_configuration() -> None:
+    """A supplied composition holder does not own the RPC cap."""
+    holder = ClientComposed()
+    internals = compose_client_internals(
+        auth=_make_auth(),
+        max_concurrent_rpcs=10,
+        composed=holder,
+    )
+    assert internals.collaborators.call_supervisor._max_concurrent_rpcs == 10
 
 
 def test_compose_client_internals_refuses_synthetic_error_first(
@@ -172,7 +301,9 @@ def test_compose_client_internals_preserves_late_binding_for_decode_response() -
 
     # The executor closure should dispatch through the live attribute,
     # not the value frozen at construction time.
-    result = internals.executor._decode_response("payload", "method-id", allow_null=False)
+    result = internals.web_runtime.executor._decode_response(
+        "payload", "method-id", allow_null=False
+    )
     assert result == "rebound-result"
     assert sentinel and sentinel[-1][0] == "decoded"
 
@@ -196,8 +327,8 @@ def test_compose_client_internals_preserves_late_binding_for_is_auth_error() -> 
 
     seams.is_auth_error = rebound
 
-    assert internals.executor._is_auth_error(KeyError("auth")) is True
-    assert internals.executor._is_auth_error(RuntimeError("nope")) is False
+    assert internals.web_runtime.executor._is_auth_error(KeyError("auth")) is True
+    assert internals.web_runtime.executor._is_auth_error(RuntimeError("nope")) is False
 
 
 def test_compose_client_internals_preserves_late_binding_for_sleep() -> None:
@@ -219,7 +350,7 @@ def test_compose_client_internals_preserves_late_binding_for_sleep() -> None:
 
     seams.sleep = rebound
 
-    asyncio.run(internals.executor._sleep(0.25))
+    asyncio.run(internals.web_runtime.executor._sleep(0.25))
     assert calls == [0.25]
 
 
@@ -229,7 +360,7 @@ def test_compose_client_internals_preserves_late_binding_for_refresh_retry_delay
     call.
 
     The integration-test contract is that
-    ``client._composed.chain_host._refresh_retry_delay = 0`` continues
+    ``client._web_runtime.composed.chain_host._refresh_retry_delay = 0`` continues
     to steer the live chain after construction. The lambda
     ``refresh_retry_delay_provider=lambda: chain_host._refresh_retry_delay``
     re-reads the attribute on every invocation, so this is a live binding,
@@ -242,28 +373,17 @@ def test_compose_client_internals_preserves_late_binding_for_refresh_retry_delay
     # The provider lambda must dereference the *current* attribute on
     # each call — not the value captured at construction time.
     initial = chain_host._refresh_retry_delay
-    assert internals.executor._refresh_retry_delay_provider() == initial
+    assert internals.web_runtime.executor._refresh_retry_delay_provider() == initial
 
     chain_host._refresh_retry_delay = 0.99
-    assert internals.executor._refresh_retry_delay_provider() == 0.99
+    assert internals.web_runtime.executor._refresh_retry_delay_provider() == 0.99
 
 
-def test_compose_client_internals_executor_timeout_provider_reads_lifecycle() -> None:
-    """The executor's ``timeout_provider`` reads from the live
-    ``ClientLifecycle._timeout`` collaborator attribute.
+def test_compose_client_internals_executor_timeout_provider_reads_config() -> None:
+    """The executor captures validated timeout without depending on root lifecycle."""
+    internals = compose_client_internals(auth=_make_auth(), timeout=99.0)
 
-    Pins the documented closure shape
-    ``timeout_provider=lambda: collaborators.lifecycle._timeout`` (plan
-    line 253). A lifecycle-side mutation must surface on the next executor
-    call without re-binding.
-    """
-    internals = compose_client_internals(auth=_make_auth())
-
-    initial = internals.collaborators.lifecycle._timeout
-    assert internals.executor._timeout_provider() == initial
-
-    internals.collaborators.lifecycle._timeout = 99.0
-    assert internals.executor._timeout_provider() == 99.0
+    assert internals.web_runtime.executor._timeout_provider() == 99.0
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +413,7 @@ def test_client_composed_chain_metadata_binder_raises_on_double_bind() -> None:
 
     # Build a sentinel ``WiredMiddleware`` carrying the existing values so
     # the rejection comes from the write-once guard, not a missing field.
-    from notebooklm._runtime.init import WiredMiddleware
+    from notebooklm._web.transport.init import WiredMiddleware
 
     wired = WiredMiddleware(
         chain_builder=holder.chain_builder,
@@ -312,14 +432,6 @@ def test_client_composed_chain_host_binder_raises_on_double_bind() -> None:
         holder.bind_chain_host(holder.chain_host)
 
 
-def test_client_composed_runtime_collaborators_binder_raises_on_double_bind() -> None:
-    holder = ClientComposed()
-    internals = compose_client_internals(auth=_make_auth(), composed=holder)
-
-    with pytest.raises(RuntimeError, match="_runtime_collaborators already bound"):
-        holder.bind_runtime_collaborators(internals.collaborators)
-
-
 # ---------------------------------------------------------------------------
 # ClientComposed required-property guards
 # ---------------------------------------------------------------------------
@@ -333,7 +445,6 @@ def test_client_composed_runtime_collaborators_binder_raises_on_double_bind() ->
         ("chain_host", "_chain_host"),
         ("chain_builder", "_chain_builder"),
         ("middlewares", "_middlewares"),
-        ("runtime_collaborators", "_runtime_collaborators"),
     ],
 )
 def test_client_composed_properties_raise_before_binding(attr_name: str, message: str) -> None:
@@ -346,201 +457,16 @@ def test_client_composed_properties_raise_before_binding(attr_name: str, message
         getattr(holder, attr_name)
 
 
-# ---------------------------------------------------------------------------
-# ClientComposed RPC-semaphore loop-affinity guard / reset (issue #1169)
-# ---------------------------------------------------------------------------
-
-
-def test_get_rpc_semaphore_returns_nullcontext_when_cap_is_none() -> None:
-    """``max_concurrent_rpcs=None`` short-circuits to a no-op context.
-
-    The affinity guard MUST NOT run on the unbounded opt-out path — there is
-    no loop-bound primitive to protect, so even an unset binding is fine.
-    """
-    from contextlib import nullcontext
-
-    holder = ClientComposed(max_concurrent_rpcs=None)
-    # No ``set_bound_loop`` call — the None-cap path never touches the guard.
-    ctx = holder.get_rpc_semaphore()
-    assert isinstance(ctx, type(nullcontext()))
-
-
-def test_get_rpc_semaphore_no_binding_is_silent_noop() -> None:
-    """An unbound holder builds the semaphore without raising.
-
-    Mirrors the sibling primitives: ``assert_bound_loop(None)`` is a silent
-    no-op so standalone holders (composition / unit fixtures) that never ran
-    ``open()`` keep working.
-    """
-
-    async def _exercise() -> None:
-        holder = ClientComposed(max_concurrent_rpcs=2)
-        # ``_bound_loop`` is None — the guard is a no-op and the semaphore is
-        # built lazily on this running loop.
-        async with holder.get_rpc_semaphore():
-            pass
-        assert holder._rpc_semaphore is not None
-
-    asyncio.run(_exercise())
-
-
-def test_get_rpc_semaphore_same_loop_use_unaffected() -> None:
-    """A holder bound to the running loop acquires its semaphore normally."""
-
-    async def _exercise() -> None:
-        holder = ClientComposed(max_concurrent_rpcs=2)
-        holder.set_bound_loop(asyncio.get_running_loop())
-        async with holder.get_rpc_semaphore():
-            pass
-        # Same instance is reused across calls on the same loop.
-        first = holder._rpc_semaphore
-        async with holder.get_rpc_semaphore():
-            pass
-        assert holder._rpc_semaphore is first
-
-    asyncio.run(_exercise())
-
-
-def test_get_rpc_semaphore_cross_loop_raises_actionable_runtime_error() -> None:
-    """A holder bound to loop A raises if its semaphore is acquired on loop B.
-
-    Two independent ``asyncio.run`` calls give two genuinely distinct loops.
-    The guard must fire with the shared loop-affinity diagnostic before the
-    stale ``asyncio.Semaphore`` (bound to the dead loop A) is reused.
-    """
-    holder = ClientComposed(max_concurrent_rpcs=2)
-
-    async def _bind_under_loop_a() -> None:
-        holder.set_bound_loop(asyncio.get_running_loop())
-        # Construct the semaphore on loop A so loop B would reuse a stale one.
-        async with holder.get_rpc_semaphore():
-            pass
-
-    asyncio.run(_bind_under_loop_a())
-    assert holder._rpc_semaphore is not None
-
-    async def _acquire_under_loop_b() -> None:
-        with pytest.raises(RuntimeError, match="bound to a different event loop"):
-            async with holder.get_rpc_semaphore():
-                pass
-        # The actionable second sentence tells users how to fix it.
-        try:
-            async with holder.get_rpc_semaphore():
-                pass
-        except RuntimeError as exc:
-            assert "create a new client in the target loop" in str(exc)
-        else:  # pragma: no cover - defensive
-            raise AssertionError("expected RuntimeError on cross-loop reuse")
-
-    asyncio.run(_acquire_under_loop_b())
-
-
-def test_reset_after_open_discards_lazy_semaphore() -> None:
-    """``reset_after_open`` drops the cached semaphore so the next call rebuilds.
-
-    This is what lets a client closed on loop A and reopened on loop B build a
-    fresh semaphore bound to loop B rather than reusing the stale one. The cap
-    itself is left untouched.
-    """
-
-    async def _exercise() -> None:
-        holder = ClientComposed(max_concurrent_rpcs=3)
-        holder.set_bound_loop(asyncio.get_running_loop())
-        async with holder.get_rpc_semaphore():
-            pass
-        first = holder._rpc_semaphore
-        assert first is not None
-
-        holder.reset_after_open()
-        assert holder._rpc_semaphore is None
-        assert holder.max_concurrent_rpcs == 3
-
-        async with holder.get_rpc_semaphore():
-            pass
-        assert holder._rpc_semaphore is not None
-        assert holder._rpc_semaphore is not first
-
-    asyncio.run(_exercise())
-
-
-def test_set_bound_loop_none_clears_binding_and_discards_semaphore() -> None:
-    """``set_bound_loop(None)`` re-arms the no-op path and drops the stale semaphore."""
-
-    async def _exercise() -> None:
-        holder = ClientComposed(max_concurrent_rpcs=2)
-        holder.set_bound_loop(asyncio.get_running_loop())
-        async with holder.get_rpc_semaphore():
-            pass
-        assert holder._rpc_semaphore is not None
-        # Clearing the binding is a loop change (loop -> None), so the cached
-        # semaphore bound to the old loop is discarded for self-consistency.
-        holder.set_bound_loop(None)
-        assert holder._bound_loop is None
-        assert holder._rpc_semaphore is None
-        # With the binding cleared the guard is a no-op again.
-        async with holder.get_rpc_semaphore():
-            pass
-
-    asyncio.run(_exercise())
-
-
-def test_set_bound_loop_same_loop_keeps_cached_semaphore() -> None:
-    """Re-binding to the *same* loop must NOT discard the live semaphore.
-
-    Idempotent ``set_bound_loop`` calls with the unchanged loop are a no-op on
-    the cache — only a genuine loop change invalidates it.
-    """
-
-    async def _exercise() -> None:
-        holder = ClientComposed(max_concurrent_rpcs=2)
-        loop = asyncio.get_running_loop()
-        holder.set_bound_loop(loop)
-        async with holder.get_rpc_semaphore():
-            pass
-        first = holder._rpc_semaphore
-        assert first is not None
-        # Same loop again — the cached semaphore survives.
-        holder.set_bound_loop(loop)
-        assert holder._rpc_semaphore is first
-
-    asyncio.run(_exercise())
-
-
-def test_set_bound_loop_different_loop_discards_stale_semaphore() -> None:
-    """A loop change via ``set_bound_loop`` alone discards the stale semaphore.
-
-    This pins the gemini-flagged self-consistency contract: even without a
-    matching ``reset_after_open`` call, rebinding to a different loop must
-    invalidate the semaphore bound to the previous loop so it is never reused.
-    """
-    holder = ClientComposed(max_concurrent_rpcs=2)
-
-    async def _bind_and_build_under_loop_a() -> None:
-        holder.set_bound_loop(asyncio.get_running_loop())
-        async with holder.get_rpc_semaphore():
-            pass
-
-    asyncio.run(_bind_and_build_under_loop_a())
-    assert holder._rpc_semaphore is not None
-
-    async def _rebind_under_loop_b() -> None:
-        # set_bound_loop to a genuinely different loop must drop the stale
-        # semaphore so the next get_rpc_semaphore() rebuilds on loop B.
-        holder.set_bound_loop(asyncio.get_running_loop())
-        assert holder._rpc_semaphore is None
-        async with holder.get_rpc_semaphore():
-            pass
-        assert holder._rpc_semaphore is not None
-
-    asyncio.run(_rebind_under_loop_b())
-
-
 def test_client_shell_reads_composition_from_client_composed() -> None:
     client = build_client_shell_for_tests(_make_auth())
 
-    assert client._rpc_executor is client._composed.executor
-    assert client._rpc_executor._transport is client._composed.transport
-    assert client._composed.chain_host._transport is client._composed.transport
-    assert client._composed.chain_builder._drain_tracker is client._collaborators.drain_tracker
-    assert client._composed.middlewares[0]._drain_tracker is client._collaborators.drain_tracker
-    assert client._composed.middlewares[1]._metrics is client._collaborators.metrics
+    assert client._web_runtime.executor is client._web_runtime.composed.executor
+    assert client._web_runtime.executor._transport is client._web_runtime.composed.transport
+    assert (
+        client._web_runtime.composed.chain_host._transport is client._web_runtime.composed.transport
+    )
+    assert not hasattr(client._collaborators, "drain_tracker")
+    assert not hasattr(client._collaborators.call_supervisor, "drain_tracker")
+    assert not hasattr(client._collaborators.call_supervisor, "max_concurrent_rpcs")
+    assert not hasattr(client._collaborators.call_supervisor, "drain")
+    assert client._web_runtime.composed.middlewares[0]._metrics is client._collaborators.metrics

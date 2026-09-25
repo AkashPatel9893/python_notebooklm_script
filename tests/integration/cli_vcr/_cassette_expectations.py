@@ -11,7 +11,7 @@ duplicate, or a miscount.
 
 To be a real oracle, that comparison must come from an **independent** reading of
 the cassette. If this helper imported the production decoder
-(``notebooklm.rpc.decoder`` / ``notebooklm._row_adapters`` / ``notebooklm._types``)
+(``notebooklm._web.wire.decoder`` / ``notebooklm._web.rows`` / ``notebooklm._types``)
 the assertion would be a tautology: "the CLI's decode equals the decoder's
 decode" proves nothing. So this module is built on **stdlib + ``yaml`` only** and
 re-implements just enough of the batchexecute envelope walk (copied as our own
@@ -40,7 +40,7 @@ import yaml
 
 # Cassettes live at ``tests/cassettes`` — three parents up from this file
 # (``tests/integration/cli_vcr/_cassette_expectations.py``).
-_CASSETTE_DIR = Path(__file__).resolve().parents[2] / "cassettes"
+_CASSETTE_DIR = Path(__file__).resolve().parents[2] / "cassettes" / "web"
 
 # Google's anti-XSSI guard prefixes every batchexecute response body. Copied
 # (not imported) from ``tests/_guardrails/test_cassette_shapes.py``.

@@ -64,15 +64,15 @@ from urllib.parse import parse_qs
 
 import pytest
 import yaml
-from tests.integration.conftest import _vcr_record_mode, get_vcr_auth, skip_no_cassettes
-from tests.vcr_config import notebooklm_vcr
 
 from notebooklm import NotebookLMClient
+from tests.integration.conftest import _vcr_record_mode, get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
 
 CASSETTE_NAME = "chat_ask_multi_source.yaml"
-CASSETTE_PATH = Path(__file__).parent.parent / "cassettes" / CASSETTE_NAME
+CASSETTE_PATH = Path(__file__).parent.parent / "cassettes" / "web" / CASSETTE_NAME
 
 # Number of sources recorded into the cassette. Five is the smallest value
 # that comfortably exceeds the "two or three sources" gut-check most chat
@@ -286,7 +286,7 @@ class TestChatMultiSource:
 
     @pytest.mark.vcr
     @pytest.mark.asyncio
-    async def test_ask_with_five_explicit_sources(self) -> None:
+    async def test_ask_with_five_explicit_sources(self, legacy_vcr_follow_up_probe) -> None:
         """A chat ask against five explicit sources round-trips successfully.
 
         Recording-mode behavior: create scratch notebook + five sources

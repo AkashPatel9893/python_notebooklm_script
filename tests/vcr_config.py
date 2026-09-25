@@ -18,7 +18,7 @@ Usage:
 Recording new cassettes:
     1. Set NOTEBOOKLM_VCR_RECORD=1 (or =true, =yes)
     2. Run the test with valid authentication
-    3. Cassette is saved to tests/cassettes/
+    3. Cassette is saved to tests/cassettes/web/
     4. Verify sensitive data is scrubbed before committing
 
 CI Strategy:
@@ -96,9 +96,9 @@ synthetic_error_cassette_name = _cassette_patterns.synthetic_error_cassette_name
 SYNTHETIC_ERROR_CASSETTE_PREFIX = _cassette_patterns.SYNTHETIC_ERROR_CASSETTE_PREFIX
 VALID_ERROR_MODES = _cassette_patterns.VALID_ERROR_MODES
 
-# env var name shared with :mod:`notebooklm._error_injection`. Kept in
+# env var name shared with :mod:`notebooklm._web.transport.error_injection`. Kept in
 # sync as a local copy so the VCR-only replay path (which does not import
-# :mod:`notebooklm._error_injection`) can still parse the env var without
+# :mod:`notebooklm._web.transport.error_injection`) can still parse the env var without
 # dragging the production module in. Unit tests in
 # ``tests/unit/test_vcr_config.py`` import ``ERROR_INJECT_ENV_VAR`` directly
 # from the canonical home — this duplication covers ONLY the VCR-replay
@@ -129,7 +129,7 @@ def get_error_injection_mode() -> str | None:
     typo path explicitly. The value comparison is case-insensitive.
 
     This helper mirrors ``_get_error_injection_mode`` in
-    :mod:`notebooklm._error_injection`; both sides validate against the
+    :mod:`notebooklm._web.transport.error_injection`; both sides validate against the
     same canonical set in :mod:`tests.cassette_patterns` so they cannot
     drift.
     """
@@ -186,7 +186,7 @@ def _substitute_synthetic_error(response: dict[str, Any]) -> dict[str, Any]:
     synthetic-error shape from :mod:`tests.cassette_patterns`.
 
     The error-injection middleware in
-    :mod:`notebooklm._middleware.error_injection` already substitutes
+    :mod:`notebooklm._web.transport.middleware.error_injection` already substitutes
     the live response BEFORE it reaches VCR, so in normal recording this hook
     sees the synthetic shape already. This pass exists so that:
 
@@ -217,6 +217,22 @@ def _substitute_synthetic_error(response: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def _ci_header_keys(headers: dict[str, Any], name: str) -> list[str]:
+    """Return ALL keys in ``headers`` matching ``name`` case-insensitively.
+
+    Google serves HTTP/2, whose header names are lowercase (``set-cookie``),
+    while older cassettes were recorded with title-case (``Set-Cookie``). A
+    case-sensitive ``name in headers`` check misses the lowercase form and
+    silently leaves live ``Set-Cookie`` session tokens unscrubbed — the
+    ``test_cassette_shapes`` guard would catch the leak, but the scrubber must
+    prevent it, not merely rely on detection. Returns *every* matching key (not
+    just the first) so a dict carrying both ``Set-Cookie`` and ``set-cookie``
+    gets every token-bearing entry scrubbed, not one.
+    """
+    lowered = name.lower()
+    return [key for key in headers if key.lower() == lowered]
+
+
 def scrub_response(response: dict[str, Any]) -> dict[str, Any]:
     """Scrub sensitive data from recorded HTTP response.
 
@@ -239,7 +255,7 @@ def scrub_response(response: dict[str, Any]) -> dict[str, Any]:
     :func:`_substitute_synthetic_error` runs FIRST so that downstream scrub
     steps see the canonical synthetic shape rather than whatever the wire
     produced (the error-injection middleware in
-    :mod:`notebooklm._middleware.error_injection` normally already
+    :mod:`notebooklm._web.transport.middleware.error_injection` normally already
     substituted, but this pass closes the loop for VCR-only test paths).
     """
     # synthetic-error substitution (no-op when env var unset).
@@ -270,12 +286,32 @@ def scrub_response(response: dict[str, Any]) -> dict[str, Any]:
     # cookie pair's value while preserving the cookie attributes (Path / Domain
     # / Expires / Secure / HttpOnly / ...). Both passes are idempotent.
     headers = response.get("headers", {})
-    if "Set-Cookie" in headers:
-        cookies = headers["Set-Cookie"]
+    for cookie_key in _ci_header_keys(headers, "Set-Cookie"):
+        cookies = headers[cookie_key]
         if isinstance(cookies, list):
-            headers["Set-Cookie"] = [scrub_set_cookie(scrub_string(c)) for c in cookies]
+            headers[cookie_key] = [scrub_set_cookie(scrub_string(c)) for c in cookies]
         elif isinstance(cookies, str):
-            headers["Set-Cookie"] = scrub_set_cookie(scrub_string(cookies))
+            headers[cookie_key] = scrub_set_cookie(scrub_string(cookies))
+
+    # Scrub resumable-upload session tokens echoed in response headers. The
+    # ``X-Goog-Upload-(Control-)URL`` values embed ``upload_id=<token>`` (handled
+    # by ``scrub_string``'s upload_id pattern); ``X-GUploader-UploadID`` carries a
+    # bare token with no anchor, so its value is replaced wholesale. Without this
+    # a fresh recording leaks per-upload tokens past ``scrub_response`` (the guard
+    # catches them, but the scrubber should prevent them — not just detect).
+    for _name in ("X-Goog-Upload-URL", "X-Goog-Upload-Control-URL"):
+        for _key in _ci_header_keys(headers, _name):
+            _vals = headers[_key]
+            headers[_key] = (
+                [scrub_string(v) for v in _vals] if isinstance(_vals, list) else scrub_string(_vals)
+            )
+    for _uploader_key in _ci_header_keys(headers, "X-GUploader-UploadID"):
+        _vals = headers[_uploader_key]
+        headers[_uploader_key] = (
+            ["SCRUBBED_UPLOAD_ID" for _ in _vals]
+            if isinstance(_vals, list)
+            else "SCRUBBED_UPLOAD_ID"
+        )
 
     return response
 
@@ -336,14 +372,76 @@ _FREQ_VOLATILE_KEYS: frozenset[str] = frozenset(
 # this placeholder in a cassette flags only the normalization, not real data.
 _UUID_PLACEHOLDER = "00000000-0000-0000-0000-_NORMALIZED"
 
-# Canonical UUID v4 string regex. Matches the 8-4-4-4-12 hex layout used by
-# every UUID NotebookLM emits (notebook IDs, source IDs, artifact IDs, project
-# IDs, conversation IDs all share this shape). Anchored to word boundaries so a
-# UUID embedded in a larger string still normalizes but a hex string of similar
-# length (e.g. a session token) does not accidentally match.
+# Canonical UUID string regex. Matches the 8-4-4-4-12 hex layout used by every
+# UUID NotebookLM emits (notebook IDs, source IDs, artifact IDs, project IDs,
+# conversation IDs all share this shape). Deliberately do not use word
+# boundaries: form and URL encoding puts hexadecimal characters immediately
+# beside an identifier (for example ``%22<uuid>%5C``), so ``\b`` misses the
+# request-side copy while still scrubbing the decoded response. The four
+# hyphens make this specific enough to find safely inside a larger string.
 _UUID_RE = re.compile(
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+
+
+class ResourceIdCassetteScrubber:
+    """Deterministically redact account-linkable UUID resource identifiers.
+
+    Most historical Web cassettes preserve UUIDs because functional replay
+    often returns one identifier and feeds it into a later request. Sensitive
+    mutation recordings may opt into this stronger stateful scrubber: distinct
+    UUIDs receive distinct reserved v4-shaped placeholders in first-seen order,
+    and later occurrences retain the same replacement. The placeholders remain
+    valid inputs to public UUID validators and the existing VCR matcher already
+    treats UUID leaves as volatile.
+    """
+
+    _PLACEHOLDER_PREFIX = "00000000-0000-4000-8000-"
+
+    def __init__(self) -> None:
+        self._replacements: dict[str, str] = {}
+
+    def scrub_text(self, value: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            resource_id = match.group(0)
+            if resource_id.startswith(self._PLACEHOLDER_PREFIX):
+                return resource_id
+            replacement = self._replacements.get(resource_id)
+            if replacement is None:
+                replacement = f"{self._PLACEHOLDER_PREFIX}{len(self._replacements) + 1:012d}"
+                self._replacements[resource_id] = replacement
+            return replacement
+
+        return _UUID_RE.sub(replace, value)
+
+    def scrub_request(self, request: Any) -> Any:
+        request = scrub_request(request)
+        if request.uri:
+            request.uri = self.scrub_text(request.uri)
+        if request.body:
+            if isinstance(request.body, bytes):
+                try:
+                    request.body = self.scrub_text(request.body.decode("utf-8")).encode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+            else:
+                request.body = self.scrub_text(request.body)
+        return request
+
+    def scrub_response(self, response: dict[str, Any]) -> dict[str, Any]:
+        response = scrub_response(response)
+        body = response.get("body", {})
+        if "string" not in body:
+            return response
+        content = body["string"]
+        if isinstance(content, bytes):
+            try:
+                body["string"] = self.scrub_text(content.decode("utf-8")).encode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        else:
+            body["string"] = self.scrub_text(content)
+        return response
 
 
 def _normalize_uuids(value: str) -> str:
@@ -449,6 +547,63 @@ def _shape_only(node: Any) -> Any:
     if isinstance(node, list):
         return [_shape_only(v) for v in node]
     return _LEAF
+
+
+_CREATE_ARTIFACT_RPC_ID = "R7cb6c"
+_CREATE_ARTIFACT_OPTIONS_SENTINEL = {"_CREATE_ARTIFACT_CLIENT_OPTIONS": True}
+_CREATE_ARTIFACT_OLD_CLIENT_OPTIONS = [2]
+_CREATE_ARTIFACT_LIVE_CLIENT_OPTIONS = [
+    2,
+    None,
+    None,
+    [1, None, None, None, None, None, None, None, None, None, [1]],
+    [[1, 4, 8, 2, 3, 6]],
+]
+
+
+def _is_create_artifact_client_options(node: Any) -> bool:
+    """Return whether ``node`` is a known CREATE_ARTIFACT options envelope.
+
+    Older cassettes recorded the compact ``[2]`` first param. Live UI captures
+    on 2026-06-15 send ``[2, None, None, ..., [[1, 4, 8, 2, 3, 6]]]`` instead.
+    Both identify the same client-options slot for matcher purposes; the actual
+    artifact spec remains matched structurally.
+    """
+    if not isinstance(node, list):
+        return False
+    return node in (
+        _CREATE_ARTIFACT_OLD_CLIENT_OPTIONS,
+        _CREATE_ARTIFACT_LIVE_CLIENT_OPTIONS,
+    )
+
+
+def _normalize_create_artifact_options(decoded_outer: Any) -> Any:
+    """Canonicalize old/new CREATE_ARTIFACT client-options shapes for VCR replay."""
+    if not isinstance(decoded_outer, list):
+        return decoded_outer
+
+    normalized_outer: list[Any] = []
+    for batch in decoded_outer:
+        if not isinstance(batch, list):
+            normalized_outer.append(batch)
+            continue
+        normalized_batch: list[Any] = []
+        for entry in batch:
+            if (
+                isinstance(entry, list)
+                and len(entry) >= 2
+                and entry[0] == _CREATE_ARTIFACT_RPC_ID
+                and isinstance(entry[1], list)
+                and entry[1]
+                and _is_create_artifact_client_options(entry[1][0])
+            ):
+                args = list(entry[1])
+                args[0] = _CREATE_ARTIFACT_OPTIONS_SENTINEL
+                normalized_batch.append([entry[0], args, *entry[2:]])
+            else:
+                normalized_batch.append(entry)
+        normalized_outer.append(normalized_batch)
+    return normalized_outer
 
 
 def _normalize_freq_string(body: str) -> str | None:
@@ -595,7 +750,7 @@ def _freq_body_matcher(r1: Any, r2: Any) -> bool:
                         else:
                             decoded_batch.append(entry)
                     decoded_outer.append(decoded_batch)
-                return f_req, ("batch", decoded_outer)
+                return f_req, ("batch", _normalize_create_artifact_options(decoded_outer))
             except (TypeError, IndexError):
                 return f_req, None
 
@@ -676,7 +831,7 @@ _record_mode = "new_episodes" if _is_vcr_record_mode() else "none"
 # Main VCR instance for notebooklm-py tests
 notebooklm_vcr = vcr.VCR(
     # Cassette storage location
-    cassette_library_dir="tests/cassettes",
+    cassette_library_dir="tests/cassettes/web",
     # Record mode: 'none' = only replay (CI), 'new_episodes' = record if missing
     record_mode=_record_mode,
     # Match requests by method and path, plus body-level disambiguators:

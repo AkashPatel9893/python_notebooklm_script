@@ -5,9 +5,8 @@ layout (plus ``Local State``) on disk and prove
 :func:`notebooklm.cli._chromium_profiles.discover_chromium_profiles` returns
 the right :class:`ChromiumProfile` records for issue #571's fan-out path.
 
-We don't exercise rookiepy decryption here — that's covered against the real
-Chrome cookie DB during local validation, and at the
-:mod:`tests.unit.cli.test_session` level via mocked ``rookiepy.any_browser``.
+We don't exercise real rookiepy decryption here; mocked ``rookiepy.any_browser``
+coverage lives in this file and in :mod:`tests.unit.cli.test_login_chromium_fanout`.
 """
 
 from __future__ import annotations
@@ -322,7 +321,7 @@ class TestResolveChromiumProfile:
 
 
 class TestReadChromiumProfileCookies:
-    def test_dispatches_to_rookiepy_any_browser(self, tmp_path, monkeypatch):
+    def test_dispatches_to_rookie_cookies_any_browser(self, tmp_path, monkeypatch):
         """Confirms we use any_browser (which decrypts non-Default profiles
         on macOS) rather than the chromium_based path that errors with
         ``missing osx_key_service`` per #511.
@@ -334,7 +333,7 @@ class TestReadChromiumProfileCookies:
 
         captured: dict[str, object] = {}
 
-        class FakeRookiepy:
+        class FakeRookieCookies:
             @staticmethod
             def any_browser(db_path, domains=None):
                 captured["db_path"] = db_path
@@ -345,7 +344,7 @@ class TestReadChromiumProfileCookies:
             def chromium_based(*a, **kw):  # pragma: no cover
                 raise AssertionError("must not be called — see #511")
 
-        monkeypatch.setitem(sys.modules, "rookiepy", FakeRookiepy)
+        monkeypatch.setitem(sys.modules, "rookie_cookies", FakeRookieCookies)
 
         db = tmp_path / "Profile 1" / "Cookies"
         db.parent.mkdir(parents=True)

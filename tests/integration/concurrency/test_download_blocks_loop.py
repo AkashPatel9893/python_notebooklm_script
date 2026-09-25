@@ -55,9 +55,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from _fixtures.fake_core import FakeSession, make_fake_core
 from notebooklm._artifacts import ArtifactsAPI
+from notebooklm._web.artifacts import WebArtifactsAPI
 from notebooklm.types import ArtifactDownloadError
+from tests._fixtures.fake_core import FakeSession, make_fake_core
 
 # mock-based loop-blocking detection tests; no HTTP, no cassette.
 # Opt out of the tier-enforcement hook in tests/integration/conftest.py.
@@ -112,19 +113,18 @@ def mock_artifacts_api(tmp_path: Path) -> tuple[ArtifactsAPI, FakeSession]:
     lifecycle capability stubs the API reads, so no post-hoc
     ``AsyncMock`` attribute assignment is needed.
     """
-    from notebooklm._mind_map import NoteBackedMindMapService
-    from notebooklm._note_service import NoteService
+    from notebooklm._web.mind_maps import NoteBackedMindMapService
+    from notebooklm._web.notes import NoteService
 
     mock_core = make_fake_core(
         rpc_call=AsyncMock(),
         get_source_ids=AsyncMock(return_value=[]),
     )
-    note_service = NoteService(mock_core)
+    note_service = NoteService(mock_core, supervisor=mock_core)
     mind_maps = NoteBackedMindMapService(note_service)
-    api = ArtifactsAPI(
+    api = WebArtifactsAPI(
         rpc=mock_core,
-        drain=mock_core,
-        lifecycle=mock_core,
+        supervisor=mock_core,
         notebooks=MagicMock(),
         mind_maps=mind_maps,
         note_service=note_service,
@@ -134,6 +134,9 @@ def mock_artifacts_api(tmp_path: Path) -> tuple[ArtifactsAPI, FakeSession]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.filterwarnings(
+    "ignore:Raw artifact download prefetch parameters are deprecated:DeprecationWarning"
+)
 async def test_download_report_runs_write_off_loop_thread(
     mock_artifacts_api: tuple[ArtifactsAPI, FakeSession],
     tmp_path: Path,
@@ -175,12 +178,12 @@ async def test_download_report_runs_write_off_loop_thread(
         captured.append(threading.get_ident())
         return original_write_text(self, *args, **kwargs)  # type: ignore[arg-type]
 
-    with (
-        patch.object(api._downloads, "_list_raw", new_callable=AsyncMock) as mock_list,
-        patch.object(Path, "write_text", recording_write_text),
-    ):
-        mock_list.return_value = report_artifact_list
-        result = await api.download_report("nb_t7d4", str(output_path))
+    with patch.object(Path, "write_text", recording_write_text):
+        result = await api.download_report(
+            "nb_t7d4",
+            str(output_path),
+            artifacts_data=report_artifact_list,
+        )
 
     assert result == str(output_path)
     assert output_path.exists(), "download_report should still produce the file"
@@ -212,7 +215,7 @@ async def test_download_mind_map_runs_write_off_loop_thread(
     ``Path.write_text`` would silently miss the production ``json.dump``
     path.
     """
-    import notebooklm._artifact.downloads as artifact_downloads
+    import notebooklm._web.artifact.downloads as artifact_downloads
 
     api, _ = mock_artifacts_api
     output_path = tmp_path / "mindmap.json"
@@ -250,7 +253,7 @@ async def test_download_mind_map_runs_write_off_loop_thread(
             "list_mind_maps",
             new=AsyncMock(return_value=mind_map_rows),
         ),
-        # Patch the `json` module as imported by `_artifact.downloads` so the
+        # Patch the `json` module as imported by `_web.artifact.downloads` so the
         # closure inside `download_mind_map` resolves to the stub.
         patch.object(artifact_downloads.json, "dump", recording_json_dump),
         # Cover the legacy ``Path.write_text``-based path too so a
@@ -276,6 +279,9 @@ async def test_download_mind_map_runs_write_off_loop_thread(
 
 
 @pytest.mark.asyncio
+@pytest.mark.filterwarnings(
+    "ignore:Raw artifact download prefetch parameters are deprecated:DeprecationWarning"
+)
 async def test_concurrent_downloads_both_offload_writes(
     mock_artifacts_api: tuple[ArtifactsAPI, FakeSession],
     tmp_path: Path,
@@ -289,7 +295,7 @@ async def test_concurrent_downloads_both_offload_writes(
     thread. A regression on either path leaves its capture matching the
     loop thread and fails the assertion.
     """
-    import notebooklm._artifact.downloads as artifact_downloads
+    import notebooklm._web.artifact.downloads as artifact_downloads
 
     api, _ = mock_artifacts_api
     report_path = tmp_path / "report.md"
@@ -332,7 +338,6 @@ async def test_concurrent_downloads_both_offload_writes(
         return original_json_dump(*args, **kwargs)  # type: ignore[arg-type]
 
     with (
-        patch.object(api._downloads, "_list_raw", new_callable=AsyncMock) as mock_list,
         patch.object(
             api._mind_maps,
             "list_mind_maps",
@@ -341,10 +346,9 @@ async def test_concurrent_downloads_both_offload_writes(
         patch.object(Path, "write_text", recording_write_text),
         patch.object(artifact_downloads.json, "dump", recording_json_dump),
     ):
-        mock_list.return_value = report_artifact_list
         report_result, mindmap_result = await asyncio.gather(
-            api.download_report("nb_t7d4", str(report_path)),
-            api.download_mind_map("nb_t7d4", str(mindmap_path)),
+            api.download_report("nb_t7d4", str(report_path), artifacts_data=report_artifact_list),
+            api.download_mind_map("nb_t7d4", str(mindmap_path), artifacts_data=[]),
         )
 
     assert report_result == str(report_path)

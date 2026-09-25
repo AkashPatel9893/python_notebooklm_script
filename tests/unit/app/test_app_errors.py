@@ -8,7 +8,14 @@ import pytest
 
 from notebooklm import exceptions as exc
 from notebooklm._app.download import DownloadPlanValidationError
-from notebooklm._app.errors import ClassifiedError, ErrorCategory, classify
+from notebooklm._app.errors import (
+    CATEGORY_HINTS,
+    ClassifiedError,
+    ErrorCategory,
+    classify,
+    did_you_mean_hint,
+    is_retriable,
+)
 from notebooklm._app.source_add import SourceAddValidationError
 from notebooklm._app.source_mutations import SourceMutationError
 
@@ -77,23 +84,34 @@ def test_every_library_exception_classifies_as_a_library_category(cls: type) -> 
         (exc.AuthError("expired"), ErrorCategory.AUTH, False),
         (exc.ValidationError("bad"), ErrorCategory.VALIDATION, False),
         (exc.ConfigurationError("no auth"), ErrorCategory.CONFIG, False),
+        # A missing optional extra classifies as DEPENDENCY (not CONFIG) even
+        # though it subclasses ConfigurationError — most-specific-first (#1959).
+        (exc.MissingDependencyError("markdownify missing"), ErrorCategory.DEPENDENCY, False),
         (exc.SourceNotFoundError("src"), ErrorCategory.NOT_FOUND, False),
         (exc.NotebookNotFoundError("nb"), ErrorCategory.NOT_FOUND, False),
         (exc.DecodingError("schema drift"), ErrorCategory.RPC, False),
         (exc.NotebookLMError("generic"), ErrorCategory.LIBRARY, False),
         # ``_app``-raised errors re-based onto the public hierarchy (§11). The
         # two validation errors fold into VALIDATION via their ValidationError
-        # base; SourceMutationError keeps its own category so adapters recover
-        # its carried ``.code`` taxonomy.
+        # base; SourceMutationError keeps its own category so adapters can map
+        # its semantic reason independently.
         (
-            DownloadPlanValidationError("Cannot specify both --force and --no-clobber"),
+            DownloadPlanValidationError("conflicting_overwrite_policy"),
             ErrorCategory.VALIDATION,
             False,
         ),
-        (SourceAddValidationError("bad url"), ErrorCategory.VALIDATION, False),
+        (SourceAddValidationError("invalid_url", url="bad"), ErrorCategory.VALIDATION, False),
         (
-            SourceMutationError("ambiguous", "AMBIGUOUS_ID"),
+            SourceMutationError("ambiguous_id", token="ambiguous"),
             ErrorCategory.SOURCE_MUTATION,
+            False,
+        ),
+        # A per-URL ADD failure classifies as its own non-fatal category (#1905)
+        # so a bad URL isolates in a batch add instead of aborting it. Not
+        # retriable — the same input will not succeed unchanged.
+        (
+            exc.SourceAddError("http://bad.example"),
+            ErrorCategory.SOURCE_ADD,
             False,
         ),
         (ValueError("not ours"), ErrorCategory.UNEXPECTED, False),
@@ -128,6 +146,41 @@ def test_artifact_timeout_subclasses_also_classify_as_artifact_timeout() -> None
     assert classify(in_progress).category is ErrorCategory.ARTIFACT_TIMEOUT
 
 
+@pytest.mark.parametrize("code", [5, "5"])
+def test_client_error_status_5_classifies_as_not_found(code: int | str) -> None:
+    """gRPC status-5 (raised as ``ClientError(rpc_code=5)``) is NOT_FOUND, not RPC.
+
+    The decoder raises a bare ``ClientError`` (not a ``NotFoundError``) for a
+    status-5 result; ``classify`` must recover NOT_FOUND. Both the int and the
+    string form of ``rpc_code`` are normalized.
+    """
+    result = classify(exc.ClientError("missing", rpc_code=code))
+
+    assert result.category is ErrorCategory.NOT_FOUND
+    assert result.retriable is False
+
+
+def test_client_error_status_7_is_not_swept_into_not_found() -> None:
+    """Code 7 (permission-denied) from the same decoder site stays generic RPC."""
+    result = classify(exc.ClientError("denied", rpc_code=7))
+
+    assert result.category is ErrorCategory.RPC
+
+
+def test_client_error_without_rpc_code_stays_rpc() -> None:
+    """A ClientError carrying no rpc_code falls through to the RPC catch-all."""
+    assert classify(exc.ClientError("client 4xx")).category is ErrorCategory.RPC
+
+
+def test_bare_rpc_error_unaffected_by_status_5_branch() -> None:
+    """The RPC exemplar (a bare RPCError, no rpc_code) keeps classifying as RPC.
+
+    This is the exemplar the cross-adapter consistency gate uses; the additive
+    status-5 branch must not perturb it.
+    """
+    assert classify(exc.RPCError("decode failed")).category is ErrorCategory.RPC
+
+
 def test_not_found_wins_over_rpc_base() -> None:
     # *NotFoundError mixes in RPCError; classification must prefer NOT_FOUND.
     assert isinstance(exc.SourceNotFoundError("x"), exc.RPCError)
@@ -144,13 +197,17 @@ def test_research_task_mismatch_is_validation() -> None:
     ("app_error", "expected_base", "expected_category"),
     [
         (
-            DownloadPlanValidationError("boom"),
+            DownloadPlanValidationError("missing_notebook"),
             exc.ValidationError,
             ErrorCategory.VALIDATION,
         ),
-        (SourceAddValidationError("boom"), exc.ValidationError, ErrorCategory.VALIDATION),
         (
-            SourceMutationError("boom", "NOT_FOUND"),
+            SourceAddValidationError("invalid_url", url="boom"),
+            exc.ValidationError,
+            ErrorCategory.VALIDATION,
+        ),
+        (
+            SourceMutationError("id_not_found", token="boom"),
             exc.NotebookLMError,
             ErrorCategory.SOURCE_MUTATION,
         ),
@@ -169,26 +226,153 @@ def test_app_raised_errors_are_in_public_hierarchy_and_classify(
     assert result.category is not ErrorCategory.UNEXPECTED
 
 
-def test_source_mutation_error_keeps_cli_attributes() -> None:
-    """Re-basing onto NotebookLMError must not drop the CLI-read attributes."""
-    err = SourceMutationError(
-        "ambiguous id",
-        "AMBIGUOUS_ID",
-        {"source_id": "abc"},
-        status_message="[dim]Matched: abc[/dim]",
-    )
-    assert err.message == "ambiguous id"
-    assert err.code == "AMBIGUOUS_ID"
-    assert err.extra == {"source_id": "abc"}
-    assert err.status_message == "[dim]Matched: abc[/dim]"
+def test_source_add_error_is_its_own_non_library_category() -> None:
+    """``SourceAddError`` classifies as ``SOURCE_ADD``, not the LIBRARY catch-all."""
+    for e in (
+        exc.SourceAddError("http://bad.example"),
+        exc.SourceAddError("http://bad.example", cause=exc.RPCError("boom", rpc_code=9)),
+    ):
+        result = classify(e)
+        assert result.category is ErrorCategory.SOURCE_ADD
+        assert result.category is not ErrorCategory.LIBRARY
+        assert result.retriable is False
 
 
-def test_download_plan_validation_error_keeps_code_and_message() -> None:
-    """``download_cmd`` reads ``.message`` / ``.code`` for its --json envelope."""
-    err = DownloadPlanValidationError("Cannot specify both --force and --no-clobber")
-    assert err.message == "Cannot specify both --force and --no-clobber"
-    assert err.code == "VALIDATION_ERROR"
-    assert str(err) == "Cannot specify both --force and --no-clobber"
+def test_source_add_error_with_transient_cause_classifies_as_server() -> None:
+    """A ``SourceAddError`` wrapping a transient bare RPC error stays SERVER.
+
+    ``_web/wire/decoder.py`` can raise a bare ``RPCError`` with an infra ``rpc_code`` (e.g. a
+    null-result-with-status INTERNAL 13, or an HTTP 5xx) that ``_web/sources/add.py`` wraps as
+    ``SourceAddError``. Isolating that as a per-item error would mask a rate-limit/5xx and
+    hide the infrastructure nature of the failure. This presentation classification
+    does not decide batch continuation; the public batch outcome does.
+    """
+    for code in (13, 14, 8, 4, 503):
+        e = exc.SourceAddError("http://x", cause=exc.RPCError("transient", rpc_code=code))
+        result = classify(e)
+        assert result.category is not ErrorCategory.SOURCE_ADD
+        assert result.category is ErrorCategory.SERVER
+
+
+def test_unconfirmed_source_add_error_is_rpc_and_not_retriable() -> None:
+    """An UNCONFIRMED create must not be presented as an input error (#2220).
+
+    The probe could not determine whether the create committed, so the write may
+    be live. Two classifications are actively harmful here, and the plain
+    ``SourceAddError`` shape lands on both depending on the cause:
+
+    * ``SOURCE_ADD`` says "fix the input and retry" (REST 422), inviting the
+      manual re-add that duplicates.
+    * ``SERVER`` is *retriable* with the hint "retry after a short delay", which
+      the marker must override even though the probe's own failure can carry a
+      transient ``rpc_code`` that would otherwise select it.
+
+    The second case is the one that would regress silently: without the marker
+    it depends on whether the decoder happened to attach a code.
+    """
+    from notebooklm._idempotency import mark_unconfirmed
+
+    for cause in (
+        # The realistic drift shape: the strict list decoder raises bare.
+        exc.RPCError("Could not list sources for nb: API response structure changed"),
+        # ...and the shape that would otherwise be classified SERVER/retriable.
+        exc.RPCError("transient", rpc_code=14),
+    ):
+        e = mark_unconfirmed(exc.SourceAddError("http://x", cause=cause))
+        result = classify(e)
+        assert result.category is ErrorCategory.RPC
+        assert result.category is not ErrorCategory.SOURCE_ADD
+        assert result.retriable is False, "must never advertise a retry"
+    # No hint may contradict the message's "do not blindly retry".
+    assert CATEGORY_HINTS[ErrorCategory.RPC] is None
+
+
+@pytest.mark.parametrize(
+    "transport_exc",
+    [
+        exc.ServerError("probe 503"),
+        exc.RateLimitError("probe 429"),
+        exc.NetworkError("probe connection reset"),
+        exc.AuthError("probe auth expired"),
+    ],
+    ids=["server", "rate_limited", "network", "auth"],
+)
+def test_unconfirmed_marker_overrides_a_retriable_transport_category(transport_exc) -> None:
+    """The probe's *transport* branch is unconfirmable too (#2220 review).
+
+    The probes re-raise transport failures unchanged rather than wrapping them,
+    so the marker rides on a ``ServerError`` / ``RateLimitError`` /
+    ``NetworkError`` / ``AuthError``. Three of those are retriable with the hint
+    "retry after a short delay" — and a caller acting on that retries the ADD,
+    not the probe, producing exactly the duplicate this change prevents. The
+    create's outcome being unknown has to dominate the transport type.
+
+    Without the marker these classify as SERVER / RATE_LIMITED / NETWORK / AUTH,
+    so this is the assertion that would fail if the ``_unconfirmed(exc)`` call
+    were dropped from any probe's transport branch.
+    """
+    from notebooklm._idempotency import mark_unconfirmed
+
+    plain = classify(transport_exc)
+    marked = classify(mark_unconfirmed(transport_exc))
+
+    assert marked.category is ErrorCategory.RPC
+    assert marked.retriable is False
+    # The unmarked classification is genuinely different — otherwise this test
+    # would pass for reasons unrelated to the marker.
+    assert plain.category is not ErrorCategory.RPC
+
+
+def test_unmarked_transport_errors_keep_their_own_category() -> None:
+    """The marker is opt-in; ordinary transport failures are untouched."""
+    assert classify(exc.ServerError("5xx")).category is ErrorCategory.SERVER
+    assert classify(exc.ServerError("5xx")).retriable is True
+    assert classify(exc.AuthError("expired")).category is ErrorCategory.AUTH
+
+
+def test_unmarked_source_add_error_keeps_input_failure_projection() -> None:
+    """The marker is the only thing that diverts; ordinary adds are unaffected."""
+    e = exc.SourceAddError("http://x", cause=exc.RPCError("bad url", rpc_code=3))
+    assert classify(e).category is ErrorCategory.SOURCE_ADD
+
+
+@pytest.mark.parametrize(
+    ("cause", "category", "retriable"),
+    [
+        (exc.NetworkError("offline"), ErrorCategory.NETWORK, True),
+        (exc.ServerError("unavailable"), ErrorCategory.SERVER, True),
+        (exc.AuthError("expired"), ErrorCategory.AUTH, False),
+        (exc.RateLimitError("slow down"), ErrorCategory.RATE_LIMITED, True),
+        (exc.ValidationError("rejected file"), ErrorCategory.VALIDATION, False),
+    ],
+)
+def test_partial_upload_recovery_attributes_do_not_change_classification(
+    cause: Exception, category: ErrorCategory, retriable: bool
+) -> None:
+    """``raise_partial_upload_failure()`` attaches ``source_id``/``stage`` directly
+    to the real cause rather than wrapping it in a new type — confirm that doing
+    so does not perturb ``_category_for``'s isinstance dispatch for any of the
+    five typed causes a post-registration upload failure can be.
+    """
+    cause.source_id = "source-1"  # type: ignore[attr-defined]
+    cause.stage = "upload_finalize"  # type: ignore[attr-defined]
+
+    result = classify(cause)
+
+    assert result.category is category
+    assert result.retriable is retriable
+
+
+def test_source_mutation_error_keeps_typed_attributes() -> None:
+    err = SourceMutationError("ambiguous_id", token="abc")
+    assert err.reason == "ambiguous_id"
+    assert err.token == "abc"
+
+
+def test_download_plan_validation_error_keeps_semantic_reason() -> None:
+    err = DownloadPlanValidationError("conflicting_overwrite_policy")
+    assert err.reason == "conflicting_overwrite_policy"
+    assert "--" not in str(err)
 
 
 def test_retriable_only_for_transient_categories() -> None:
@@ -204,6 +388,7 @@ def test_retriable_only_for_transient_categories() -> None:
         ErrorCategory.AUTH: exc.AuthError("x"),
         ErrorCategory.VALIDATION: exc.ValidationError("x"),
         ErrorCategory.CONFIG: exc.ConfigurationError("x"),
+        ErrorCategory.DEPENDENCY: exc.MissingDependencyError("x"),
         ErrorCategory.NOTEBOOK_LIMIT: exc.NotebookLimitError(1),
         ErrorCategory.RPC: exc.DecodingError("x"),
         ErrorCategory.LIBRARY: exc.NotebookLMError("x"),
@@ -218,3 +403,66 @@ def test_retriable_only_for_transient_categories() -> None:
         result = classify(sample)
         assert result.category is category
         assert result.retriable is (category in transient)
+
+
+def test_classify_retriable_delegates_to_is_retriable() -> None:
+    """``classify`` reads retriability from ``is_retriable`` (single source of truth).
+
+    Rather than re-inlining ``category in _RETRIABLE_CATEGORIES``, ``classify``
+    must agree with :func:`is_retriable` for both transient and deterministic
+    exceptions — so the two never drift.
+    """
+    samples = [
+        exc.RateLimitError("x"),
+        exc.ServerError("x"),
+        exc.NetworkError("x"),
+        exc.AuthError("x"),
+        exc.ValidationError("x"),
+        ValueError("x"),
+    ]
+    for sample in samples:
+        result = classify(sample)
+        assert result.retriable is is_retriable(result.category)
+
+
+def test_category_hints_are_surface_neutral() -> None:
+    """The shared REST+MCP hints must not name a specific tool or CLI command.
+
+    ``CATEGORY_HINTS`` is consumed by BOTH the MCP projector and the REST error
+    body, so a hint that names ``studio_status`` or ``notebooklm login`` would be
+    wrong on the other surface. Guards the F2 neutralization.
+    """
+    banned = ("studio_status", "notebooklm ", "`")
+    for category, hint in CATEGORY_HINTS.items():
+        if hint is None:
+            continue
+        for token in banned:
+            assert token not in hint, (
+                f"{category} hint leaks surface-specific token {token!r}: {hint}"
+            )
+    assert CATEGORY_HINTS[ErrorCategory.AUTH] == "Re-authenticate and retry."
+    assert "task status" in CATEGORY_HINTS[ErrorCategory.ARTIFACT_TIMEOUT]
+    # The DEPENDENCY hint must name the install command, NOT the auth/storage
+    # remediation the CONFIG hint carries (#1959).
+    dep_hint = CATEGORY_HINTS[ErrorCategory.DEPENDENCY]
+    assert dep_hint is not None
+    assert "pip install" in dep_hint and "markdown" in dep_hint
+    assert dep_hint != CATEGORY_HINTS[ErrorCategory.CONFIG]
+
+
+# --- did_you_mean_hint (issue #1787) ---------------------------------------
+
+
+def test_did_you_mean_hint_includes_id_and_title() -> None:
+    """The hint carries id AND title so a flat-string MCP client can retry by id."""
+    hint = did_you_mean_hint([{"id": "abc123", "title": "Scientific PDF Parsing"}])
+    assert hint.startswith("Did you mean:")
+    assert "abc123" in hint
+    assert "Scientific PDF Parsing" in hint
+    assert hint.endswith("Pass the full title or id.")
+
+
+def test_did_you_mean_hint_lists_multiple_candidates() -> None:
+    hint = did_you_mean_hint([{"id": "id1", "title": "Alpha"}, {"id": "id2", "title": "Beta"}])
+    assert "id1" in hint and "id2" in hint
+    assert "Alpha" in hint and "Beta" in hint

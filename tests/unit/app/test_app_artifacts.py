@@ -21,15 +21,22 @@ from notebooklm._app.artifacts import (
     delete_artifact,
     export_artifact,
     get_artifact,
+    get_artifact_prompt,
     poll_artifact,
     rename_artifact,
+    require_complete_artifact_listing,
     retry_artifact,
     status_view,
     wait_for_artifact,
 )
-from notebooklm.exceptions import ArtifactNotFoundError
+from notebooklm.exceptions import ArtifactNotFoundError, RPCError
 from notebooklm.types import (
     Artifact,
+    ArtifactListing,
+    ArtifactListingComponent,
+    ArtifactListingFailure,
+    ArtifactLookup,
+    ArtifactLookupStatus,
     ExportType,
     GenerationStatus,
     MindMap,
@@ -54,22 +61,102 @@ def _client() -> MagicMock:
 async def test_get_artifact_returns_artifact() -> None:
     client = _client()
     art = Artifact(id="art_1", title="T", _artifact_type=1, status=3)
-    client.artifacts.get_or_none = AsyncMock(return_value=art)
+    client.artifacts.lookup = AsyncMock(
+        return_value=ArtifactLookup(ArtifactLookupStatus.FOUND, artifact=art)
+    )
     result = await get_artifact(client, "nb", "art_1")
     assert result is art
-    client.artifacts.get_or_none.assert_awaited_once_with("nb", "art_1")
+    client.artifacts.lookup.assert_awaited_once_with("nb", "art_1")
 
 
 @pytest.mark.asyncio
 async def test_get_artifact_raises_not_found() -> None:
     client = _client()
-    client.artifacts.get_or_none = AsyncMock(return_value=None)
-    client.artifacts.list = AsyncMock(return_value=[])
+    client.artifacts.lookup = AsyncMock(return_value=ArtifactLookup(ArtifactLookupStatus.MISSING))
     with pytest.raises(ArtifactNotFoundError):
         await get_artifact(client, "nb", "art_gone")
-    # No list call — the neutral get is a single get_or_none (the partial-id
-    # resolution + full-id fast path live in the CLI resolver, not here).
-    client.artifacts.list.assert_not_called()
+    client.artifacts.lookup.assert_awaited_once_with("nb", "art_gone")
+
+
+@pytest.mark.asyncio
+async def test_get_artifact_projects_unknown_as_sanitized_rpc_error() -> None:
+    client = _client()
+    failure = ArtifactListingFailure(
+        ArtifactListingComponent.NOTE_BACKED_MIND_MAPS,
+        "RPCError",
+        "The note-backed mind-map listing is unavailable.",
+    )
+    client.artifacts.lookup = AsyncMock(
+        return_value=ArtifactLookup(ArtifactLookupStatus.UNKNOWN, failures=(failure,))
+    )
+
+    with pytest.raises(RPCError, match="note_backed_mind_maps") as raised:
+        await get_artifact(client, "nb", "art_gone")
+
+    assert raised.value.method_id == "artifacts.lookup"
+    assert "cookie" not in str(raised.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# require_complete_artifact_listing — fuzzy-resolution inventory gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_require_complete_artifact_listing_returns_items() -> None:
+    client = _client()
+    art = Artifact(id="art_1", title="Q1 Report", _artifact_type=1, status=3)
+    client.artifacts.list_with_status = AsyncMock(
+        return_value=ArtifactListing(items=(art,), is_complete=True)
+    )
+    assert await require_complete_artifact_listing(client, "nb") == [art]
+    client.artifacts.list_with_status.assert_awaited_once_with("nb")
+
+
+@pytest.mark.asyncio
+async def test_require_complete_artifact_listing_refuses_partial_inventory() -> None:
+    client = _client()
+    art = Artifact(id="art_1", title="Q1 Report", _artifact_type=1, status=3)
+    failure = ArtifactListingFailure(
+        ArtifactListingComponent.NOTE_BACKED_MIND_MAPS,
+        "RPCError",
+        "The note-backed mind-map listing is unavailable.",
+    )
+    client.artifacts.list_with_status = AsyncMock(
+        return_value=ArtifactListing(items=(art,), is_complete=False, failures=(failure,))
+    )
+    with pytest.raises(RPCError, match="note_backed_mind_maps") as raised:
+        await require_complete_artifact_listing(client, "nb")
+    assert raised.value.method_id == "artifacts.lookup"
+
+
+# ---------------------------------------------------------------------------
+# get_artifact_prompt — delegates to the client, propagates not-found
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_artifact_prompt_returns_prompt() -> None:
+    client = _client()
+    client.artifacts.get_prompt = AsyncMock(return_value="Explain the technique.")
+    result = await get_artifact_prompt(client, "nb", "art_1")
+    assert result == "Explain the technique."
+    client.artifacts.get_prompt.assert_awaited_once_with("nb", "art_1", require_complete=True)
+
+
+@pytest.mark.asyncio
+async def test_get_artifact_prompt_returns_none_when_no_prompt() -> None:
+    client = _client()
+    client.artifacts.get_prompt = AsyncMock(return_value=None)
+    assert await get_artifact_prompt(client, "nb", "art_1") is None
+
+
+@pytest.mark.asyncio
+async def test_get_artifact_prompt_propagates_not_found() -> None:
+    client = _client()
+    client.artifacts.get_prompt = AsyncMock(side_effect=ArtifactNotFoundError("art_gone"))
+    with pytest.raises(ArtifactNotFoundError):
+        await get_artifact_prompt(client, "nb", "art_gone")
 
 
 # ---------------------------------------------------------------------------
@@ -116,26 +203,58 @@ async def test_rename_mind_map_dispatches_kind_aware(kind: MindMapKind) -> None:
 
 @pytest.mark.asyncio
 async def test_delete_regular_artifact() -> None:
+    """A miss on the typed note-backed probe routes to ``artifacts.delete``."""
     client = _client()
-    client.notes.list_mind_maps = AsyncMock(return_value=[])
+    client.mind_maps.list_note_backed = AsyncMock(return_value=[])
     client.notes.delete = AsyncMock()
     client.artifacts.delete = AsyncMock()
     assert await delete_artifact(client, "nb", "art_1") is False
+    client.mind_maps.list_note_backed.assert_awaited_once_with("nb")
     client.artifacts.delete.assert_awaited_once_with("nb", "art_1")
     client.notes.delete.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_delete_note_backed_mind_map_clears_via_notes() -> None:
+    """A hit on the typed ``mind_maps.list_note_backed`` probe clears via ``notes.delete``."""
     client = _client()
-    client.notes.list_mind_maps = AsyncMock(
-        return_value=[["mm_1", ["mm_1", "{}", None, None, "MM Title"]]]
+    client.mind_maps.list_note_backed = AsyncMock(
+        return_value=[
+            MindMap(id="mm_1", notebook_id="nb", title="MM Title", kind=MindMapKind.NOTE_BACKED)
+        ]
     )
     client.notes.delete = AsyncMock()
     client.artifacts.delete = AsyncMock()
     assert await delete_artifact(client, "nb", "mm_1") is True
+    client.mind_maps.list_note_backed.assert_awaited_once_with("nb")
     client.notes.delete.assert_awaited_once_with("nb", "mm_1")
     client.artifacts.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delete_plain_note_uuid_falls_through_to_artifacts_delete() -> None:
+    """A plain-note UUID must NOT be ``notes.delete``d — it is not a mind map.
+
+    Regression for the broad-probe data-loss path: the CLI resolver's full-ID
+    fast-path skips the artifact listing for a canonical UUID, so a plain
+    user-note UUID can reach ``delete_artifact`` without ever being validated
+    as an artifact. A probe matching ANY note row (e.g. ``notes.get_or_none``)
+    would route it into ``notes.delete`` and soft-delete user data. The probe
+    must match note-backed mind maps only — even when other note-backed maps
+    exist — and fall through to ``artifacts.delete`` (harmless no-op/error).
+    """
+    plain_note_uuid = "11111111-2222-3333-4444-555555555555"
+    client = _client()
+    client.mind_maps.list_note_backed = AsyncMock(
+        return_value=[
+            MindMap(id="mm_other", notebook_id="nb", title="Other", kind=MindMapKind.NOTE_BACKED)
+        ]
+    )
+    client.notes.delete = AsyncMock()
+    client.artifacts.delete = AsyncMock()
+    assert await delete_artifact(client, "nb", plain_note_uuid) is False
+    client.notes.delete.assert_not_awaited()
+    client.artifacts.delete.assert_awaited_once_with("nb", plain_note_uuid)
 
 
 # ---------------------------------------------------------------------------
@@ -160,8 +279,9 @@ async def test_export_maps_type_and_returns_typed_result(export_type, expected_e
         export_type,
         {"url": "https://x"},
     )
-    # content is None so the backend retrieves it from the artifact id.
-    client.artifacts.export.assert_awaited_once_with("nb", "art_1", None, "My Title", expected_enum)
+    # content defaults to None (keyword-only) so the backend retrieves it from
+    # the artifact id; positional slots now match export_report/export_data_table.
+    client.artifacts.export.assert_awaited_once_with("nb", "art_1", "My Title", expected_enum)
 
 
 @pytest.mark.asyncio
@@ -238,7 +358,23 @@ def test_status_view_projects_full_generation_status() -> None:
         error_code="CODE",
         metadata={"k": "v"},
         is_complete=status.is_complete,
+        media_ready=status.is_complete,
     )
+
+
+def test_status_view_pending_url_is_not_media_ready() -> None:
+    """A pending row that already exposes a url is flagged ``media_ready=False``
+    so a caller knows the url is provisional (#1924 F13)."""
+    status = GenerationStatus(
+        task_id="t",
+        status="pending",
+        url="https://provisional",
+    )
+    view = status_view(status)
+    assert view.is_complete is False
+    assert view.media_ready is False
+    # The url still passes through — flagged, not dropped.
+    assert view.url == "https://provisional"
 
 
 def test_status_view_tolerates_duck_typed_source_without_optional_attrs() -> None:

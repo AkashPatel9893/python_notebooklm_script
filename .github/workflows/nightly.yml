@@ -1,0 +1,733 @@
+name: Nightly E2E Tests
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      qualification_pr:
+        description: 'Open same-repository PR to qualify (dispatch this workflow on main)'
+        required: false
+        type: string
+        default: ''
+      e2e_lane:
+        description: 'Live E2E lane(s) to run'
+        required: true
+        type: choice
+        default: all
+        options: [all, web, android, readonly]
+      test_filter:
+        description: 'Specific pytest node ID (empty runs the full E2E suite)'
+        required: false
+        default: ''
+      account_rotation_base:
+        description: 'Account-rotation base; lane offsets still apply'
+        required: true
+        type: choice
+        default: auto
+        options: [auto, A, B, C]
+
+permissions:
+  contents: read
+
+jobs:
+  # This no-secret job is the only place a mutable ref is resolved. The trusted
+  # workflow must run on main; an owner-authorized same-repo PR is pinned here.
+  resolve-target:
+    runs-on: ubuntu-latest
+    if: github.repository == 'teng-lin/notebooklm-py'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      branch: ${{ steps.resolve.outputs.branch }}
+      is_standard: ${{ steps.resolve.outputs.is_standard }}
+      sha: ${{ steps.target.outputs.sha }}
+      short_sha: ${{ steps.target.outputs.short_sha }}
+      trusted_sha: ${{ steps.resolve.outputs.trusted_sha }}
+    steps:
+    - name: Resolve trusted target
+      id: resolve
+      env:
+        CANONICAL_REPOSITORY: teng-lin/notebooklm-py
+        EVENT_NAME: ${{ github.event_name }}
+        GITHUB_ACTOR_VALUE: ${{ github.actor }}
+        GITHUB_REF_VALUE: ${{ github.ref }}
+        GITHUB_SHA_VALUE: ${{ github.sha }}
+        GITHUB_TRIGGERING_ACTOR_VALUE: ${{ github.triggering_actor }}
+        GH_TOKEN: ${{ github.token }}
+        QUALIFICATION_PR: ${{ inputs.qualification_pr }}
+        RUN_ATTEMPT: ${{ github.run_attempt }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$GITHUB_REF_VALUE" != refs/heads/main ]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Dispatch the trusted nightly workflow on main"
+          exit 1
+        fi
+        if ! [[ "$GITHUB_SHA_VALUE" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::GitHub returned an invalid trusted workflow SHA"
+          exit 1
+        fi
+        echo "trusted_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+
+        if [ -z "$QUALIFICATION_PR" ]; then
+          echo "branch=main" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          echo "expected_sha=$GITHUB_SHA_VALUE" >> "$GITHUB_OUTPUT"
+          echo "is_standard=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [ "$EVENT_NAME" != workflow_dispatch ]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::PR qualification is available only through workflow_dispatch"
+          exit 1
+        fi
+        if [ "$GITHUB_ACTOR_VALUE" != teng-lin ] || \
+           [ "$GITHUB_TRIGGERING_ACTOR_VALUE" != teng-lin ]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Only the repository owner may authorize live PR qualification"
+          exit 1
+        fi
+        if [ "$RUN_ATTEMPT" != 1 ]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::PR qualification cannot be rerun; dispatch a fresh run to pin its head"
+          exit 1
+        fi
+        if ! [[ "$QUALIFICATION_PR" =~ ^[1-9][0-9]*$ ]]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::qualification_pr must be a positive PR number"
+          exit 1
+        fi
+
+        pr_fields=$(gh api "repos/$CANONICAL_REPOSITORY/pulls/$QUALIFICATION_PR" \
+          --jq '[.state, .base.repo.full_name, .base.ref, .head.repo.full_name, .head.sha] | @tsv')
+        IFS=$'\t' read -r state base_repo base_ref head_repo head_sha <<< "$pr_fields"
+        if [ "$state" != open ] || [ "$base_repo" != "$CANONICAL_REPOSITORY" ] || \
+           [ "$base_ref" != main ] || [ "$head_repo" != "$CANONICAL_REPOSITORY" ]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::Qualification requires an open, same-repository PR targeting main"
+          exit 1
+        fi
+        if ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "is_standard=false" >> "$GITHUB_OUTPUT"
+          echo "::error::GitHub returned an invalid PR head SHA"
+          exit 1
+        fi
+        echo "branch=pr-$QUALIFICATION_PR" >> "$GITHUB_OUTPUT"
+        echo "checkout_ref=$head_sha" >> "$GITHUB_OUTPUT"
+        echo "expected_sha=$head_sha" >> "$GITHUB_OUTPUT"
+        echo "is_standard=true" >> "$GITHUB_OUTPUT"
+    - uses: actions/checkout@v7
+      if: steps.resolve.outputs.is_standard == 'true'
+      with:
+        ref: ${{ steps.resolve.outputs.checkout_ref }}
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Resolve immutable commit
+      id: target
+      if: steps.resolve.outputs.is_standard == 'true'
+      shell: bash
+      env:
+        EXPECTED_SHA: ${{ steps.resolve.outputs.expected_sha }}
+        TARGET_LABEL: ${{ steps.resolve.outputs.branch }}
+      run: |
+        set -euo pipefail
+        actual_sha=$(git rev-parse HEAD)
+        if [ -n "$EXPECTED_SHA" ] && [ "$actual_sha" != "$EXPECTED_SHA" ]; then
+          echo "::error::Checked-out commit does not match the authorized PR head SHA"
+          exit 1
+        fi
+        echo "sha=$actual_sha" >> "$GITHUB_OUTPUT"
+        echo "short_sha=${actual_sha:0:12}" >> "$GITHUB_OUTPUT"
+        printf '### Live target\n\nTarget: `%s@%s`\n' \
+          "$TARGET_LABEL" "$actual_sha" >> "$GITHUB_STEP_SUMMARY"
+
+  # The account selector runs from the trusted workflow SHA without any secret. Its
+  # matrix contains aliases and allowlisted secret names, never secret values.
+  plan-live-lanes:
+    needs: resolve-target
+    if: >-
+      github.repository == 'teng-lin/notebooklm-py' &&
+      needs.resolve-target.outputs.is_standard == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      full_matrix: ${{ steps.plan.outputs.full_matrix }}
+      readonly_matrix: ${{ steps.plan.outputs.readonly_matrix }}
+      has_full: ${{ steps.plan.outputs.has_full }}
+      has_readonly: ${{ steps.plan.outputs.has_readonly }}
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ needs.resolve-target.outputs.trusted_sha }}
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Select live account slots
+      id: plan
+      env:
+        ENABLED_SLOTS: ${{ vars.NOTEBOOKLM_CI_ACCOUNT_SLOTS }}
+        MANUAL_BASE: ${{ inputs.account_rotation_base || 'auto' }}
+        E2E_LANE: ${{ inputs.e2e_lane || 'all' }}
+        TEST_FILTER: ${{ inputs.test_filter }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        rotation_day=$(date -u +%F)
+        python scripts/select_ci_account.py \
+          --enabled-slots "$ENABLED_SLOTS" \
+          --lane nightly-web-ubuntu \
+          --rotation-day "$rotation_day" \
+          --manual-base "$MANUAL_BASE" \
+          --github-output "$RUNNER_TEMP/web-slot.out"
+        python scripts/select_ci_account.py \
+          --enabled-slots "$ENABLED_SLOTS" \
+          --lane nightly-android-macos \
+          --rotation-day "$rotation_day" \
+          --manual-base "$MANUAL_BASE" \
+          --github-output "$RUNNER_TEMP/android-slot.out"
+        python scripts/select_ci_account.py \
+          --enabled-slots "$ENABLED_SLOTS" \
+          --lane nightly-readonly-windows \
+          --rotation-day "$rotation_day" \
+          --manual-base "$MANUAL_BASE" \
+          --github-output "$RUNNER_TEMP/readonly-slot.out"
+        python - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        def read_outputs(name: str) -> dict[str, str]:
+            text = (Path(os.environ["RUNNER_TEMP"]) / name).read_text(encoding="utf-8")
+            return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+        web = read_outputs("web-slot.out")
+        android = read_outputs("android-slot.out")
+        readonly = read_outputs("readonly-slot.out")
+        selected_lane = os.environ["E2E_LANE"]
+        test_filter = os.environ["TEST_FILTER"]
+        if selected_lane not in {"all", "web", "android", "readonly"}:
+            raise SystemExit(f"unsupported e2e_lane: {selected_lane}")
+        include = []
+        if selected_lane in {"all", "web"}:
+            include.append(
+                {"os": "ubuntu-latest", "backend": "web",
+                 "lane": "nightly-web-ubuntu", "mode": "full",
+                 "selection": "not variants", "account_slot": web["account_slot"],
+                 "master_token_secret_name": web["master_token_secret_name"]}
+            )
+        if selected_lane in {"all", "android"}:
+            include.append(
+                {"os": "macos-latest", "backend": "android",
+                 "lane": "nightly-android-macos", "mode": "full",
+                 "selection": "not variants", "account_slot": android["account_slot"],
+                 "master_token_secret_name": android["master_token_secret_name"]}
+            )
+        if selected_lane == "readonly" or (selected_lane == "all" and not test_filter):
+            include.append(
+                {"os": "windows-latest", "backend": "web",
+                 "lane": "nightly-readonly-windows", "mode": "readonly",
+                 "selection": "readonly and not variants",
+                 "account_slot": readonly["account_slot"],
+                 "master_token_secret_name": readonly["master_token_secret_name"]}
+            )
+        matrix = {"include": include}
+        value = json.dumps(matrix, separators=(",", ":"))
+        with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+            stream.write(f"matrix={value}\n")
+            for group, mode in (("full", "full"), ("readonly", "readonly")):
+                rows = [row for row in include if row["mode"] == mode]
+                group_matrix = json.dumps({"include": rows}, separators=(",", ":"))
+                stream.write(f"{group}_matrix={group_matrix}\n")
+                stream.write(f"has_{group}={str(bool(rows)).lower()}\n")
+            stream.write(f"rotation_day={web['rotation_day']}\n")
+            stream.write(f"web_slot={web['account_slot']}\n")
+            stream.write(f"android_slot={android['account_slot']}\n")
+            stream.write(f"readonly_slot={readonly['account_slot']}\n")
+        PY
+    - name: Summarize safe lane selection
+      env:
+        ENABLED_SLOTS: ${{ vars.NOTEBOOKLM_CI_ACCOUNT_SLOTS }}
+        WEB_SLOT: ${{ steps.plan.outputs.web_slot }}
+        ANDROID_SLOT: ${{ steps.plan.outputs.android_slot }}
+        READONLY_SLOT: ${{ steps.plan.outputs.readonly_slot }}
+        E2E_LANE: ${{ inputs.e2e_lane || 'all' }}
+        TEST_FILTER: ${{ inputs.test_filter }}
+        SELECTION_MODE: ${{ (inputs.account_rotation_base == '' || inputs.account_rotation_base == 'auto') && 'automatic' || 'manual base' }}
+        ROTATION_DAY: ${{ steps.plan.outputs.rotation_day }}
+      shell: bash
+      run: |
+        IFS=, read -ra enabled_slots <<< "$ENABLED_SLOTS"
+        enabled_count=${#enabled_slots[@]}
+        {
+          echo "### Live account plan"
+          echo "Rotation day: $ROTATION_DAY; enabled slot count: $enabled_count"
+          echo "| Lane | Runner | Backend | Suite | Slot | Selection |"
+          echo "| --- | --- | --- | --- | --- | --- |"
+          if [ "$E2E_LANE" = all ] || [ "$E2E_LANE" = web ]; then
+            echo "| nightly-web-ubuntu | Ubuntu | web | full | $WEB_SLOT | $SELECTION_MODE |"
+          fi
+          if [ "$E2E_LANE" = all ] || [ "$E2E_LANE" = android ]; then
+            echo "| nightly-android-macos | macOS | android | full | $ANDROID_SLOT | $SELECTION_MODE |"
+          fi
+          if [ "$E2E_LANE" = all ] || [ "$E2E_LANE" = readonly ]; then
+            if [ "$E2E_LANE" = all ] && [ -n "$TEST_FILTER" ]; then
+              echo "| nightly-readonly-windows | Windows | web | omitted | $READONLY_SLOT | filtered dispatch |"
+            else
+              echo "| nightly-readonly-windows | Windows | web | readonly | $READONLY_SLOT | $SELECTION_MODE |"
+            fi
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+  # The read-only lane still seeds a chat during provisioning. Run it before
+  # either full suite can spend the same account's quota; a concurrency group
+  # alone serializes jobs but does not establish their order.
+  e2e:
+    name: E2E (${{ matrix.backend }}/${{ matrix.lane }}/${{ matrix.account_slot }})
+    needs: [resolve-target, plan-live-lanes, e2e-readonly]
+    if: >-
+      always() && !cancelled() &&
+      needs.plan-live-lanes.result == 'success' &&
+      needs.plan-live-lanes.outputs.has_full == 'true' &&
+      github.repository == 'teng-lin/notebooklm-py' &&
+      needs.resolve-target.outputs.is_standard == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    environment: protected-readonly
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan-live-lanes.outputs.full_matrix) }}
+    concurrency:
+      group: notebooklm-account-${{ matrix.account_slot }}
+      queue: max
+      cancel-in-progress: false
+    defaults:
+      run:
+        # Lifecycle and retry scripts use Bash syntax on every runner.
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+      CI_E2E_PROGRESS: "1"
+      NOTEBOOKLM_BACKEND: ${{ matrix.backend }}
+      NOTEBOOKLM_PROFILE: ci-${{ matrix.account_slot }}-${{ matrix.lane }}
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+      E2E_COVERAGE_FLOOR_SENTINEL: ${{ github.workspace }}/.e2e-coverage-floor-failed
+    steps: &e2e-steps
+    - uses: actions/checkout@v7
+      with:
+        ref: ${{ needs.resolve-target.outputs.sha }}
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Checkout trusted CI helpers
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ needs.resolve-target.outputs.trusted_sha }}
+        path: trusted-ci-${{ github.run_id }}-${{ github.run_attempt }}
+        fetch-depth: 1
+        persist-credentials: false
+    - name: Configure runner-local paths
+      run: |
+        {
+          echo "NOTEBOOKLM_HOME=$RUNNER_TEMP/notebooklm-home"
+          echo "CI_E2E_MANIFEST=$RUNNER_TEMP/notebooklm-e2e/manifest.json"
+          echo "CI_E2E_JOURNAL=$RUNNER_TEMP/notebooklm-generation.jsonl"
+        } >> "$GITHUB_ENV"
+    - name: Record job budget origin
+      id: job_start
+      run: |
+        python - <<'PY'
+        import os
+        import time
+        from pathlib import Path
+        with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
+            stream.write(f"NOTEBOOKLM_CI_JOB_STARTED_MONOTONIC_NS={time.monotonic_ns()}\n")
+        PY
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+        cache: pip
+    - name: Install uv
+      uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # @ v7.0.0
+    - name: Install trusted auth environment
+      run: |
+        trusted_root="$GITHUB_WORKSPACE/trusted-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+        cd "$trusted_root"
+        uv sync --frozen --extra headless --no-dev
+    - name: Materialize selected account
+      id: auth
+      if: >-
+        needs.resolve-target.outputs.is_standard == 'true' &&
+        github.repository == 'teng-lin/notebooklm-py'
+      continue-on-error: true
+      env:
+        NOTEBOOKLM_MASTER_TOKEN_JSON: ${{ secrets[matrix.master_token_secret_name] }}
+      run: |
+        trusted_root="$GITHUB_WORKSPACE/trusted-ci-${{ github.run_id }}-${{ github.run_attempt }}"
+        cd "$trusted_root"
+        PYTHONPATH="$trusted_root/src" uv run --frozen --no-sync python \
+          scripts/materialize_ci_auth.py \
+          --account-slot "${{ matrix.account_slot }}" --profile "$NOTEBOOKLM_PROFILE"
+    - name: Install dependencies
+      run: >-
+        uv sync --frozen --extra browser --extra dev --extra markdown
+        --extra impersonate --extra mcp --extra server --extra headless --extra android
+    - name: Get Playwright version
+      id: playwright-version
+      run: |
+        VERSION=$(uv run python -c 'import importlib.metadata as m; print(m.version("playwright"))')
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+    - name: Cache Playwright browsers
+      uses: actions/cache@v6
+      with:
+        path: ${{ github.workspace }}/.playwright-browsers
+        key: playwright-${{ matrix.os }}-${{ steps.playwright-version.outputs.version }}-ws
+    - name: Install Playwright browsers
+      run: uv run playwright install chromium
+    - name: Sweep stale managed copies
+      id: sweep
+      if: steps.auth.outcome == 'success'
+      continue-on-error: true
+      env:
+        NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID: ${{ secrets.NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID }}
+      run: |
+        uv run python scripts/manage_ci_e2e_notebooks.py sweep \
+          --backend "${{ matrix.backend }}" \
+          --template-id-env NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID \
+          --manifest "$CI_E2E_MANIFEST"
+    - name: Provision managed role copies
+      id: provision
+      if: steps.auth.outcome == 'success' && steps.sweep.outcome == 'success'
+      continue-on-error: true
+      env:
+        NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID: ${{ secrets.NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID }}
+        SUMMARY_BACKEND: ${{ matrix.backend }}
+        SUMMARY_LANE: ${{ matrix.lane }}
+        SUMMARY_MODE: ${{ matrix.mode }}
+        SUMMARY_SLOT: ${{ matrix.account_slot }}
+      run: |
+        uv run python scripts/manage_ci_e2e_notebooks.py provision \
+          --backend "${{ matrix.backend }}" \
+          --template-id-env NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID \
+          --contract tests/fixtures/e2e_template_contract.json \
+          --prepared-contract tests/fixtures/e2e_prepared_role_contract.json \
+          --mode "${{ matrix.mode }}" --lane "${{ matrix.lane }}" \
+          --account-slot "${{ matrix.account_slot }}" \
+          --manifest "$CI_E2E_MANIFEST" --github-env "$GITHUB_ENV"
+        python - <<'PY'
+        import json
+        import os
+        import re
+        from collections import Counter
+        from pathlib import Path
+
+        manifest = json.loads(Path(os.environ["CI_E2E_MANIFEST"]).read_text(encoding="utf-8"))
+        expected = {
+            "backend": os.environ["SUMMARY_BACKEND"],
+            "lane": os.environ["SUMMARY_LANE"],
+            "account_slot": os.environ["SUMMARY_SLOT"],
+            "mode": os.environ["SUMMARY_MODE"],
+        }
+        if any(manifest.get(key) != value for key, value in expected.items()):
+            raise RuntimeError("manifest summary metadata mismatch")
+        copies = manifest.get("copies")
+        roles = {
+            "full": ("reference", "generation"),
+            "readonly": ("reference",),
+        }[expected["mode"]]
+        if not isinstance(copies, list):
+            raise RuntimeError("manifest summary role count mismatch")
+        manifest_roles = tuple(row.get("role") for row in copies if isinstance(row, dict))
+        if manifest_roles != roles or len(manifest_roles) != len(copies):
+            raise RuntimeError("manifest summary role count mismatch")
+        rows = {row.get("role"): row for row in copies if isinstance(row, dict)}
+        if set(rows) != set(roles):
+            raise RuntimeError("manifest summary roles mismatch")
+        if any(row.get("status") not in {"confirmed", "reconciled"} for row in rows.values()):
+            raise RuntimeError("manifest summary contains an unexpected copy outcome")
+        if any(row.get("prepared") is not True for row in rows.values()):
+            raise RuntimeError("manifest summary contains an unprepared role")
+        fingerprint = manifest.get("template_fingerprint")
+        if not isinstance(fingerprint, str) or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+            raise RuntimeError("manifest summary fingerprint is malformed")
+        outcomes = Counter(str(row["status"]) for row in rows.values())
+        lines = [
+            "### Prepared managed roles",
+            f"- Lane/backend/slot: {expected['lane']} / {expected['backend']} / {expected['account_slot']}",
+            f"- Template contract: version=1 fingerprint={fingerprint}",
+            f"- Copy outcomes: total={len(roles)} confirmed={outcomes['confirmed']} reconciled={outcomes['reconciled']}",
+            "- Reference checks: seeded_notes=1 history=passed",
+        ]
+        if expected["mode"] == "full":
+            lines.append("- Clean workspace residuals: generation/multi-source=0")
+        with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(lines) + "\n")
+        PY
+    - name: Backend preflight
+      id: preflight
+      if: steps.provision.outcome == 'success'
+      continue-on-error: true
+      run: |
+        uv run python - <<'PY'
+        import asyncio
+        import os
+        import gpsoauth  # noqa: F401
+        import grpc  # noqa: F401
+        from notebooklm import NotebookLMClient
+        async def main() -> None:
+            backend = os.environ["NOTEBOOKLM_BACKEND"]
+            notebook_id = os.environ["NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID"]
+            async with NotebookLMClient.from_storage(backend=backend) as client:
+                if set(client.backends.values()) != {backend}:
+                    raise RuntimeError("Selected backend graph is inconsistent")
+                notebook = await client.notebooks.get(notebook_id)
+                if notebook.id != notebook_id:
+                    raise RuntimeError("Backend preflight returned the wrong managed copy")
+        asyncio.run(main())
+        PY
+    - name: Configure generation journal policy
+      id: journal_policy
+      if: steps.preflight.outcome == 'success'
+      continue-on-error: true
+      env:
+        TEST_FILTER: ${{ inputs.test_filter }}
+      run: |
+        if [ "${{ matrix.lane }}" = nightly-web-ubuntu ] && [ -z "$TEST_FILTER" ]; then
+          umask 077
+          : > "$CI_E2E_JOURNAL"
+          echo "NOTEBOOKLM_E2E_GENERATION_JOURNAL_MODE=required" >> "$GITHUB_ENV"
+          echo "NOTEBOOKLM_E2E_GENERATION_JOURNAL=$CI_E2E_JOURNAL" >> "$GITHUB_ENV"
+        else
+          echo "NOTEBOOKLM_E2E_GENERATION_JOURNAL_MODE=off" >> "$GITHUB_ENV"
+        fi
+    - name: Run primary E2E tests
+      id: primary
+      if: steps.journal_policy.outcome == 'success'
+      continue-on-error: true
+      env:
+        E2E_ENFORCE_COVERAGE_FLOOR: "1"
+        TEST_FILTER: ${{ inputs.test_filter }}
+      run: |
+        python -c 'from pathlib import Path; import os; Path(os.environ["E2E_COVERAGE_FLOOR_SENTINEL"]).unlink(missing_ok=True)'
+        if [ -n "$TEST_FILTER" ]; then
+          unset E2E_ENFORCE_COVERAGE_FLOOR
+          uv run pytest -m "${{ matrix.selection }}" -s -v -ra --tb=short --no-cov --reruns 1 --reruns-delay 30 -- "$TEST_FILTER"
+        else
+          uv run pytest tests/e2e -m "${{ matrix.selection }}" -s -v -ra --tb=short --no-cov \
+            --reruns 1 --reruns-delay 30
+        fi
+    - name: Validate lastfailed cache
+      id: lastfailed
+      if: steps.primary.outcome == 'failure'
+      continue-on-error: true
+      run: |
+        python - <<'PY'
+        import json
+        from pathlib import Path
+
+        value = json.loads(Path(".pytest_cache/v/cache/lastfailed").read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or not value:
+            raise RuntimeError("lastfailed cache is empty or malformed")
+        if any(not isinstance(node_id, str) or failed is not True for node_id, failed in value.items()):
+            raise RuntimeError("lastfailed cache entries are malformed")
+        PY
+    - name: Retry failed E2E tests after 10-min cool-down
+      id: retry
+      if: steps.primary.outcome == 'failure' && steps.lastfailed.outcome == 'success'
+      continue-on-error: true
+      env:
+        E2E_ENFORCE_COVERAGE_FLOOR: "1"
+        TEST_FILTER: ${{ inputs.test_filter }}
+      run: |
+        for minute in {1..10}; do
+          echo "E2E retry cool-down: minute $minute/10"
+          sleep 60
+        done
+        if [ -n "$TEST_FILTER" ]; then unset E2E_ENFORCE_COVERAGE_FLOOR; fi
+        uv run pytest tests/e2e --last-failed --last-failed-no-failures=none -m "${{ matrix.selection }}" -s -v -ra --tb=short --no-cov
+    - name: curl_cffi transport smoke
+      id: smoke
+      if: steps.preflight.outcome == 'success' && matrix.lane == 'nightly-web-ubuntu'
+      continue-on-error: true
+      env:
+        NOTEBOOKLM_TRANSPORT: curl_cffi
+      run: uv run pytest tests/e2e -m impersonate_smoke -s -v -ra --tb=short --no-cov --reruns 1 --reruns-delay 30
+    - name: Enforce E2E execution floors
+      id: coverage
+      if: >-
+        always() &&
+        (steps.primary.outcome == 'success' ||
+         (steps.primary.outcome == 'failure' &&
+          (steps.lastfailed.outcome == 'failure' ||
+           (steps.lastfailed.outcome == 'success' &&
+            (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure')))))
+      continue-on-error: true
+      env:
+        TEST_FILTER: ${{ inputs.test_filter }}
+      run: |
+        sentinel="$E2E_COVERAGE_FLOOR_SENTINEL"
+        if [ ! -f "$sentinel" ]; then
+          if [ -n "$TEST_FILTER" ]; then
+            echo "E2E execution floor: not enforced for filtered dispatch" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "E2E execution floor: passed; skip-only markers=0" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+        fi
+        passed="$(awk -F'\t' '$1=="PASS"{print $2}' "$sentinel" | sort -u)"
+        skipped="$(awk -F'\t' '$1=="SKIP"{print $2}' "$sentinel" | sort -u)"
+        breach="$(comm -23 <(printf '%s\n' "$skipped" | sed '/^$/d') <(printf '%s\n' "$passed" | sed '/^$/d'))"
+        if [ -n "$breach" ]; then
+          breach_count=$(printf '%s\n' "$breach" | sed '/^$/d' | wc -l | tr -d ' ')
+          echo "E2E execution floor: failed; skip-only markers=$breach_count" >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::E2E execution floor breached"
+          printf '  %s\n' "$breach"
+          exit 1
+        fi
+        echo "E2E execution floor: passed; skip-only markers=0" >> "$GITHUB_STEP_SUMMARY"
+    - name: Compute verifier budget
+      id: verifier_budget
+      if: >-
+        always() && matrix.lane == 'nightly-web-ubuntu' && inputs.test_filter == '' &&
+        steps.journal_policy.outcome == 'success' &&
+        (steps.primary.outcome == 'success' ||
+         (steps.primary.outcome == 'failure' &&
+          (steps.lastfailed.outcome == 'failure' ||
+           (steps.lastfailed.outcome == 'success' &&
+            (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure')))))
+      continue-on-error: true
+      run: |
+        timeout=$(uv run python scripts/verify_ci_artifacts.py --compute-budget)
+        echo "timeout=$timeout" >> "$GITHUB_OUTPUT"
+    - name: Verify generation operation journal
+      id: verifier
+      if: >-
+        always() && matrix.lane == 'nightly-web-ubuntu' && inputs.test_filter == '' &&
+        steps.journal_policy.outcome == 'success' &&
+        (steps.primary.outcome == 'success' ||
+         (steps.primary.outcome == 'failure' &&
+          (steps.lastfailed.outcome == 'failure' ||
+           (steps.lastfailed.outcome == 'success' &&
+            (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure'))))) &&
+        steps.verifier_budget.outcome == 'success'
+      continue-on-error: true
+      run: |
+        uv run python scripts/verify_ci_artifacts.py \
+          --mode journal --backend web \
+          --manifest "$CI_E2E_MANIFEST" --role generation \
+          --journal "$CI_E2E_JOURNAL" \
+          --timeout "${{ steps.verifier_budget.outputs.timeout }}"
+    - name: Cleanup managed role copies
+      id: cleanup
+      if: always()
+      continue-on-error: true
+      env:
+        NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID: ${{ secrets.NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID }}
+      run: |
+        uv run python scripts/manage_ci_e2e_notebooks.py cleanup \
+          --backend "${{ matrix.backend }}" \
+          --template-id-env NOTEBOOKLM_E2E_TEMPLATE_NOTEBOOK_ID \
+          --manifest "$CI_E2E_MANIFEST"
+    - name: Purge local credentials and handles
+      id: purge
+      if: always()
+      continue-on-error: true
+      run: |
+        python - <<'PY'
+        import os
+        import shutil
+        from pathlib import Path
+        home = Path(os.environ["NOTEBOOKLM_HOME"])
+        if home.exists():
+            shutil.rmtree(home)
+        journal = Path(os.environ["CI_E2E_JOURNAL"])
+        journal.unlink(missing_ok=True)
+        journal.with_name(f".{journal.name}.lock").unlink(missing_ok=True)
+        Path(os.environ["CI_E2E_MANIFEST"]).unlink(missing_ok=True)
+        PY
+    - name: Aggregate full Web lane outcomes
+      id: aggregate_web
+      if: always() && matrix.lane == 'nightly-web-ubuntu'
+      run: >-
+        python scripts/aggregate_ci_e2e_outcomes.py
+        --lane nightly-web-ubuntu --mode full
+        --producer ${{ inputs.test_filter == '' && 'required' || 'off' }}
+        --phase auth=${{ steps.auth.outcome == 'success' && 'success' || 'failure' }}
+        --phase sweep=${{ steps.auth.outcome == 'success' && (steps.sweep.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase provision=${{ steps.sweep.outcome == 'success' && (steps.provision.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase preflight=${{ steps.provision.outcome == 'success' && (steps.preflight.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase journal_policy=${{ steps.preflight.outcome == 'success' && (steps.journal_policy.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase primary=${{ steps.journal_policy.outcome == 'success' && (steps.primary.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase lastfailed=${{ steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase retry=${{ steps.primary.outcome == 'failure' && steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase smoke=${{ steps.preflight.outcome == 'success' && (steps.smoke.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase coverage=${{ (steps.primary.outcome == 'success' || (steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'failure' || (steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure'))))) && (steps.coverage.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase verifier=${{ inputs.test_filter == '' && steps.journal_policy.outcome == 'success' && (steps.primary.outcome == 'success' || (steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'failure' || (steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure'))))) && (steps.verifier_budget.outcome == 'success' && (steps.verifier.outcome == 'success' && 'success' || 'failure') || 'failure') || 'not_applicable' }}
+        --phase cleanup=${{ steps.cleanup.outcome == 'success' && 'success' || 'failure' }}
+        --phase purge=${{ steps.purge.outcome == 'success' && 'success' || 'failure' }}
+    - name: Aggregate Android lane outcomes
+      id: aggregate_android
+      if: always() && matrix.lane == 'nightly-android-macos'
+      run: >-
+        python scripts/aggregate_ci_e2e_outcomes.py
+        --lane nightly-android-macos --mode full --producer required
+        --phase auth=${{ steps.auth.outcome == 'success' && 'success' || 'failure' }}
+        --phase sweep=${{ steps.auth.outcome == 'success' && (steps.sweep.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase provision=${{ steps.sweep.outcome == 'success' && (steps.provision.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase preflight=${{ steps.provision.outcome == 'success' && (steps.preflight.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase journal_policy=${{ steps.preflight.outcome == 'success' && (steps.journal_policy.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase primary=${{ steps.journal_policy.outcome == 'success' && (steps.primary.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase lastfailed=${{ steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase retry=${{ steps.primary.outcome == 'failure' && steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase coverage=${{ (steps.primary.outcome == 'success' || (steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'failure' || (steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure'))))) && (steps.coverage.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase cleanup=${{ steps.cleanup.outcome == 'success' && 'success' || 'failure' }}
+        --phase purge=${{ steps.purge.outcome == 'success' && 'success' || 'failure' }}
+    - name: Aggregate read-only Windows lane outcomes
+      id: aggregate_readonly
+      if: always() && matrix.lane == 'nightly-readonly-windows'
+      run: >-
+        python scripts/aggregate_ci_e2e_outcomes.py
+        --lane nightly-readonly-windows --mode readonly --producer required
+        --phase auth=${{ steps.auth.outcome == 'success' && 'success' || 'failure' }}
+        --phase sweep=${{ steps.auth.outcome == 'success' && (steps.sweep.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase provision=${{ steps.sweep.outcome == 'success' && (steps.provision.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase preflight=${{ steps.provision.outcome == 'success' && (steps.preflight.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase journal_policy=${{ steps.preflight.outcome == 'success' && (steps.journal_policy.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase primary=${{ steps.journal_policy.outcome == 'success' && (steps.primary.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase lastfailed=${{ steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase retry=${{ steps.primary.outcome == 'failure' && steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase coverage=${{ (steps.primary.outcome == 'success' || (steps.primary.outcome == 'failure' && (steps.lastfailed.outcome == 'failure' || (steps.lastfailed.outcome == 'success' && (steps.retry.outcome == 'success' || steps.retry.outcome == 'failure'))))) && (steps.coverage.outcome == 'success' && 'success' || 'failure') || 'not_applicable' }}
+        --phase cleanup=${{ steps.cleanup.outcome == 'success' && 'success' || 'failure' }}
+        --phase purge=${{ steps.purge.outcome == 'success' && 'success' || 'failure' }}
+
+  e2e-readonly:
+    name: E2E (${{ matrix.backend }}/${{ matrix.lane }}/${{ matrix.account_slot }})
+    needs: [resolve-target, plan-live-lanes]
+    if: >-
+      github.repository == 'teng-lin/notebooklm-py' &&
+      needs.resolve-target.outputs.is_standard == 'true' &&
+      needs.plan-live-lanes.outputs.has_readonly == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    environment: protected-readonly
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan-live-lanes.outputs.readonly_matrix) }}
+    concurrency:
+      group: notebooklm-account-${{ matrix.account_slot }}
+      queue: max
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUNBUFFERED: "1"
+      CI_E2E_PROGRESS: "1"
+      NOTEBOOKLM_BACKEND: ${{ matrix.backend }}
+      NOTEBOOKLM_PROFILE: ci-${{ matrix.account_slot }}-${{ matrix.lane }}
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+      E2E_COVERAGE_FLOOR_SENTINEL: ${{ github.workspace }}/.e2e-coverage-floor-failed
+    steps: *e2e-steps

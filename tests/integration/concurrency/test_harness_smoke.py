@@ -39,11 +39,11 @@ import time
 import httpx
 import pytest
 
-from _fixtures.kernel_test_helpers import install_http_client_for_test
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 from .conftest import ConcurrentMockTransport
 
@@ -69,8 +69,9 @@ async def _open_core_with_transport(transport: ConcurrentMockTransport) -> Noteb
     """Open a ``NotebookLMClient`` and swap in the mock transport.
 
     Mirrors the documented pattern from ``tests/unit/conftest.py``:
-    ``NotebookLMClient.open()`` builds its own ``httpx.AsyncClient`` and we
-    can't override the transport via the constructor. So we open
+    ``NotebookLMClient.__aenter__()`` calls ``ClientLifecycle.open()``, which
+    builds its own ``httpx.AsyncClient`` and we can't override the transport via
+    the constructor. So we open
     normally, then close-and-replace the underlying client with one
     that routes through our recording transport.
 
@@ -81,11 +82,11 @@ async def _open_core_with_transport(transport: ConcurrentMockTransport) -> Noteb
     """
     core = build_client_shell_for_tests(auth=_make_auth(), max_concurrent_rpcs=None)
     await core.__aenter__()
-    assert core._collaborators.kernel.http_client is not None
-    prior_cookies = core._collaborators.kernel.get_http_client().cookies
-    await core._collaborators.kernel.get_http_client().aclose()
+    assert core._web_runtime.kernel.http_client is not None
+    prior_cookies = core._web_runtime.kernel.get_http_client().cookies
+    await core._web_runtime.kernel.get_http_client().aclose()
     install_http_client_for_test(
-        core._collaborators.kernel,
+        core._web_runtime.kernel,
         httpx.AsyncClient(
             cookies=prior_cookies,
             transport=transport,
@@ -113,7 +114,7 @@ async def test_harness_100_way_fanout_records_peak_inflight(
     try:
         start = time.perf_counter()
         results = await asyncio.gather(
-            *[core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, []) for _ in range(100)]
+            *[core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, []) for _ in range(100)]
         )
         elapsed = time.perf_counter() - start
     finally:

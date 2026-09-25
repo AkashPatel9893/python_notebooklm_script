@@ -20,71 +20,21 @@ from types import ModuleType
 
 import pytest
 
+from tests._baselines.registry import (
+    BASELINES,
+    UNGATED_PUBLIC_MODULES,
+    Baseline,
+    allowlist_extra_public_names,
+    baseline_by_name,
+)
+
+# The documented public import manifest (stability spec) lives in a shared
+# ``_``-prefixed module because ``test_public_surface.py`` cross-checks
+# ``notebooklm.auth.__all__`` against it, and one ``test_*`` module may not import
+# another (tests/_guardrails/test_no_cross_test_imports.py).
+from tests._guardrails._public_import_manifest import _DOCUMENTED_PUBLIC_IMPORTS
+
 pytestmark = pytest.mark.repo_lint
-
-# ---------------------------------------------------------------------------
-# Documented public import manifest (stability spec)
-#
-# This is the public import surface documented in the user-facing API docs.
-# Keep this manifest explicit: if docs add a new supported import path, add it
-# here in the same PR; if docs intentionally remove one, remove it here with
-# the docs change.
-# ---------------------------------------------------------------------------
-
-
-_DOCUMENTED_PUBLIC_IMPORTS = {
-    "notebooklm": [
-        "ArtifactType",
-        "AudioFormat",
-        "AudioLength",
-        "AuthTokens",
-        "ChatGoal",
-        "ChatResponseLength",
-        "ConnectionLimits",
-        "correlation_id",
-        "ExportType",
-        "NonIdempotentRetryError",
-        "NotebookLMClient",
-        "QuizDifficulty",
-        "QuizQuantity",
-        "ReportFormat",
-        "RPCError",
-        "SharePermission",
-        "ShareViewLevel",
-        "SourceType",
-        "VideoFormat",
-        "VideoStyle",
-    ],
-    "notebooklm.auth": [
-        "AuthTokens",
-        "convert_rookiepy_cookies_to_storage_state",
-        "OPTIONAL_COOKIE_DOMAINS",
-        "OPTIONAL_COOKIE_DOMAINS_BY_LABEL",
-        "REQUIRED_COOKIE_DOMAINS",
-    ],
-    "notebooklm.config": [
-        "DEFAULT_BASE_URL",
-        "get_base_url",
-    ],
-    "notebooklm.log": [
-        "install_redaction",
-    ],
-    "notebooklm.research": [
-        "extract_report_urls",
-        "normalize_url",
-        "select_cited_sources",
-    ],
-    "notebooklm.rpc": [
-        "RPCMethod",
-    ],
-    "notebooklm.types": [
-        "ConnectionLimits",
-    ],
-    "notebooklm.urls": [
-        "is_google_auth_redirect",
-        "is_youtube_url",
-    ],
-}
 
 
 @pytest.mark.parametrize(
@@ -123,9 +73,12 @@ def test_public_facade_imports_are_identity_reexports() -> None:
     """Compatibility facades must keep returning the canonical public objects."""
     import notebooklm
     import notebooklm._auth.tokens as private_tokens
+    import notebooklm._web.wire.decoder as wire_decoder
+    import notebooklm._web.wire.encoder as wire_encoder
+    import notebooklm._web.wire.overrides as wire_overrides
+    import notebooklm._web.wire.safe_index as wire_safe_index
     import notebooklm.auth as public_auth
     import notebooklm.rpc as public_rpc
-    import notebooklm.rpc.overrides as rpc_overrides
     import notebooklm.rpc.types as rpc_types
     import notebooklm.types as public_types
 
@@ -133,7 +86,114 @@ def test_public_facade_imports_are_identity_reexports() -> None:
     assert public_auth.AuthTokens is private_tokens.AuthTokens
     assert notebooklm.ConnectionLimits is public_types.ConnectionLimits
     assert public_rpc.RPCMethod is rpc_types.RPCMethod
-    assert public_rpc.resolve_rpc_id is rpc_overrides.resolve_rpc_id
+    assert public_rpc.resolve_rpc_id is wire_overrides.resolve_rpc_id
+    assert rpc_types.resolve_rpc_id is wire_overrides.resolve_rpc_id
+    assert public_rpc.decode_response is wire_decoder.decode_response
+    assert public_rpc.encode_rpc_request is wire_encoder.encode_rpc_request
+    assert public_rpc.safe_index is wire_safe_index.safe_index
+
+
+# The names de-blessed from ``notebooklm.rpc.__all__`` in #1589. They were
+# removed from ``__all__`` (so the compat gate no longer advertises them) but
+# remain importable as module attributes for back-compat — see
+# ``scripts/api-compat-allowlist.json`` and ``docs/deprecations.md``.
+_RPC_LEGACY_REEXPORTS = [
+    # batchexecute endpoint URL constants + helpers
+    "BATCHEXECUTE_URL",
+    "QUERY_URL",
+    "UPLOAD_URL",
+    "get_batchexecute_url",
+    "get_query_url",
+    "get_upload_url",
+    # artifact-variant constants
+    "FLASHCARDS_VARIANT",
+    "QUIZ_VARIANT",
+    "INTERACTIVE_MIND_MAP_VARIANT",
+    # artifact type-code + status helpers
+    "ArtifactTypeCode",
+    "ArtifactStatus",
+    "artifact_status_to_str",
+    # enum re-exports (also public via notebooklm / notebooklm.types)
+    "AudioFormat",
+    "AudioLength",
+    "VideoFormat",
+    "VideoStyle",
+    "QuizQuantity",
+    "QuizDifficulty",
+    "InfographicOrientation",
+    "InfographicDetail",
+    "InfographicStyle",
+    "SlideDeckFormat",
+    "SlideDeckLength",
+    "ReportFormat",
+    "ChatGoal",
+    "ChatResponseLength",
+    "DriveMimeType",
+    "ExportType",
+    # batchexecute wire helpers
+    "encode_rpc_request",
+    "build_request_body",
+    "nest_source_ids",
+    "strip_anti_xssi",
+    "parse_chunked_response",
+    "extract_rpc_result",
+    "collect_rpc_ids",
+    "decode_response",
+    "safe_index",
+    # exception re-exports (also public via notebooklm / notebooklm.exceptions)
+    "RPCError",
+    "AuthError",
+    "NetworkError",
+    "RPCTimeoutError",
+    "RateLimitError",
+    "ServerError",
+    "ClientError",
+    "UnknownRPCMethodError",
+    # error-code utilities
+    "RPCErrorCode",
+    "get_error_message_for_code",
+]
+
+
+def test_rpc_all_is_minimized_to_documented_power_user_imports() -> None:
+    """``notebooklm.rpc.__all__`` stays frozen to the two blessed imports (#1589).
+
+    Catches a name being re-blessed into ``__all__`` directly (the compat audit
+    only catches this indirectly, via a now-stale allowlist entry).
+    """
+    import notebooklm.rpc as public_rpc
+
+    assert public_rpc.__all__ == ["RPCMethod", "resolve_rpc_id"]
+
+
+def test_rpc_has_no_deep_wire_compatibility_modules() -> None:
+    """The implementation move must not leave duplicate module state behind."""
+    rpc_dir = Path(__file__).parents[2] / "src" / "notebooklm" / "rpc"
+    former_modules = ("decoder", "encoder", "overrides", "_safe_index")
+
+    assert [name for name in former_modules if (rpc_dir / f"{name}.py").exists()] == []
+    assert [
+        name
+        for name in former_modules
+        if importlib.util.find_spec(f"notebooklm.rpc.{name}") is not None
+    ] == []
+
+
+def test_rpc_legacy_reexports_stay_importable_but_unblessed() -> None:
+    """The de-blessed RPC names remain importable as attributes (back-compat),
+    while staying out of ``__all__``. Freezes the promise made in #1589 that this
+    is a de-advertisement, not a removal — no existing gate covers importability.
+    """
+    import notebooklm.rpc as public_rpc
+
+    assert len(_RPC_LEGACY_REEXPORTS) == 47
+    assert len(_RPC_LEGACY_REEXPORTS) == len(set(_RPC_LEGACY_REEXPORTS)), (
+        "_RPC_LEGACY_REEXPORTS must not contain duplicate names (a dup could mask a drop)"
+    )
+    missing = [name for name in _RPC_LEGACY_REEXPORTS if not hasattr(public_rpc, name)]
+    assert missing == [], f"de-blessed names must stay importable from notebooklm.rpc: {missing}"
+    re_blessed = [name for name in _RPC_LEGACY_REEXPORTS if name in public_rpc.__all__]
+    assert re_blessed == [], f"de-blessed names must not return to __all__: {re_blessed}"
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +223,14 @@ def test_cited_source_selection_is_on_public_surface():
 
 
 # ---------------------------------------------------------------------------
-# RPC enums re-exported via notebooklm.types
+# Domain enums re-exported via notebooklm.types
 #
 # CLI modules import these enums from ``notebooklm.types`` (the public surface)
 # rather than reaching into ``notebooklm.rpc`` directly. The re-exports must be
-# the exact same objects as the canonical definitions in ``notebooklm.rpc.types``
+# the exact same objects as the compatibility exports in ``notebooklm.rpc.types``
 # (identity, not just equality), so isinstance checks and equality both work
-# regardless of which import path callers use.
+# regardless of which import path callers use. Their canonical definitions live
+# in ``notebooklm._types.enums`` and are checked separately below.
 #
 # The explicit list below covers every public RPC enum re-exported by
 # ``notebooklm.types`` (see ``notebooklm.types.__all__``). Keep this list in
@@ -186,11 +247,14 @@ _REEXPORTED_RPC_ENUMS = [
     "AudioLength",
     "ChatGoal",
     "ChatResponseLength",
+    "DiscoveryMode",
     "DriveMimeType",
+    "DriveSourceStatus",
     "ExportType",
     "InfographicDetail",
     "InfographicOrientation",
     "InfographicStyle",
+    "MagicArtifactType",
     "QuizDifficulty",
     "QuizQuantity",
     "ReportFormat",
@@ -204,87 +268,27 @@ _REEXPORTED_RPC_ENUMS = [
     "VideoStyle",
 ]
 
-_FROZEN_TYPES_ALL = [
-    "CitedSourceSelection",
-    "ConnectionLimits",
-    "ClientMetricsSnapshot",
-    "RpcTelemetryEvent",
-    "Notebook",
-    "NotebookDescription",
-    "NotebookMetadata",
-    "SuggestedTopic",
-    "Source",
-    "SourceFulltext",
-    "SourceSummary",
-    "Artifact",
-    "GenerationState",
-    "GenerationStatus",
-    "ReportSuggestion",
-    "Note",
-    "Label",
-    "ConversationTurn",
-    "ChatReference",
-    "AskResult",
-    "ChatMode",
-    "SharedUser",
-    "ShareStatus",
-    # Research / mind-map / source-guide typed returns (issue #1209).
-    "ResearchStatus",
-    "ResearchSource",
-    "ResearchTask",
-    "ResearchStart",
-    "MindMap",
-    "MindMapKind",
-    "MindMapResult",
-    "SourceGuide",
-    "SourceError",
-    "SourceAddError",
-    "SourceProcessingError",
-    "SourceTimeoutError",
-    "SourceNotFoundError",
-    "ArtifactError",
-    "ArtifactFeatureUnavailableError",
-    "ArtifactNotFoundError",
-    "ArtifactNotReadyError",
-    "ArtifactParseError",
-    "ArtifactDownloadError",
-    "ArtifactTimeoutError",
-    "ArtifactPendingTimeoutError",
-    "ArtifactInProgressTimeoutError",
-    "LabelError",
-    "LabelNotFoundError",
-    "UnknownTypeWarning",
-    "SourceType",
-    "ArtifactType",
-    "ArtifactStatus",
-    "AudioFormat",
-    "AudioLength",
-    "VideoFormat",
-    "VideoStyle",
-    "QuizQuantity",
-    "QuizDifficulty",
-    "InfographicOrientation",
-    "InfographicDetail",
-    "InfographicStyle",
-    "SlideDeckFormat",
-    "SlideDeckLength",
-    "ReportFormat",
-    "ChatGoal",
-    "ChatResponseLength",
-    "DriveMimeType",
-    "ExportType",
-    "SourceStatus",
-    "ShareAccess",
-    "ShareViewLevel",
-    "SharePermission",
-    "artifact_status_to_str",
-    "source_status_to_str",
-]
+# Exact A1 inventory: these enums are canonically defined in the neutral
+# ``_types.enums`` module and remain available through both compatibility
+# facades. The two internal names are module attributes on ``notebooklm.types``
+# but intentionally absent from its ``__all__``.
+_NEUTRAL_DOMAIN_ENUMS = [*_REEXPORTED_RPC_ENUMS, "ArtifactTypeCode", "GrpcStatusCode"]
+
+# NOTE: the former hand-typed ``_FROZEN_TYPES_ALL`` snapshot of
+# ``notebooklm.types.__all__`` is gone — it is now the regenerable ``types_all``
+# baseline (``tests/fixtures/baselines/types_all.json``, derived by the
+# ``types_all`` :class:`~tests._baselines.registry.Baseline`). The freeze test is
+# ``test_baseline_matches_committed_file[types_all]`` plus the per-name
+# ``hasattr`` check in ``test_types_all_contract_is_frozen_in_order`` below.
 
 _TOP_LEVEL_TYPE_EXPORTS = [
     "AccountLimits",
-    "AccountTier",
     "Artifact",
+    "ArtifactListing",
+    "ArtifactListingComponent",
+    "ArtifactListingFailure",
+    "ArtifactLookup",
+    "ArtifactLookupStatus",
     "ArtifactType",
     "AskResult",
     "AudioFormat",
@@ -293,10 +297,14 @@ _TOP_LEVEL_TYPE_EXPORTS = [
     "ChatMode",
     "ChatReference",
     "ChatResponseLength",
+    "ChatSession",
     "CitedSourceSelection",
     "ClientMetricsSnapshot",
+    "Collection",
     "ConnectionLimits",
     "ConversationTurn",
+    "ConversationTurnKey",
+    "DiscoveryMode",
     "DriveMimeType",
     "ExportType",
     "GenerationState",
@@ -305,11 +313,14 @@ _TOP_LEVEL_TYPE_EXPORTS = [
     "InfographicOrientation",
     "InfographicStyle",
     "Label",
+    "MagicArtifactType",
     "MindMapResult",
     "Note",
     "Notebook",
     "NotebookDescription",
     "NotebookMetadata",
+    "NextStepSuggestion",
+    "PremiumFeatureInfo",
     "QuizDifficulty",
     "QuizQuantity",
     "ReportFormat",
@@ -328,6 +339,7 @@ _TOP_LEVEL_TYPE_EXPORTS = [
     "SlideDeckLength",
     "Source",
     "SourceFulltext",
+    "RelevantChunk",
     "SourceGuide",
     "SourceStatus",
     "SourceSummary",
@@ -355,6 +367,8 @@ _TYPES_EXCEPTION_REEXPORTS = [
     "ArtifactInProgressTimeoutError",
     "LabelError",
     "LabelNotFoundError",
+    "CollectionError",
+    "CollectionNotFoundError",
 ]
 
 _TOP_LEVEL_EXCEPTION_EXPORTS = [
@@ -373,12 +387,15 @@ _TOP_LEVEL_EXCEPTION_EXPORTS = [
     "ChatError",
     "ChatResponseParseError",
     "ClientError",
+    "CollectionError",
+    "CollectionNotFoundError",
     "ConfigurationError",
     "DecodingError",
     "LabelError",
     "LabelNotFoundError",
     "MindMapError",
     "MindMapNotFoundError",
+    "MissingDependencyError",
     "NetworkError",
     "NonIdempotentRetryError",
     "NotFoundError",
@@ -388,25 +405,33 @@ _TOP_LEVEL_EXCEPTION_EXPORTS = [
     "NotebookLimitError",
     "NotebookLMError",
     "NotebookNotFoundError",
+    "OperationTimeoutError",
     "RateLimitError",
     "ResearchError",
+    "ResearchStartUnavailableError",
     "ResearchTaskMismatchError",
     "ResearchTimeoutError",
     "RPCError",
     "RPCResponseTooLargeError",
     "RPCTimeoutError",
     "ServerError",
+    "PlayBookNotExportableError",
     "SourceAddError",
     "SourceError",
     "SourceNotFoundError",
     "SourceProcessingError",
     "SourceTimeoutError",
     "UnknownRPCMethodError",
+    "UnsupportedOperationError",
     "ValidationError",
     "WaitTimeoutError",
 ]
 
 _TYPES_PRIVATE_HELPER_SEAMS = [
+    # Routed through the facade for ``_app.source_add``'s path heuristic: the
+    # ``_app`` boundary lint forbids importing the private ``_types`` sibling
+    # that declares it (#2202).
+    "_PATH_SHAPED_FILE_EXTENSIONS",
     "_SOURCE_TYPE_COMPAT_MAP",
     "_datetime_from_timestamp",
     "_extract_artifact_url",
@@ -423,9 +448,9 @@ _TYPES_PRIVATE_HELPER_SEAMS = [
 # Private helpers that are no longer imported by first-party code but
 # must remain exportable through ``notebooklm.types`` for downstream
 # compatibility. ``_extract_source_created_at`` moved here when the
-# row-adapter migration (see ``_row_adapters.sources.SourceRow.created_at``)
+# row-adapter migration (see ``_web.rows.sources.SourceRow.created_at``)
 # replaced its sole first-party consumer
-# (``_source.listing._parse_source``).
+# (``_web.sources.listing._parse_source``).
 _TYPES_PRIVATE_EXTERNAL_COMPAT_SEAMS: list[str] = [
     "_extract_source_created_at",
 ]
@@ -465,12 +490,47 @@ def test_rpc_enum_reexports_are_identical(enum_name: str) -> None:
     )
 
 
-def test_types_all_contract_is_frozen_in_order() -> None:
-    """T13 type moves must preserve the exact public types.__all__ ordering."""
+@pytest.mark.parametrize("enum_name", _NEUTRAL_DOMAIN_ENUMS)
+def test_domain_enum_compatibility_paths_are_identical(enum_name: str) -> None:
+    """All 26 domain enums resolve to their canonical neutral definitions."""
+    import notebooklm._types.enums as canonical_enums
+    import notebooklm.rpc.types as rpc_types
     import notebooklm.types as public_types
 
-    assert list(public_types.__all__) == _FROZEN_TYPES_ALL
-    for name in _FROZEN_TYPES_ALL:
+    canonical_enum = getattr(canonical_enums, enum_name)
+    assert getattr(public_types, enum_name) is canonical_enum
+    assert getattr(rpc_types, enum_name) is canonical_enum
+
+
+def test_neutral_domain_enum_manifest_is_complete() -> None:
+    """The A1 manifest covers exactly the 26 enums defined in the neutral module."""
+    import notebooklm._types.enums as canonical_enums
+
+    defined = {
+        name
+        for name, value in vars(canonical_enums).items()
+        if isinstance(value, type)
+        and value.__module__ == canonical_enums.__name__
+        and issubclass(value, enum.Enum)
+    }
+    assert len(_NEUTRAL_DOMAIN_ENUMS) == 26
+    assert len(set(_NEUTRAL_DOMAIN_ENUMS)) == 26
+    assert set(_NEUTRAL_DOMAIN_ENUMS) == defined
+
+
+def test_types_all_contract_is_frozen_in_order() -> None:
+    """T13 type moves must preserve the exact public ``types.__all__`` ordering.
+
+    The frozen ordering itself is the regenerable ``types_all`` baseline
+    (asserted by ``test_baseline_matches_committed_file[types_all]``). This test
+    keeps the per-name ``hasattr`` intent: every name in the committed order must
+    resolve on ``notebooklm.types``.
+    """
+    import notebooklm.types as public_types
+
+    committed = baseline_by_name("types_all").load()
+    assert list(public_types.__all__) == committed
+    for name in committed:
         assert hasattr(public_types, name), f"notebooklm.types.__all__ misses {name!r}"
 
 
@@ -526,6 +586,8 @@ def test_rpc_helper_reexports_are_canonical_identities() -> None:
 
     assert public_types.artifact_status_to_str is rpc_types.artifact_status_to_str
     assert public_types.source_status_to_str is rpc_types.source_status_to_str
+    assert public_types.share_permission_to_str is rpc_types.share_permission_to_str
+    assert public_types.drive_source_status_to_str is rpc_types.drive_source_status_to_str
 
 
 def test_types_non_all_facade_attributes_are_frozen() -> None:
@@ -678,7 +740,7 @@ def test_config_shim_exposes_documented_names(monkeypatch):
     from notebooklm import config
 
     assert config.get_base_url() == config.DEFAULT_BASE_URL
-    assert config.DEFAULT_BASE_URL == "https://notebooklm.google.com"
+    assert config.DEFAULT_BASE_URL == "https://notebook.google.com"
 
 
 def test_urls_shim_exposes_documented_names():
@@ -745,6 +807,13 @@ def test_auth_cookie_domain_constants_are_facade_exports() -> None:
 # ---------------------------------------------------------------------------
 
 
+# NOTE: 22 of the 23 names de-blessed from ``auth.__all__`` in PR-1 (#1592) were
+# removed from this manifest as a deliberate change (the docstring above sanctions
+# removal via a dedicated plan); the 23rd, ``recover_psidts_in_memory``, was never
+# in this list. First-party code now imports the de-blessed names from
+# ``notebooklm._auth.<sub>``; they stay importable from ``notebooklm.auth`` for
+# back-compat, guarded by ``test_auth_deblessed_names_stay_importable_but_unblessed``
+# in ``tests/_guardrails/test_public_surface.py``.
 _AUTH_FIRST_PARTY_COMPATIBILITY_NAMES = [
     "_auth_domain_priority",
     "_EXTRACTION_HINT",
@@ -760,45 +829,23 @@ _AUTH_FIRST_PARTY_COMPATIBILITY_NAMES = [
     "_update_cookie_input",
     "_validate_required_cookies",
     "Account",
-    "advance_cookie_snapshot_after_save",
-    "ALLOWED_COOKIE_DOMAINS",
-    "authuser_query",
     "AuthTokens",
     "build_cookie_jar",
     "build_httpx_cookies_from_storage",
     "clear_account_metadata",
     "convert_rookiepy_cookies_to_storage_state",
-    "CookieSaveResult",
-    "CookieSnapshot",
-    "CookieSnapshotKey",
-    "CookieSnapshotValue",
     "enumerate_accounts",
     "extract_cookies_from_storage",
     "extract_cookies_with_domains",
-    "extract_csrf_from_html",
     "extract_email_from_html",
-    "extract_session_id_from_html",
-    "extract_wiz_field",
-    "fetch_tokens",
     "fetch_tokens_with_domains",
-    "format_authuser_value",
     "get_account_email_for_storage",
     "get_authuser_for_storage",
     "GOOGLE_REGIONAL_CCTLDS",
-    "KEEPALIVE_ROTATE_URL",
-    "load_auth_from_storage",
-    "load_httpx_cookies",
-    "MINIMUM_REQUIRED_COOKIES",
-    "normalize_cookie_map",
-    "NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV",
-    "NOTEBOOKLM_REFRESH_CMD_ENV",
-    "NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV",
     "OPTIONAL_COOKIE_DOMAINS",
     "OPTIONAL_COOKIE_DOMAINS_BY_LABEL",
     "read_account_metadata",
     "REQUIRED_COOKIE_DOMAINS",
-    "save_cookies_to_storage",
-    "snapshot_cookie_jar",
     "write_account_metadata",
 ]
 
@@ -829,6 +876,7 @@ def test_auth_cookie_policy_facade_delegates_to_private_module() -> None:
     assert auth.ALLOWED_COOKIE_DOMAINS is cookie_policy.ALLOWED_COOKIE_DOMAINS
     assert auth.GOOGLE_REGIONAL_CCTLDS is cookie_policy.GOOGLE_REGIONAL_CCTLDS
     assert auth.MINIMUM_REQUIRED_COOKIES is cookie_policy.MINIMUM_REQUIRED_COOKIES
+    assert auth.app_host_scope_note is cookie_policy.app_host_scope_note
     assert auth._auth_domain_priority is cookie_policy._auth_domain_priority
     assert auth._is_google_domain is cookie_policy._is_google_domain
     assert auth._is_allowed_auth_domain is cookie_policy._is_allowed_auth_domain
@@ -866,9 +914,13 @@ def test_auth_paths_facade_delegates_to_private_module() -> None:
     import notebooklm.auth as auth
     from notebooklm._auth import paths
 
-    # Public-surface env-var names (listed in notebooklm.auth.__all__).
+    # Env-var names de-blessed from notebooklm.auth.__all__ in #1592; kept
+    # importable via the facade.
     assert auth.NOTEBOOKLM_REFRESH_CMD_ENV == paths.NOTEBOOKLM_REFRESH_CMD_ENV
     assert auth.NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV == paths.NOTEBOOKLM_REFRESH_CMD_USE_SHELL_ENV
+    # Mid-session rung + captured-output opt-in env names (c-PR4).
+    assert auth.NOTEBOOKLM_REFRESH_CMD_MIDSESSION_ENV == paths.NOTEBOOKLM_REFRESH_CMD_MIDSESSION_ENV
+    assert auth.NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT_ENV == paths.NOTEBOOKLM_REFRESH_CMD_LOG_OUTPUT_ENV
     assert auth.NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV == paths.NOTEBOOKLM_DISABLE_KEEPALIVE_POKE_ENV
     # White-box affordances.
     assert auth._REFRESH_ATTEMPTED_ENV == paths._REFRESH_ATTEMPTED_ENV
@@ -881,7 +933,8 @@ def test_auth_extraction_facade_delegates_to_private_module() -> None:
     import notebooklm.auth as auth
     from notebooklm._auth import extraction
 
-    # Public-surface (listed in notebooklm.auth.__all__).
+    # WIZ extractors de-blessed from notebooklm.auth.__all__ in #1592; kept
+    # importable via the facade.
     assert auth.extract_csrf_from_html is extraction.extract_csrf_from_html
     assert auth.extract_session_id_from_html is extraction.extract_session_id_from_html
     assert auth.extract_wiz_field is extraction.extract_wiz_field
@@ -904,26 +957,70 @@ def test_auth_extract_email_from_html_still_routed_via_account_module() -> None:
     assert not hasattr(extraction, "extract_email_from_html")
 
 
-def test_auth_headers_facade_delegates_to_private_module() -> None:
-    """``_resolve_token_route_kwargs`` lives in ``_auth.headers`` but stays
-    reachable through ``notebooklm.auth`` for internal callers and tests."""
+def test_auth_token_route_resolver_facade_delegates_to_private_module() -> None:
+    """``_resolve_token_route_kwargs`` stays reachable through ``notebooklm.auth``.
+
+    Rewritten by ADR-0033's ``headers.py`` fold. The helper used to live in
+    ``_auth/headers.py`` — a 68-line module holding exactly this one function,
+    whose only three call sites are the token-fetch entry points in
+    ``_auth/refresh.py``. That module is gone and ``refresh.py`` now *defines*
+    the function, so this clause asserts identity against its new owner.
+
+    The two assertions this replaced (``from notebooklm._auth import headers``
+    plus ``hasattr(_auth, "headers")``) are deliberately NOT re-pointed at
+    ``refresh``: module existence is already covered by the seam-module clause
+    below, and re-adding it here would assert the same thing twice. What is
+    load-bearing and kept is the **identity** — ``notebooklm.auth`` must expose
+    the very same function object, because white-box tests and the internal
+    callers resolve it through the facade.
+    """
     import notebooklm.auth as auth
-    from notebooklm._auth import headers
+    from notebooklm._auth import refresh
 
-    assert auth._resolve_token_route_kwargs is headers._resolve_token_route_kwargs
+    assert auth._resolve_token_route_kwargs is refresh._resolve_token_route_kwargs
+    # ...and it is genuinely defined here now, not re-aliased from elsewhere.
+    assert refresh._resolve_token_route_kwargs.__module__ == "notebooklm._auth.refresh"
 
 
-def test_auth_subpackage_init_wires_new_seam_modules() -> None:
-    """The ``_auth`` package re-exports the new seam modules so that
-    ``from notebooklm._auth import extraction`` style imports keep working."""
+def test_auth_seam_modules_are_importable_from_the_subpackage() -> None:
+    """``from notebooklm._auth import <seam>`` keeps working for every seam
+    module, so the facade and the white-box suites can reach their bodies.
+
+    Rewritten in ADR-0033's PR 0.2, which deleted the eager submodule
+    re-exports from ``_auth/__init__.py``. This test previously spelled the
+    contract as ``hasattr(_auth, "paths")`` and justified it as what makes
+    ``from notebooklm._auth import extraction`` work. Both halves were wrong:
+
+    * The import system resolves ``from <package> import <submodule>`` by
+      importing the submodule, with or without a re-export — so the re-export
+      was never what kept these imports working.
+    * ``hasattr`` on the package is satisfied *transitively*: importing any
+      module that itself imports ``notebooklm._auth.paths`` binds ``paths`` as
+      an attribute of the package. Under the full suite the assertions
+      therefore passed no matter what ``__init__`` contained, which is the
+      "guardrail that asserts nothing" failure mode.
+
+    The contract that actually matters — each seam module exists at its
+    canonical dotted path and is reachable by name — is asserted directly via
+    :func:`importlib.import_module`, which is immune to import-order pollution
+    and still fails loudly if a seam module is deleted or renamed without its
+    consumers being migrated.
+    """
+    import importlib
+
     from notebooklm import _auth
 
-    assert hasattr(_auth, "paths")
-    assert hasattr(_auth, "extraction")
-    assert hasattr(_auth, "headers")
-    # Tier-10 PR-B-high additions:
-    assert hasattr(_auth, "keepalive")
-    assert hasattr(_auth, "refresh")
+    # ``headers`` left this set when ADR-0033's fold deleted the module (its one
+    # function now lives in ``refresh``). Shrink-only, per the plan's guardrail
+    # bookkeeping rule — a seam module may leave the set when it is deleted, but
+    # the set never grows.
+    seam_modules = ("extraction", "keepalive", "paths", "refresh", "tokens")
+    for name in seam_modules:
+        module = importlib.import_module(f"notebooklm._auth.{name}")
+        assert module.__name__ == f"notebooklm._auth.{name}"
+        # The ``from notebooklm._auth import <name>`` form must resolve to the
+        # very same module object the dotted path does.
+        assert getattr(_auth, name) is module
 
 
 def test_auth_validation_is_identity_re_export() -> None:
@@ -1121,6 +1218,183 @@ def test_public_top_level_module_declares_all(module_name: str) -> None:
     )
     for name in all_value:
         assert hasattr(module, name), f"{module_name}.__all__ references missing attribute {name!r}"
+
+
+# ---------------------------------------------------------------------------
+# Additions gate (#1592 follow-on): freeze the FULL collected surface of every
+# public module the audit discovers but that has no exact pin yet.
+#
+# The compat audit (scripts/audit_public_api_compat.py::compare_manifests) only
+# flags REMOVED/CHANGED exports vs the last release tag — it never walks
+# current-only names, so a name ADDED to a public ``__all__`` (or a brand-new
+# public module) is invisible and the surface can silently regrow. This snapshot
+# makes every such addition a deliberate, diff-visible, in-PR act.
+#
+# The four modules already exact-pinned elsewhere keep their own gates (NO dedup:
+# ``EXPECTED_AUTH_ALL`` is also load-bearing for the auth snapshot test, and the
+# no-cross-test-import guard forbids importing those lists into this module):
+#   notebooklm.auth   -> EXPECTED_AUTH_ALL                       (test_public_surface.py)
+#   notebooklm.client -> EXPECTED_CLIENT_ALL                     (test_public_surface.py)
+#   notebooklm.rpc    -> test_rpc_all_is_minimized_to_documented_power_user_imports
+#   notebooklm.types  -> ``types_all`` regenerable baseline (tests/_baselines)
+#
+# The ordered collected surface of each ungated module is now the regenerable
+# ``ungated_surface`` baseline (``tests/fixtures/baselines/ungated_surface.json``).
+# ``collect_public_surface`` (the derive helper) and the module set
+# (``UNGATED_PUBLIC_MODULES``) both live in ``tests._baselines.registry`` so the
+# gate and the regen path derive identically. The freeze test is
+# ``test_baseline_matches_committed_file[ungated_surface]``.
+# ---------------------------------------------------------------------------
+
+_EXACT_PINNED_ELSEWHERE = {
+    "notebooklm.auth",
+    "notebooklm.client",
+    "notebooklm.rpc",
+    "notebooklm.types",
+}
+
+
+def test_ungated_public_surface_covers_exactly_the_unpinned_modules() -> None:
+    """Completeness: every audit-discovered public module is addition-gated —
+    either exact-pinned elsewhere (auth/client/rpc/types) or frozen in the
+    ``ungated_surface`` baseline. This fails a BRAND-NEW public module that
+    declares ``__all__`` (which the ``declares_all`` test alone would let pass)
+    until it is added to ``UNGATED_PUBLIC_MODULES`` and the baseline regenerated.
+    """
+    committed_modules = set(baseline_by_name("ungated_surface").load())
+    discovered = set(_PUBLIC_TOP_LEVEL_MODULES)
+    assert discovered == committed_modules | _EXACT_PINNED_ELSEWHERE, (
+        "A public top-level module is neither exact-pinned elsewhere nor frozen in "
+        "the ungated_surface baseline. Add a new public module to "
+        "tests._baselines.registry.UNGATED_PUBLIC_MODULES (or to an existing exact "
+        "pin) and regenerate (`python scripts/regen_baselines.py`) so its additions "
+        "are gated.\n"
+        f"  discovered-not-gated: {sorted(discovered - committed_modules - _EXACT_PINNED_ELSEWHERE)}\n"
+        f"  baselined-not-discovered: {sorted(committed_modules - discovered)}"
+    )
+
+    # The registry's regen seed and the committed baseline keys must agree, so the
+    # parametrized freeze (keyed off the committed file) can't silently skip a
+    # module that ``UNGATED_PUBLIC_MODULES`` intends to gate.
+    assert committed_modules == set(UNGATED_PUBLIC_MODULES), (
+        "ungated_surface baseline keys drifted from UNGATED_PUBLIC_MODULES; "
+        "regenerate the baseline (`python scripts/regen_baselines.py`)."
+    )
+
+    # The 4 exact-pinned modules pin ``__all__`` ONLY; assert no allowlist extra
+    # targets them — an extra would be a *collected* export their ``__all__``-pin
+    # misses and this gate excludes (a latent bypass). If one ever does, add it to
+    # ``UNGATED_PUBLIC_MODULES`` so its collected surface is baselined too.
+    pinned_with_extras = _EXACT_PINNED_ELSEWHERE & set(allowlist_extra_public_names())
+    assert not pinned_with_extras, (
+        f"allowlist extra_public_names target exact-__all__-pinned modules "
+        f"{sorted(pinned_with_extras)} whose pins don't cover extras; add them to "
+        "UNGATED_PUBLIC_MODULES so their collected surface is baselined."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regenerable-baseline freeze (ADR-0022).
+#
+# Every registered :class:`~tests._baselines.registry.Baseline` is frozen here:
+# the committed JSON file must equal ``derive()``. Public-surface snapshots and
+# shrink-only ratchets share the same reviewable regen seam; ratchet growth also
+# requires ``--allow-growth``. Regenerate after an intended change with::
+#
+#     python scripts/regen_baselines.py
+#
+# CI never passes ``--update-baselines``; it only ever diffs (the dev-only-regen
+# invariant). See ADR-0022.
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_registry_is_non_trivial() -> None:
+    """Guard the registry itself: the known baselines must be registered.
+
+    A regression that emptied ``BASELINES`` would make the parametrized freeze
+    below vacuously pass. Pin the stable names so that is caught loudly.
+    """
+    names = {baseline.name for baseline in BASELINES}
+    assert {
+        "auth_import_graph",
+        "auth_facade_patch_sites",
+        "auth_family_patch_scorecard",
+        "auth_patch_sites",
+        "auth_shared_mutations",
+        "backend_runtime_coupling",
+        "backend_static_coupling",
+        "backend_boundary",
+        "browser_import_graph",
+        "browser_patch_sites",
+        "guardrail_inline_literals",
+        "module_size",
+        "storage_transaction_policy",
+        "types_all",
+        "ungated_surface",
+        "cli_contract",
+    } <= names, names
+    # Names are unique (parametrize ids + lookup rely on it).
+    assert len(names) == len(BASELINES)
+
+
+@pytest.mark.parametrize(
+    "baseline",
+    [
+        pytest.param(
+            baseline,
+            marks=(
+                pytest.mark.timeout(360)
+                if baseline.name in {"auth_family_patch_scorecard", "backend_runtime_coupling"}
+                else pytest.mark.timeout(180)
+                if baseline.name
+                in {
+                    "auth_patch_sites",
+                    "auth_shared_mutations",
+                    "browser_patch_sites",
+                    "auth_facade_patch_sites",
+                }
+                else ()
+            ),
+        )
+        for baseline in BASELINES
+    ],
+    ids=lambda b: b.name,
+)
+def test_baseline_matches_committed_file(
+    baseline: Baseline,
+    update_baselines: bool,
+    allow_baseline_growth: bool,
+) -> None:
+    """The committed baseline JSON must equal ``derive()`` (CI-mode assertion).
+
+    With ``--update-baselines`` (dev only — see ``tests/conftest.py``), the
+    ``update_baselines`` fixture is ``True`` and the test instead REWRITES the
+    committed file from ``derive()`` and passes. CI must never set the flag.
+    """
+    if update_baselines:
+        baseline.write(allow_growth=allow_baseline_growth)
+        return
+
+    assert baseline.path.is_file(), (
+        f"committed baseline {baseline.path} is missing — regenerate with "
+        "`python scripts/regen_baselines.py`"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        derived = baseline.derive()
+    committed = baseline.load()
+    assert derived == committed, (
+        f"{baseline.name} baseline ({baseline.path.name}) is stale. If the change "
+        "is intentional, regenerate it in this PR (`python scripts/regen_baselines.py`) "
+        "— that diff is the deliberate acknowledgement."
+    )
+    # The committed bytes must be exactly what ``write()`` would emit, so a
+    # regen is a no-op on a fresh checkout (idempotency) and hand-edits that
+    # happen to parse-equal but differ in formatting are caught.
+    assert baseline.dump(committed) == baseline.path.read_text(encoding="utf-8"), (
+        f"{baseline.name} baseline is not in canonical serialized form; "
+        "regenerate it (`python scripts/regen_baselines.py`)."
+    )
 
 
 # ---------------------------------------------------------------------------

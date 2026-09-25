@@ -27,8 +27,8 @@ from notebooklm._artifact.polling import ArtifactPollingService
 from notebooklm._types.artifacts import _status_from_code
 from notebooklm.cli.error_handler import _generation_status_extra
 from notebooklm.exceptions import ArtifactTimeoutError
-from notebooklm.rpc.types import _ARTIFACT_STATUS_MAP, ArtifactStatus
-from notebooklm.types import GenerationState, GenerationStatus
+from notebooklm.rpc.types import _ARTIFACT_STATUS_MAP, ArtifactStatus, ArtifactTypeCode
+from notebooklm.types import Artifact, GenerationState, GenerationStatus
 
 # ---------------------------------------------------------------------------
 # Export surface + module identity
@@ -207,6 +207,128 @@ def test_status_from_code_covers_every_mapped_code():
         assert result.value == expected
 
 
+def test_status_from_code_pins_every_backend_artifact_status_code():
+    """#2127: each backend ``ArtifactStatus`` code maps to its own state.
+
+    Codes 1/2 were transposed and 0/5/6 were unmodelled (all three collapsed
+    into ``UNKNOWN``). Pin the whole table so a future transposition or a
+    silently-dropped member fails here.
+    """
+    assert {
+        code: _status_from_code(code) for code in (member.value for member in ArtifactStatus)
+    } == {
+        0: GenerationState.UNKNOWN,
+        1: GenerationState.PENDING,
+        2: GenerationState.IN_PROGRESS,
+        3: GenerationState.COMPLETED,
+        4: GenerationState.FAILED,
+        5: GenerationState.SUGGESTED,
+        6: GenerationState.PENDING_REVIEW,
+    }
+
+
+def test_is_terminal_partitions_the_enum_exactly():
+    """``is_terminal`` is the single authority for "generation ended".
+
+    Pinned as an exact partition so a member added later has to be classified
+    deliberately here rather than silently inheriting a default. Everything
+    non-terminal means "keep waiting" — including ``NOT_FOUND``, which is a
+    transport-level absence rather than an outcome.
+    """
+    terminal = {state for state in GenerationState if state.is_terminal}
+    assert terminal == {
+        GenerationState.COMPLETED,
+        GenerationState.FAILED,
+        GenerationState.REMOVED,
+    }
+    assert {state for state in GenerationState if not state.is_terminal} == {
+        GenerationState.PENDING,
+        GenerationState.IN_PROGRESS,
+        GenerationState.NOT_FOUND,
+        GenerationState.UNKNOWN,
+        GenerationState.SUGGESTED,
+        GenerationState.PENDING_REVIEW,
+    }
+
+
+def test_is_terminal_equals_the_is_complete_or_is_failed_predicate_pair():
+    """The enum partition matches the predicate pair ``_run_poll_loop`` stops on.
+
+    Scope note: this compares two derivations, it does not drive the loop —
+    ``_run_poll_loop`` itself returns on ``status.is_complete or
+    status.is_failed`` (legacy ``REMOVED`` is never emitted by ``poll_status``).
+    Pinning the pair keeps the enum partition aligned with the loop condition.
+    """
+    for state in GenerationState:
+        if state is GenerationState.REMOVED:
+            continue  # legacy compatibility value; no longer emitted
+        status = GenerationStatus(task_id="t", status=state)
+        assert state.is_terminal == (status.is_complete or status.is_failed), state
+
+
+def test_generation_status_is_terminal_matches_the_enum_for_every_state():
+    """The dataclass predicate agrees with the enum for all nine states."""
+    for state in GenerationState:
+        assert GenerationStatus(task_id="t", status=state).is_terminal == state.is_terminal, state
+
+
+def test_generation_status_is_terminal_works_on_a_plain_string_status():
+    """``GenerationStatus.status`` is documented raw-string-permissive.
+
+    ``is_terminal`` is the only predicate on this dataclass that resolves by
+    *hashing* (``in`` against a frozenset) rather than by ``==`` alone, so the
+    plain-string path needs its own pin — every sibling predicate would keep
+    working even if this one silently stopped.
+    """
+    assert GenerationStatus(task_id="t", status="completed").is_terminal is True
+    assert GenerationStatus(task_id="t", status="failed").is_terminal is True
+    assert GenerationStatus(task_id="t", status="removed").is_terminal is True
+    assert GenerationStatus(task_id="t", status="pending").is_terminal is False
+    assert GenerationStatus(task_id="t", status="in_progress").is_terminal is False
+    # An unmodelled string is not terminal either — it must not crash the branch.
+    assert GenerationStatus(task_id="t", status="some_future_status").is_terminal is False
+
+
+def test_generation_state_hashes_as_its_value_not_its_member_name():
+    """The mechanism the plain-string path above rests on, pinned explicitly.
+
+    ``str`` precedes ``Enum`` in ``GenerationState``'s MRO, so ``str.__hash__``
+    wins over ``Enum.__hash__`` (which would hash the *member name*, e.g.
+    ``"COMPLETED"``, and would silently break frozenset lookups by value).
+    Reordering the bases would keep every ``==``-based predicate working and
+    break only the ``in``-based one, so pin the cause, not just the symptom.
+    """
+    assert GenerationState.__mro__[1] is str
+    assert hash(GenerationState.COMPLETED) == hash("completed")
+    assert hash(GenerationState.COMPLETED) != hash("COMPLETED")
+    assert "completed" in frozenset({GenerationState.COMPLETED})
+
+
+def test_generation_outcome_terminality_agrees_with_the_enum():
+    """``_app/generate_retry`` classifies terminality independently — keep it in step.
+
+    It duck-types over ``is_complete`` / ``is_failed`` / ``is_removed`` so it can
+    accept non-``GenerationStatus`` payloads, which means it cannot call
+    ``is_terminal``. This pins that its three-way split still partitions the
+    enum the same way, so the two cannot drift apart silently.
+    """
+    from notebooklm._app.generate_retry import generation_outcome_from_status
+
+    for state in GenerationState:
+        outcome = generation_outcome_from_status(
+            GenerationStatus(task_id="t", status=state), "audio"
+        )
+        assert (outcome.status != "pending") == state.is_terminal, state
+
+
+def test_rare_backend_states_are_distinguishable_from_unknown():
+    """SUGGESTED / PENDING_REVIEW must not collapse into ``UNKNOWN`` (#2127)."""
+    for code in (ArtifactStatus.SUGGESTED, ArtifactStatus.PENDING_REVIEW):
+        assert _status_from_code(code) is not GenerationState.UNKNOWN
+    # ...while a code the backend enum does not define still fails closed.
+    assert _status_from_code(7) is GenerationState.UNKNOWN
+
+
 def test_status_from_code_none_defaults_to_pending():
     assert _status_from_code(None) is GenerationState.PENDING
 
@@ -243,8 +365,8 @@ def test_status_from_code_never_returns_wait_only_states():
 # ---------------------------------------------------------------------------
 
 
-class _StubProvider:
-    """Minimal loop-guard / op-scope stub.
+class _StubSupervisor:
+    """Minimal supervisor stub for direct ``poll_status`` tests.
 
     ``poll_status`` never touches either collaborator, but the constructor
     requires them; a plain class avoids ``MagicMock`` blocking the
@@ -256,12 +378,14 @@ class _StubProvider:
     def assert_bound_loop(self) -> None:
         return None
 
+    def register_drain_hook(self, _name: str, _hook: object) -> None:
+        return None
+
 
 def _make_polling_service() -> ArtifactPollingService:
-    provider = _StubProvider()
+    supervisor = _StubSupervisor()
     return ArtifactPollingService(
-        loop_guard=provider,
-        op_scope=provider,
+        supervisor=supervisor,  # type: ignore[arg-type]
         sleep=AsyncMock(),
         monotonic=lambda: 0.0,
     )
@@ -269,19 +393,21 @@ def _make_polling_service() -> ArtifactPollingService:
 
 async def _poll_with_status_code(code: int | None) -> GenerationStatus:
     service = _make_polling_service()
-    # Minimal LIST_ARTIFACTS row: [id, title, type_code, error, status_code].
-    row = ["task1", "Title", 7, None, code]
+    artifact = Artifact(
+        id="task1",
+        title="Title",
+        _artifact_type=ArtifactTypeCode.INFOGRAPHIC.value,
+        status=code,
+        url="https://example.test/artifact" if code == ArtifactStatus.COMPLETED else None,
+    )
 
-    async def list_raw(_notebook_id: str) -> list:
-        return [row]
+    async def list_studio(_notebook_id: str, _task_id: str) -> list[Artifact]:
+        return [artifact]
 
     return await service.poll_status(
         "nb1",
         "task1",
-        list_raw=list_raw,
-        is_media_ready=lambda *_: True,
-        get_artifact_type_name=lambda _code: "report",
-        extract_artifact_error=lambda _raw: "err",
+        list_studio=list_studio,
     )
 
 
@@ -290,6 +416,55 @@ async def _poll_with_status_code(code: int | None) -> GenerationStatus:
 async def test_poll_status_never_returns_removed(code: int):
     status = await _poll_with_status_code(code)
     assert status.status is not GenerationState.REMOVED
+
+
+@pytest.mark.asyncio
+async def test_poll_status_decoded_failed_artifact_has_no_fabricated_error():
+    """Polling consumes decoded artifacts and never fabricates an error reason."""
+    service = _make_polling_service()
+    artifact = Artifact(
+        id="task1",
+        title="Title",
+        _artifact_type=ArtifactTypeCode.REPORT.value,
+        status=ArtifactStatus.FAILED,
+    )
+
+    async def list_studio(_notebook_id: str, _task_id: str) -> list[Artifact]:
+        return [artifact]
+
+    status = await service.poll_status(
+        "nb1",
+        "task1",
+        list_studio=list_studio,
+    )
+
+    assert status.status is GenerationState.FAILED
+    assert status.error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        (ArtifactStatus.PENDING, GenerationState.PENDING),
+        (ArtifactStatus.PROCESSING, GenerationState.IN_PROGRESS),
+        (ArtifactStatus.SUGGESTED, GenerationState.SUGGESTED),
+        (ArtifactStatus.PENDING_REVIEW, GenerationState.PENDING_REVIEW),
+    ],
+)
+async def test_poll_status_non_terminal_codes_keep_the_loop_waiting(
+    code: int, expected: GenerationState
+):
+    """#2127: the transitional + rare codes surface distinctly and stay non-terminal.
+
+    ``_run_poll_loop`` only stops on ``is_complete``/``is_failed``, so a state
+    that is neither keeps polling — the same behaviour codes 5/6 already had
+    when they decoded as ``"unknown"``.
+    """
+    status = await _poll_with_status_code(code)
+    assert status.status is expected
+    assert not status.is_complete
+    assert not status.is_failed
 
 
 @pytest.mark.asyncio
@@ -302,16 +477,13 @@ async def test_poll_status_completed_code_maps_to_completed():
 async def test_poll_status_missing_artifact_is_not_found_not_removed():
     service = _make_polling_service()
 
-    async def list_raw(_notebook_id: str) -> list:
+    async def list_studio(_notebook_id: str, _task_id: str) -> list[Artifact]:
         return []
 
     status = await service.poll_status(
         "nb1",
         "task1",
-        list_raw=list_raw,
-        is_media_ready=lambda *_: True,
-        get_artifact_type_name=lambda _code: "report",
-        extract_artifact_error=lambda _raw: "err",
+        list_studio=list_studio,
     )
     assert status.status is GenerationState.NOT_FOUND
     assert status.status is not GenerationState.REMOVED
@@ -323,8 +495,8 @@ async def _noop_operation_scope():
 
 
 def _make_parse_api():
-    from _fixtures.fake_core import make_fake_core
-    from notebooklm._artifacts import ArtifactsAPI
+    from notebooklm._web.artifacts import WebArtifactsAPI
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(
         rpc_call=AsyncMock(),
@@ -333,10 +505,9 @@ def _make_parse_api():
     )
     notebooks = MagicMock()
     notebooks.get_source_ids = AsyncMock(return_value=[])
-    return ArtifactsAPI(
+    return WebArtifactsAPI(
         rpc=core,
-        drain=core,
-        lifecycle=core,
+        supervisor=core,
         notebooks=notebooks,
         mind_maps=MagicMock(),
         note_service=MagicMock(),

@@ -1,18 +1,18 @@
 """Source CLI render/validation helpers (extracted from ``source_cmd.py``).
 
-This module holds the pure render and validation helpers used by the
-``source`` command group. They never reference :class:`NotebookLMClient`
-(so they are not patch seams) and are re-exported from ``source_cmd`` to
-preserve the historical ``source_cmd.<helper>`` import/patch surface.
+This module holds client-free render and validation helpers used by the
+``source`` command group. Selected names are re-exported from ``source_cmd``
+to preserve the historical ``source_cmd.<helper>`` import/patch surface, and a
+few wrappers remain explicit test patch points.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
-from rich.markup import render as render_markup
+from rich.markup import escape as escape_markup
 from rich.table import Table
 
 from .._app import source_add as source_add_service
@@ -31,7 +31,7 @@ from .._app.source_wait import (
     SourceWaitReady,
     SourceWaitTimeout,
 )
-from ..types import Source, source_status_to_str
+from ..types import Source, drive_source_status_to_str
 from .error_handler import _output_error, current_json_output, exit_with_code
 from .rendering import (
     cli_print,
@@ -43,22 +43,61 @@ from .rendering import (
     json_output_response,
 )
 from .services.source_mutations import (
+    CliSourceMutationError,
+    SourceAddDriveFileResult,
     SourceAddDriveResult,
     SourceDeleteByTitleResult,
     SourceDeleteResult,
     SourceMutationError,
     SourceRefreshResult,
     SourceRenameResult,
+    source_mutation_error_details,
 )
 from .services.source_research import SourceAddResearchResult
 from .services.source_serializers import (
+    relevant_chunk_payload,
     source_fulltext_payload,
     source_kind_value,
+    source_row_payload,
     source_summary_payload,
 )
 
+if TYPE_CHECKING:
+    from ..types import RelevantChunk
+
 # Compatibility wrappers — tests patch these names on this module. Each
 # one is a one-liner forwarder to the canonical service-layer home.
+
+
+def _render_source_search_result(
+    chunks: list[RelevantChunk],
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    """Render ranked passage search results as JSON or a readable table."""
+    if json_output:
+        json_output_response([relevant_chunk_payload(chunk) for chunk in chunks])
+        return
+
+    if not chunks:
+        cli_print("No relevant passages found.", ctx=ctx)
+        return
+
+    table = Table(title=f"{len(chunks)} relevant passage(s)")
+    table.add_column("Rank", justify="right", no_wrap=True)
+    table.add_column("Source ID", style="cyan", overflow="fold")
+    table.add_column("Span", no_wrap=True)
+    table.add_column("Text", overflow="fold")
+    for chunk in chunks:
+        span = f"{chunk.start}:{chunk.end}" if chunk.start is not None else "-"
+        table.add_row(
+            str(chunk.rank),
+            escape_markup(chunk.source_id),
+            span,
+            escape_markup(chunk.text),
+        )
+    console.print(table)
 
 
 def _looks_like_path(content: str) -> bool:
@@ -66,12 +105,56 @@ def _looks_like_path(content: str) -> bool:
     return source_add_service.looks_like_path(content)
 
 
+def _source_add_validation_message(exc: source_add_service.SourceAddValidationError) -> str:
+    """Render a neutral source-add reason using the established CLI wording."""
+    if exc.reason == "invalid_url":
+        return f"Invalid URL: {exc.url} ({exc.detail})"
+    if exc.reason == "unsupported_url_scheme":
+        return (
+            f"URL scheme {exc.scheme!r} is not allowed; only http and https URLs "
+            f"are accepted as sources. Got: {exc.url}"
+        )
+    if exc.reason == "url_missing_host":
+        return f"URL has no host component: {exc.url}"
+    if exc.reason == "local_host_disallowed":
+        return (
+            f"URL targets the local host {exc.host!r}; pass --allow-internal "
+            f"to override. Got: {exc.url}"
+        )
+    if exc.reason == "internal_ip_disallowed":
+        return (
+            f"URL targets an internal IP address {exc.host}; pass --allow-internal "
+            f"to override. Got: {exc.url}"
+        )
+    if exc.reason == "symlink_disallowed":
+        return (
+            "Path is a symlink; pass --follow-symlinks to follow it explicitly. "
+            f"Refusing to upload: {exc.path}"
+        )
+    if exc.reason == "not_regular_file":
+        return f"Not a regular file: {exc.path}"
+    if exc.reason == "missing_upload_path":
+        return "upload_path must be set when detected_type == 'file'"
+    if exc.reason == "upload_root_not_configured":
+        return "No upload allowed roots are configured; refusing local file add."
+    if exc.reason == "path_outside_allowed_root":
+        return f"Path is outside the allowed upload roots: {exc.path}"
+    if exc.reason == "credential_path_disallowed":
+        return f"Refusing to upload a credential or Playwright profile path: {exc.path}"
+    raise AssertionError(f"Unhandled source-add validation reason: {exc.reason}")
+
+
 def _validate_upload_path(content: str, follow_symlinks: bool) -> Path:
     """Compatibility wrapper for tests patching source-add upload validation."""
     try:
         return source_add_service.validate_upload_path(content, follow_symlinks)
     except source_add_service.SourceAddValidationError as exc:
-        _output_error(f"Error: {exc}", "VALIDATION_ERROR", current_json_output(), 1)
+        _output_error(
+            f"Error: {_source_add_validation_message(exc)}",
+            "VALIDATION_ERROR",
+            current_json_output(),
+            1,
+        )
         raise AssertionError("unreachable") from None  # pragma: no cover
 
 
@@ -107,17 +190,7 @@ def _render_source_get_result(result: SourceGetResult, *, json_output: bool) -> 
         raise AssertionError("unreachable")  # pragma: no cover
 
     if json_output:
-        json_output_response(
-            {
-                "source": {
-                    **source_summary_payload(src),
-                    "status": source_status_to_str(src.status),
-                    "status_id": src.status,
-                    "created_at": (src.created_at.isoformat() if src.created_at else None),
-                },
-                "found": True,
-            }
-        )
+        json_output_response({"source": source_row_payload(src), "found": True})
         return
 
     console.print(f"[bold cyan]Source:[/bold cyan] {src.id}")
@@ -127,6 +200,48 @@ def _render_source_get_result(result: SourceGetResult, *, json_output: bool) -> 
         console.print(f"[bold]URL:[/bold] {src.url}")
     if src.created_at:
         console.print(f"[bold]Created:[/bold] {src.created_at.strftime('%Y-%m-%d %H:%M')}")
+    _print_drive_lines(src)
+
+
+def _print_drive_lines(src: Source) -> None:
+    """Print the Drive-only lines of ``source get`` text output.
+
+    Emitted only for a source that actually carries a Drive claim, so the
+    non-Drive output (the overwhelming majority) is byte-identical to before.
+    ``drive_document_id`` is the sole handle on a Drive source — the backend
+    leaves the URL slots empty, so ``source get`` previously showed no way to
+    tie the row back to its Drive file (#2113). The Drive status line exists
+    because ``Type``/``Created`` say nothing about a file that was deleted or
+    unshared after ingestion completed (#2111).
+
+    The two lines are gated **independently**, and that is load-bearing rather
+    than defensive: the id and the status decode from structurally unrelated
+    wire slots, and the only Drive row this project has captured
+    (``tests/cassettes/web/sources_add_drive.yaml``) carries an id with **no**
+    health slot at all. Gating the id on the status would blank #2113's whole
+    reason for existing on the most common real shape.
+    """
+    if src.drive_document_id is not None:
+        console.print(f"[bold]Drive File ID:[/bold] {src.drive_document_id}")
+    if src.drive_status is None:
+        return
+    drive_label = drive_source_status_to_str(src.drive_status)
+    if src.is_drive_degraded:
+        # Deliberately says nothing about ingestion: the two axes are
+        # independent, so a degraded Drive file can sit on a source that is
+        # still processing or that errored outright. Asserting "ingestion
+        # finished" here would be confidently wrong on those rows.
+        # No "Status above" cross-reference: this text view prints Source /
+        # Title / Type / URL / Created and no ingestion status at all, so
+        # pointing at one would send the reader looking for a line that is not
+        # there. Name the axis instead.
+        console.print(
+            f"[bold]Drive Status:[/bold] [yellow]{drive_label}[/yellow] "
+            "(Drive-side health, not NotebookLM's ingestion status — answers "
+            "grounded on this source may be stale)"
+        )
+    else:
+        console.print(f"[bold]Drive Status:[/bold] {drive_label}")
 
 
 def _available_output_path(path: Path) -> Path:
@@ -390,24 +505,17 @@ def _render_source_stale_result(
         exit_with_code(0)
 
 
-def _handle_source_mutation_error(exc: SourceMutationError, *, json_output: bool) -> NoReturn:
+def _handle_source_mutation_error(
+    exc: SourceMutationError | CliSourceMutationError, *, json_output: bool
+) -> NoReturn:
     """Render a typed source-mutation error through the CLI error contract."""
-    extra = dict(exc.extra) if exc.extra else None
-    hint = None
-    if exc.status_message:
-        plain_status = render_markup(exc.status_message).plain
-        if json_output:
-            extra = extra or {}
-            extra["status_message"] = plain_status
-        else:
-            hint = plain_status
+    message, code, extra = source_mutation_error_details(exc)
     _output_error(
-        exc.message,
-        code=exc.code,
+        message,
+        code=code,
         json_output=json_output,
         exit_code=1,
-        extra=extra,
-        hint=hint,
+        extra=dict(extra) if extra else None,
     )
     raise AssertionError("unreachable")  # pragma: no cover
 
@@ -480,8 +588,11 @@ def _render_source_delete_result(
     json_output: bool,
     ctx: click.Context,
 ) -> None:
-    if result.status_message:
-        emit_status(result.status_message, json_output=json_output)
+    if isinstance(result, SourceDeleteResult) and result.matched_title is not None:
+        emit_status(
+            f"[dim]Matched: {result.source_id[:12]}... ({result.matched_title})[/dim]",
+            json_output=json_output,
+        )
 
     if json_output:
         payload = (
@@ -544,6 +655,76 @@ def source_add_payload(result: SourceAddResult) -> dict[str, Any]:
     return {"source": source_summary_payload(result.source)}
 
 
+def _render_play_books_result(
+    books: list[Any],
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    """Render ``source books`` — the account's Play Books library (#2292)."""
+    from .._app.serialize import play_book_summary
+
+    if json_output:
+        json_output_response(
+            {
+                "play_books": [play_book_summary(b) for b in books],
+                "count": len(books),
+            }
+        )
+        return
+
+    if not books:
+        cli_print("No Google Play Books available to add as sources.", ctx=ctx)
+        return
+
+    table = Table(title=f"{len(books)} Play Book(s)")
+    table.add_column("Content ID", no_wrap=True)
+    table.add_column("Title")
+    table.add_column("Authors")
+    table.add_column("Add?")
+    for book in books:
+        add_cell = (
+            "[green]yes[/green]"
+            if not book.export_disabled
+            else f"[red]no[/red] ({escape_markup(book.reason.value)})"
+            if book.reason is not None
+            else "[red]no[/red]"
+        )
+        # Escape library-supplied strings so a title/author containing
+        # ``[...]`` is not parsed as Rich console markup.
+        table.add_row(
+            escape_markup(book.content_id),
+            escape_markup(book.title or "-"),
+            escape_markup(", ".join(book.authors) or "-"),
+            add_cell,
+        )
+    console.print(table)
+
+
+def _render_source_add_play_book_result(
+    result: Any,
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    """Render ``source add-book`` (#2292)."""
+    if json_output:
+        json_output_response(
+            {
+                "action": "add-book",
+                "source": source_summary_payload(result.source),
+                "content_id": result.content_id,
+                "notebook_id": result.notebook_id,
+            }
+        )
+        return
+
+    # Escape the library-supplied title so a value containing ``[...]`` is not
+    # parsed as Rich console markup.
+    cli_print(f"[green]Added Play Book source:[/green] {result.source.id}", ctx=ctx)
+    cli_print(f"[bold]Title:[/bold] {escape_markup(result.source.title or '-')}", ctx=ctx)
+
+
 def _render_source_add_drive_result(
     result: SourceAddDriveResult,
     *,
@@ -567,6 +748,30 @@ def _render_source_add_drive_result(
         return
 
     cli_print(f"[green]Added Drive source:[/green] {result.source.id}", ctx=ctx)
+    cli_print(f"[bold]Title:[/bold] {result.source.title}", ctx=ctx)
+
+
+def _render_source_add_drive_file_result(
+    result: SourceAddDriveFileResult,
+    *,
+    json_output: bool,
+    ctx: click.Context,
+) -> None:
+    if json_output:
+        # Mirrors the add-drive envelope: the ``source_summary_payload`` serializer
+        # is presentation, so the envelope is built here rather than on the neutral
+        # result. ``document_id`` echoes the raw id/URL the caller passed.
+        json_output_response(
+            {
+                "action": "add-drive-file",
+                "source": source_summary_payload(result.source),
+                "document_id": result.document_id,
+                "notebook_id": result.notebook_id,
+            }
+        )
+        return
+
+    cli_print(f"[green]Added Drive file source:[/green] {result.source.id}", ctx=ctx)
     cli_print(f"[bold]Title:[/bold] {result.source.title}", ctx=ctx)
 
 
@@ -630,10 +835,14 @@ def _render_add_research_result(result: SourceAddResearchResult, *, json_output:
                 payload["poll_task_id"] = result.poll_task_id
             json_output_response(payload)
             return
+        # This is THE --no-wait success path, so it names both follow-ups: the
+        # blocking one and the standalone import (#2206). Pointing only at
+        # 'research wait' told a user who just opted out of waiting to go wait.
         console.print(
             "[green]Research started.[/green] "
-            "Run 'notebooklm research wait --import-all' to commit "
-            "sources once it completes, otherwise the NotebookLM web "
+            "Commit its sources once it completes with "
+            "'notebooklm research import' (or 'notebooklm research wait "
+            "--import-all' to block until then), otherwise the NotebookLM web "
             "UI will keep an 'Add sources?' modal open."
         )
         return
@@ -648,10 +857,21 @@ def _render_add_research_result(result: SourceAddResearchResult, *, json_output:
 
     if result.outcome in ("failed", "timeout"):
         message = "Research timed out" if result.outcome == "timeout" else "Research failed"
+        # Explain WHY and what to do next when the poll named a termination
+        # reason — an empty Drive search is not a broken run (issue #1964).
+        extra: dict[str, Any] = {}
+        if result.reason_message:
+            extra["reason_message"] = result.reason_message
+        if result.hint:
+            extra["hint"] = result.hint
         if json_output:
-            _exit_with_add_research_status(result.outcome, message)
+            _exit_with_add_research_status(result.outcome, message, **extra)
         else:
             console.print(f"[red]{message}[/red]")
+            if result.reason_message:
+                console.print(result.reason_message)
+            if result.hint:
+                console.print(f"[dim]{result.hint}[/dim]")
             exit_with_code(1)
         return  # pragma: no cover
 

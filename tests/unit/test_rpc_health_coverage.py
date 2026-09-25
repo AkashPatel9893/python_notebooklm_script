@@ -68,6 +68,9 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
         # Creates a new notebook — only safe inside --full mode against a
         # throwaway notebook (handled by setup_temp_resources).
         "CREATE_NOTEBOOK",
+        # Copies a notebook and its children — a mutating create with no
+        # idempotency token, safe only against an explicitly disposable source.
+        "COPY_NOTEBOOK",
         # Permanently deletes a notebook — only safe in --full cleanup.
         "DELETE_NOTEBOOK",
         # Adds a text/url source to a notebook — write op, --full only.
@@ -89,6 +92,9 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
         # history") — destructive write op, needs a real conversation to
         # delete and is exercised via the e2e suite, not the canary.
         "DELETE_CONVERSATION",
+        # Synchronous discovery: quota-bearing and records a completed job on the
+        # notebook; probed in full mode only, right after START_FAST_RESEARCH.
+        "DISCOVER_SOURCES",
         # Kicks off a fast-research task on the server — long-running write
         # op. Tested via --full setup to verify the RPC ID still echoes.
         "START_FAST_RESEARCH",
@@ -96,6 +102,13 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
         # probed in either quick or full mode (see ALWAYS_SKIP_METHODS in
         # scripts/check_rpc_health.py).
         "START_DEEP_RESEARCH",
+        # Cancels an in-flight research run — write op needing a real run id;
+        # the server returns [] unconditionally (no echo to confirm), so it is
+        # not probed by the canary.
+        "CANCEL_RESEARCH",
+        # Idempotently stops an active chat generation, but needs a real
+        # conversation and is still a write. Covered by adapter tests instead.
+        "CANCEL_GENERATION",
         # AI auto-groups / creates source labels (multi-mode write) — write op,
         # --full only. LIST_LABELS (read) is probed via get_test_params.
         "CREATE_LABEL",
@@ -103,6 +116,13 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
         "UPDATE_LABEL",
         # Batch-deletes labels — write op, --full only.
         "DELETE_LABEL",
+        # #2283 transfer family — every one creates or extends rows (queues
+        # new sources, appends text in place, copies sources / artifacts into a
+        # target notebook); write ops with no read-only probe shape.
+        "ADD_SOURCES_ASYNC",
+        "APPEND_SOURCE",
+        "COPY_SOURCES",
+        "COPY_ARTIFACTS",
     }
 )
 
@@ -115,7 +135,15 @@ MUTATING_SKIP_LIST: frozenset[str] = frozenset(
 PATH_NOT_METHOD_SKIP: frozenset[str] = frozenset()
 
 
-UNAVAILABLE_SKIP_LIST: frozenset[str] = frozenset()
+UNAVAILABLE_SKIP_LIST: frozenset[str] = frozenset(
+    {
+        # Read-only, but account-scoped: ListExpertIntelligenceContent returns a
+        # non-empty payload only for an account that has redeemed Google Play
+        # Books, and is empty (indistinguishable from a transport miss) on the
+        # canary account — so it is not a usable drift probe (#2292).
+        "LIST_EXPERT_INTELLIGENCE_CONTENT",
+    }
+)
 """Reserved for ``RPCMethod`` members that exist but aren't currently
 exercisable by the canary (e.g. unreleased / rolled-back Google features).
 Empty for now; the scaffolding is preserved so a future "exists but cannot
@@ -170,6 +198,14 @@ def test_every_rpc_method_is_probed_or_explicitly_skipped() -> None:
         "expensive op), PATH_NOT_METHOD_SKIP (a URL path), or "
         "UNAVAILABLE_SKIP_LIST (not currently exercisable)."
     )
+
+
+def test_chat_session_status_probe_does_not_require_notebook_id() -> None:
+    """Quick mode still exercises the account-safe placeholder status read."""
+    assert check_rpc_health.get_test_params(RPCMethod.GET_CHAT_SESSION_STATUS, None) == [
+        None,
+        "placeholder_conv_id",
+    ]
 
 
 def test_skip_lists_are_disjoint_from_probed() -> None:

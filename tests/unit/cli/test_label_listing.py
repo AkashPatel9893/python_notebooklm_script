@@ -25,6 +25,7 @@ from notebooklm.cli.services.label_listing import (
     LabelListPlan,
     LabelResolutionError,
     execute_label_list,
+    label_resolution_projection,
     resolve_label_id,
 )
 from notebooklm.types import Label, Source
@@ -86,7 +87,9 @@ async def test_resolve_ambiguous_name_lists_candidates() -> None:
     client = _make_client(labels=labels)
     with pytest.raises(LabelResolutionError) as exc:
         await resolve_label_id(client, "nb_1", "Dup")
-    message = str(exc.value)
+    message, code, extra = label_resolution_projection(exc.value)
+    assert code == "AMBIGUOUS_NAME"
+    assert extra["name"] == "Dup"
     # Both candidate ids, emojis, and source counts are surfaced.
     assert "lblaaa111" in message
     assert "lblbbb222" in message
@@ -113,15 +116,15 @@ async def test_resolve_ambiguous_prefix_lists_candidates() -> None:
     with pytest.raises(LabelResolutionError) as exc:
         # ``lblaaa`` is a prefix of BOTH ids — ambiguous.
         await resolve_label_id(client, "nb_1", "lblaaa")
-    assert exc.value.code == "AMBIGUOUS_ID"
+    assert exc.value.reason == "ambiguous_id"
     # Candidate ids, emojis, and source counts are surfaced (message + extra).
-    message = str(exc.value)
+    message, code, extra = label_resolution_projection(exc.value)
+    assert code == "AMBIGUOUS_ID"
     assert "lblaaa111" in message
     assert "lblaaa222" in message
     assert "📄" in message
     assert "🧠" in message
-    assert exc.value.extra is not None
-    candidate_ids = {c["id"] for c in exc.value.extra["candidates"]}
+    candidate_ids = {c["id"] for c in extra["candidates"]}
     assert candidate_ids == {"lblaaa111", "lblaaa222"}
 
 
@@ -131,6 +134,31 @@ async def test_resolve_no_match_raises() -> None:
     client = _make_client(labels=labels)
     with pytest.raises(LabelResolutionError):
         await resolve_label_id(client, "nb_1", "nope")
+
+
+@pytest.mark.asyncio
+async def test_resolve_near_miss_attaches_candidates() -> None:
+    """A name mistyped with a hyphen for an em-dash surfaces the real label (#1787)."""
+    labels = [Label(id="lblaaa111", name="Q3 — Papers"), Label(id="lblbbb222", name="Other")]
+    client = _make_client(labels=labels)
+    with pytest.raises(LabelResolutionError) as exc:
+        await resolve_label_id(client, "nb_1", "Q3 - Papers")
+    assert exc.value.reason == "not_found"
+    expected = [{"id": "lblaaa111", "title": "Q3 — Papers"}]
+    # Also exposed on ``.candidates`` so the MCP / REST surfaces (which read the
+    # attribute, not ``.extra``) enrich a label near-miss reached via
+    # ``source_list(label=…)`` even though the error classifies as VALIDATION.
+    assert list(exc.value.candidates) == expected
+
+
+@pytest.mark.asyncio
+async def test_resolve_no_near_match_omits_candidates() -> None:
+    labels = [Label(id="lblaaa111", name="Papers")]
+    client = _make_client(labels=labels)
+    with pytest.raises(LabelResolutionError) as exc:
+        await resolve_label_id(client, "nb_1", "Zzzzqwx")
+    assert exc.value.reason == "not_found"
+    assert exc.value.candidates == []
 
 
 @pytest.mark.asyncio

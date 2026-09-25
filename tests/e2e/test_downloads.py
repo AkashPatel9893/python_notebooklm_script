@@ -5,14 +5,34 @@ import tempfile
 
 import pytest
 
-from notebooklm.exceptions import ArtifactNotReadyError
+from notebooklm.exceptions import ArtifactDownloadError, ArtifactNotReadyError
 
-from .conftest import requires_auth
+from ._artifact_helpers import completed_download_candidates, completed_interactive_mind_maps
+from .conftest import _managed_bindings, requires_auth
+
+# Large artifact transfers can be hundreds of MiB and need several minutes on
+# Windows runners. The HTTP client's 60-second read timeout still catches a
+# stalled transfer; this outer budget permits a healthy stream to finish.
+pytestmark = pytest.mark.timeout(600)
 
 # Magic bytes for file type verification
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 PDF_MAGIC = b"%PDF"
 MP4_FTYP = b"ftyp"  # At offset 4
+
+
+async def downloadable_url_artifact_id(client, notebook_id: str, family: str) -> str:
+    """Select a completed downloadable artifact, or skip an inventory-only copy."""
+
+    artifacts = await client.artifacts.list(notebook_id)
+    candidates = completed_download_candidates(
+        artifacts,
+        family,
+        backend=client.backends["artifacts"],
+    )
+    if not candidates:
+        pytest.skip(f"No completed downloadable {family} artifact available")
+    return candidates[0].id
 
 
 def is_png(path: str) -> bool:
@@ -39,6 +59,7 @@ def is_mp4(path: str) -> bool:
 class TestDownloadAudio:
     @pytest.mark.asyncio
     @pytest.mark.readonly
+    @pytest.mark.impersonate_smoke
     async def test_download_audio(self, client, read_only_notebook_id):
         """Downloads existing audio artifact - read-only.
 
@@ -47,13 +68,18 @@ class TestDownloadAudio:
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "audio.mp4")
+            artifact_id = await downloadable_url_artifact_id(client, read_only_notebook_id, "audio")
             try:
-                result = await client.artifacts.download_audio(read_only_notebook_id, output_path)
+                result = await client.artifacts.download_audio(
+                    read_only_notebook_id, output_path, artifact_id=artifact_id
+                )
                 assert result == output_path
                 assert os.path.exists(output_path)
                 assert os.path.getsize(output_path) > 0
                 assert is_mp4(output_path), "Downloaded audio is not a valid MP4 file"
             except ArtifactNotReadyError:
+                if _managed_bindings() is not None:
+                    raise
                 pytest.skip("No completed audio artifact available")
 
 
@@ -65,13 +91,18 @@ class TestDownloadVideo:
         """Downloads existing video artifact - read-only."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "video.mp4")
+            artifact_id = await downloadable_url_artifact_id(client, read_only_notebook_id, "video")
             try:
-                result = await client.artifacts.download_video(read_only_notebook_id, output_path)
+                result = await client.artifacts.download_video(
+                    read_only_notebook_id, output_path, artifact_id=artifact_id
+                )
                 assert result == output_path
                 assert os.path.exists(output_path)
                 assert os.path.getsize(output_path) > 0
                 assert is_mp4(output_path), "Downloaded video is not a valid MP4 file"
             except ArtifactNotReadyError:
+                if _managed_bindings() is not None:
+                    raise
                 pytest.skip("No completed video artifact available")
 
 
@@ -83,15 +114,20 @@ class TestDownloadInfographic:
         """Downloads existing infographic - read-only."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "infographic.png")
+            artifact_id = await downloadable_url_artifact_id(
+                client, read_only_notebook_id, "infographic"
+            )
             try:
                 result = await client.artifacts.download_infographic(
-                    read_only_notebook_id, output_path
+                    read_only_notebook_id, output_path, artifact_id=artifact_id
                 )
                 assert result == output_path
                 assert os.path.exists(output_path)
                 assert os.path.getsize(output_path) > 0
                 assert is_png(output_path), "Downloaded infographic is not a valid PNG file"
             except ArtifactNotReadyError:
+                if _managed_bindings() is not None:
+                    raise
                 pytest.skip("No completed infographic artifact available")
 
 
@@ -103,16 +139,28 @@ class TestDownloadSlideDeck:
         """Downloads existing slide deck as PDF - read-only."""
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "slides.pdf")
+            artifact_id = await downloadable_url_artifact_id(
+                client, read_only_notebook_id, "slide_deck"
+            )
             try:
                 result = await client.artifacts.download_slide_deck(
-                    read_only_notebook_id, output_path
+                    read_only_notebook_id, output_path, artifact_id=artifact_id
                 )
                 assert result == output_path
                 assert os.path.exists(output_path)
                 assert os.path.getsize(output_path) > 0
                 assert is_pdf(output_path), "Downloaded slide deck is not a valid PDF file"
             except ArtifactNotReadyError:
+                if _managed_bindings() is not None:
+                    raise
                 pytest.skip("No completed slide deck artifact available")
+            except ArtifactDownloadError as error:
+                if (
+                    client.backends["artifacts"] == "android"
+                    and error.details == "PDF URL not available in artifact data"
+                ):
+                    pytest.skip("Android hydration confirmed an inventory-only slide deck")
+                raise
 
 
 @requires_auth
@@ -187,11 +235,18 @@ class TestDownloadMindMap:
     @pytest.mark.readonly
     async def test_download_mind_map(self, client, read_only_notebook_id):
         """Downloads existing mind map as JSON - read-only."""
+        artifact_id = None
+        if _managed_bindings() is not None:
+            artifacts = await client.artifacts.list(read_only_notebook_id)
+            interactive = completed_interactive_mind_maps(artifacts)
+            if not interactive:
+                pytest.skip("No completed Studio-backed interactive mind map available")
+            artifact_id = interactive[0].id
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "mindmap.json")
             try:
                 result = await client.artifacts.download_mind_map(
-                    read_only_notebook_id, output_path
+                    read_only_notebook_id, output_path, artifact_id=artifact_id
                 )
                 assert result == output_path
                 assert os.path.exists(output_path)
@@ -203,6 +258,8 @@ class TestDownloadMindMap:
                     data = json.load(f)
                 assert "name" in data, "Mind map JSON should have 'name' field"
             except ArtifactNotReadyError:
+                if _managed_bindings() is not None:
+                    raise
                 pytest.skip("No mind map artifact available")
 
 

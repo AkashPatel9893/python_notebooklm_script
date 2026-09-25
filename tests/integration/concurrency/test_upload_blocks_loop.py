@@ -65,9 +65,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from _fixtures.fake_core import FakeSession, make_fake_core
-from notebooklm._source.upload import SourceUploadPipeline
 from notebooklm._sources import SourcesAPI
+from notebooklm._web.sources import WebSourcesAPI
+from notebooklm._web.sources.upload import SourceUploadPipeline
+from tests._fixtures.fake_core import FakeSession, make_fake_core
 
 # mock-based loop-blocking detection tests; no HTTP, no cassette.
 # Opt out of the tier-enforcement hook in tests/integration/conftest.py.
@@ -113,13 +114,15 @@ def _make_sources_api() -> tuple[SourcesAPI, FakeSession]:
     core = make_fake_core(rpc_call=AsyncMock())
     uploader = SourceUploadPipeline(
         rpc=core.rpc_executor,
-        drain=core,
-        lifecycle=core,
+        supervisor=core,
         kernel=core.kernel,
         auth=core.auth,
         record_upload_queue_wait=core.record_upload_queue_wait,
     )
-    return SourcesAPI(core.rpc_executor, uploader=uploader), core
+    uploader._active_epoch = 1
+    uploader._closing = False
+    uploader._registry_lock = asyncio.Lock()
+    return WebSourcesAPI(core.rpc_executor, supervisor=core, uploader=uploader), core
 
 
 class _SlowReadFile:

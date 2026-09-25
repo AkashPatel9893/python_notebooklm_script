@@ -7,7 +7,8 @@ These pin the relocated ``source add`` business logic at the ``_app`` boundary
   no-host rejection, private/loopback/link-local/unspecified IP rejection,
   ``localhost`` spelling rejection, the ``allow_internal`` bypass).
 * :func:`looks_like_path` — slash / known-extension path heuristic.
-* :func:`validate_upload_path` — symlink refusal + regular-file check.
+* :func:`validate_upload_path` — symlink refusal, regular-file check, credential
+  path refusal, and optional allowed-root boundary.
 * :func:`build_source_add_plan` — input-mode detection (url / youtube / file /
   text), warning collection, and the gate that explicit ``--type`` still honours.
 * :func:`add_source` / :func:`execute_source_add` — the add-workflow dispatch
@@ -19,6 +20,7 @@ in ``tests/unit/cli/test_source.py``.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -33,6 +35,7 @@ from notebooklm._app.source_add import (
     build_source_add_plan,
     execute_source_add,
     looks_like_path,
+    parse_upload_allowed_roots,
     validate_upload_path,
     validate_url,
 )
@@ -75,7 +78,7 @@ class TestValidateUrl:
     def test_rejects_missing_host(self) -> None:
         with pytest.raises(SourceAddValidationError) as exc:
             validate_url("http:///path", allow_internal=False)
-        assert "no host" in str(exc.value).lower()
+        assert exc.value.reason == "url_missing_host"
 
     @pytest.mark.parametrize(
         "url",
@@ -135,6 +138,66 @@ class TestLooksLikePath:
     def test_non_path_content(self, content: str) -> None:
         assert looks_like_path(content) is False
 
+    @pytest.mark.parametrize("content", ["deck.pptx", "deck.ppt", "DECK.PPTX", "slides.PpT"])
+    def test_powerpoint_filename_is_path_shaped(self, content: str) -> None:
+        """A PowerPoint filename reads as file-shaped (#2202).
+
+        What this buys is the missing-file warning, not the upload branch — see
+        ``test_missing_powerpoint_filename_warns_instead_of_silently_pasting``
+        for the behaviour that actually changed.
+        """
+        assert looks_like_path(content) is True
+
+    @pytest.mark.parametrize("content", ["page.xhtml", "page.xht"])
+    def test_bare_xhtml_filename_is_path_shaped(self, content: str) -> None:
+        """The upload endpoint rejects XHTML, but the argument is still a filename.
+
+        Reading it as a path is what routes the user to the convert-first error
+        instead of silently pasting the filename in as text content.
+        """
+        assert looks_like_path(content) is True
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "The deck.pptx covered three topics",  # extension mid-sentence
+            "e.g",
+            "version 2.0",
+            "Q3.results",
+            "deck.pptxx",
+            "deck.keynote",
+            "deck.",
+            ".pptx",
+        ],
+    )
+    def test_extension_like_but_not_a_filename_is_not_path_shaped(self, content: str) -> None:
+        """Prose / non-upload suffixes must NOT be treated as a local file.
+
+        The widened set (#2202) must not widen into "anything with a dot": a
+        false positive here slaps a spurious "looks like a path but does not
+        exist" warning onto text a user deliberately pasted.
+        """
+        assert looks_like_path(content) is False
+
+    @pytest.mark.parametrize("content", ["I read deck.pptx", "see slides.ppt", "read page.xhtml"])
+    def test_prose_ending_in_a_filename_is_a_known_false_positive(self, content: str) -> None:
+        """KNOWN LIMITATION, pinned rather than wished away.
+
+        ``Path("I read deck.pptx").suffix`` is ``".pptx"``, so prose whose LAST
+        token looks like a filename trips the heuristic. This is pre-existing for
+        every extension in the set (``"I read notes.pdf"`` behaves identically on
+        ``main``); #2202 widens the set, so it inherits the behaviour for
+        PowerPoint and XHTML too.
+
+        Deliberately tolerated: the only consequence is a spurious "looks like a
+        path but does not exist" warning on text that is still added correctly as
+        a text source. Tightening it (e.g. rejecting suffixes containing spaces)
+        would be a behaviour change beyond this fix's scope — this test exists so
+        that change is a conscious one, and so nobody reads the negative cases
+        above as proving more than they do.
+        """
+        assert looks_like_path(content) is True
+
 
 # ===========================================================================
 # validate_upload_path — symlink + regular-file checks
@@ -171,6 +234,146 @@ class TestValidateUploadPath:
         assert resolved == target.resolve()
 
 
+class TestParseUploadAllowedRoots:
+    def test_empty_is_deny(self) -> None:
+        assert parse_upload_allowed_roots(None) == ()
+        assert parse_upload_allowed_roots("") == ()
+        assert parse_upload_allowed_roots("   ") == ()
+
+    def test_splits_on_pathsep_and_dedupes(self, tmp_path: Path) -> None:
+        first = tmp_path / "a"
+        second = tmp_path / "b"
+        first.mkdir()
+        second.mkdir()
+        raw = f"{first}{os.pathsep}{second}{os.pathsep}{first / '.'}"
+        assert parse_upload_allowed_roots(raw) == (first.resolve(), second.resolve())
+
+    def test_drops_home_and_notebooklm_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "nblm-home"
+        home.mkdir()
+        monkeypatch.setenv("NOTEBOOKLM_HOME", str(home))
+        assert parse_upload_allowed_roots(str(Path.home())) == ()
+        assert parse_upload_allowed_roots(str(home)) == ()
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        assert parse_upload_allowed_roots(str(uploads)) == (uploads.resolve(),)
+
+    def test_drops_filesystem_root(self) -> None:
+        assert parse_upload_allowed_roots(str(Path("/"))) == ()
+
+
+class TestValidateUploadPathAllowedRoots:
+    def test_rejects_storage_state_under_notebooklm_home(self, tmp_path: Path) -> None:
+        profile = tmp_path / ".notebooklm" / "profiles" / "p"
+        profile.mkdir(parents=True)
+        cred = profile / "storage_state.json"
+        cred.write_text("{}")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(cred), follow_symlinks=False)
+        assert exc.value.reason == "credential_path_disallowed"
+
+    def test_rejects_master_token_inside_allowed_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        cred = root / "master_token.json"
+        cred.write_text("{}")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(cred), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "credential_path_disallowed"
+
+    def test_rejects_playwright_profile_dir_inside_allowed_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        profile = root / "browser_profile"
+        profile.mkdir(parents=True)
+        cookies = profile / "Cookies"
+        cookies.write_text("x")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(cookies), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "credential_path_disallowed"
+
+    def test_rejects_explicit_storage_browser_profile_suffix(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        profile = root / "custom.browser_profile"
+        profile.mkdir(parents=True)
+        cookies = profile / "Cookies"
+        cookies.write_text("x")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(cookies), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "credential_path_disallowed"
+
+    def test_accepts_path_inside_allowed_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        doc = root / "doc.pdf"
+        doc.write_text("x")
+        resolved = validate_upload_path(str(doc), follow_symlinks=False, allowed_roots=[root])
+        assert resolved == doc.resolve()
+
+    def test_rejects_path_outside_allowed_root_even_if_regular_pdf(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        outside = tmp_path / "other" / "doc.pdf"
+        outside.parent.mkdir()
+        outside.write_text("x")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(outside), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "path_outside_allowed_root"
+
+    def test_rejects_prefix_sibling_directory(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        sibling = tmp_path / "uploads_evil" / "doc.pdf"
+        sibling.parent.mkdir()
+        sibling.write_text("x")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(sibling), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "path_outside_allowed_root"
+
+    def test_empty_allowed_roots_is_deny(self, tmp_path: Path) -> None:
+        doc = tmp_path / "doc.pdf"
+        doc.write_text("x")
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(doc), follow_symlinks=False, allowed_roots=())
+        assert exc.value.reason == "upload_root_not_configured"
+
+    def test_omitted_allowed_roots_stays_unrestricted_for_non_credentials(
+        self, tmp_path: Path
+    ) -> None:
+        doc = tmp_path / "doc.pdf"
+        doc.write_text("x")
+        assert validate_upload_path(str(doc), follow_symlinks=False) == doc.resolve()
+
+    def test_rejects_symlink_inside_allowed_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        target = root / "real.pdf"
+        target.write_text("x")
+        link = root / "link.pdf"
+        link.symlink_to(target)
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(link), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "symlink_disallowed"
+
+    def test_rejects_directory_inside_allowed_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(root), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "not_regular_file"
+
+    def test_rejects_escape_via_dotdot(self, tmp_path: Path) -> None:
+        root = tmp_path / "uploads"
+        root.mkdir()
+        secret = tmp_path / "secret.pdf"
+        secret.write_text("x")
+        sneaky = root / ".." / "secret.pdf"
+        with pytest.raises(SourceAddValidationError) as exc:
+            validate_upload_path(str(sneaky), follow_symlinks=False, allowed_roots=[root])
+        assert exc.value.reason == "path_outside_allowed_root"
+
+
 # ===========================================================================
 # build_source_add_plan — input detection + warning collection
 # ===========================================================================
@@ -181,6 +384,50 @@ def _validate_path_stub(content: str, follow_symlinks: bool) -> Path:
 
 
 class TestBuildSourceAddPlan:
+    def test_missing_powerpoint_filename_warns_instead_of_silently_pasting(self) -> None:
+        """#2202's real user-visible fix: the typo'd deck now gets a warning.
+
+        Without ``.pptx`` in the path-shaped set this returned zero warnings, so
+        ``source add dekc.pptx`` created a source whose entire content was the
+        string ``dekc.pptx`` and said nothing about it.
+        """
+        plan = build_source_add_plan(
+            content="dekc.pptx",
+            source_type=None,
+            title=None,
+            mime_type=None,
+            follow_symlinks=False,
+            validate_path=_validate_path_stub,
+            looks_path_shaped=looks_like_path,
+        )
+        # Still a text source — the warning is the change, not the routing.
+        assert plan.detected_type == "text"
+        assert len(plan.warnings) == 1
+        assert plan.warnings[0].code == "PATH_NOT_FOUND"
+        assert plan.warnings[0].content == "dekc.pptx"
+
+    def test_an_existing_file_uploads_regardless_of_extension(self, tmp_path: Path) -> None:
+        """The extension set is NOT the upload gate — existence is, and it is checked first.
+
+        Pins the fact that corrects #2202's premise: an unlisted extension (and
+        even none at all) still takes the file branch when the path exists, so
+        widening the set cannot change which real files are uploadable.
+        """
+        for name in ("deck.pptx", "deck.keynote", "notes"):
+            path = tmp_path / name
+            path.write_text("x")
+            plan = build_source_add_plan(
+                content=str(path),
+                source_type=None,
+                title=None,
+                mime_type=None,
+                follow_symlinks=False,
+                validate_path=lambda content, _follow: Path(content),
+                looks_path_shaped=looks_like_path,
+            )
+            assert plan.detected_type == "file", name
+            assert plan.warnings == ()
+
     def test_autodetect_url(self) -> None:
         plan = build_source_add_plan(
             content="https://example.com/a",
@@ -232,7 +479,8 @@ class TestBuildSourceAddPlan:
         )
         assert plan.detected_type == "text"
         assert len(plan.warnings) == 1
-        assert "looks like a path" in plan.warnings[0]
+        assert plan.warnings[0].code == "PATH_NOT_FOUND"
+        assert plan.warnings[0].content == "docs/missing.pdf"
 
     def test_autodetect_existing_file(self, tmp_path: Path) -> None:
         f = tmp_path / "doc.pdf"
@@ -365,6 +613,28 @@ async def test_add_source_youtube_uses_add_url() -> None:
     )
     await add_source(facade, notebook_id="nb_1", plan=plan)
     facade.add_url.assert_awaited_once_with("nb_1", "https://youtu.be/abc")
+
+
+@pytest.mark.asyncio
+async def test_add_source_url_forwards_explicit_title() -> None:
+    # #1960: a caller-supplied title must reach add_url so it can honor it via a
+    # post-add rename (web pages / YouTube re-derive the title server-side).
+    facade = _make_sources_facade()
+    plan = SourceAddPlan(
+        content="https://ex.com/a", detected_type="url", title="My Title", upload_path=None
+    )
+    await add_source(facade, notebook_id="nb_1", plan=plan)
+    facade.add_url.assert_awaited_once_with("nb_1", "https://ex.com/a", title="My Title")
+
+
+@pytest.mark.asyncio
+async def test_add_source_youtube_forwards_explicit_title() -> None:
+    facade = _make_sources_facade()
+    plan = SourceAddPlan(
+        content="https://youtu.be/abc", detected_type="youtube", title="Talk", upload_path=None
+    )
+    await add_source(facade, notebook_id="nb_1", plan=plan)
+    facade.add_url.assert_awaited_once_with("nb_1", "https://youtu.be/abc", title="Talk")
 
 
 @pytest.mark.asyncio

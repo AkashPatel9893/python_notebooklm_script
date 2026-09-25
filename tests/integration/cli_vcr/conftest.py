@@ -28,8 +28,11 @@ from urllib.parse import urlparse
 
 import pytest
 from click.testing import CliRunner
-from tests.integration.conftest import _is_vcr_record_mode, skip_no_cassettes
-from tests.vcr_config import notebooklm_vcr
+
+import notebooklm.auth as auth_module
+import notebooklm.cli.context as context_module
+import notebooklm.cli.helpers as helpers_module
+import notebooklm.cli.resolve as resolve_module
 
 # Enum value *sets* only — an allowed-membership definition, NOT a decoder. Reading
 # the canonical enum values from the public ``notebooklm`` types keeps the membership
@@ -43,6 +46,8 @@ from notebooklm.types import (
     artifact_status_to_str,
     source_status_to_str,
 )
+from tests.integration.conftest import _is_vcr_record_mode, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 from ._fixtures import (
     PLACEHOLDER_NOTEBOOK_ID,
@@ -90,9 +95,9 @@ def mock_context(tmp_path: Path):
     context_file.write_text(json.dumps({"notebook_id": PLACEHOLDER_NOTEBOOK_ID}), encoding="utf-8")
 
     with (
-        patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
+        patch.object(helpers_module, "get_context_path", return_value=context_file),
+        patch.object(context_module, "get_context_path", return_value=context_file),
+        patch.object(resolve_module, "get_context_path", return_value=context_file),
     ):
         yield context_file
 
@@ -129,9 +134,10 @@ def mock_auth_for_vcr():
         "SAPISID": "vcr_mock_sapisid",
     }
     with (
-        patch("notebooklm.cli.helpers.load_auth_from_storage", return_value=mock_cookies),
-        patch(
-            "notebooklm.auth.fetch_tokens_with_domains",
+        patch.object(helpers_module, "load_auth_from_storage", return_value=mock_cookies),
+        patch.object(
+            auth_module,
+            "fetch_tokens_with_domains",
             return_value=("vcr_mock_csrf", "vcr_mock_session"),
         ),
     ):
@@ -308,6 +314,9 @@ _ARTIFACT_TYPE_VALUES = frozenset(member.value for member in ArtifactType)
 _SOURCE_STATUS_STR_VALUES = frozenset(
     source_status_to_str(member.value) for member in SourceStatus
 ) | {source_status_to_str(0)}
+# ``ArtifactStatus`` models code 0 as a member since #2127, so the enum alone
+# already covers the "unknown" degrade string; the explicit union keeps this
+# symmetrical with ``_SOURCE_STATUS_STR_VALUES``, whose enum still omits 0.
 _ARTIFACT_STATUS_STR_VALUES = frozenset(
     artifact_status_to_str(member.value) for member in ArtifactStatus
 ) | {artifact_status_to_str(0)}

@@ -43,9 +43,11 @@ downloads/
 # Local working notes (process scratch — not shipped)
 docs/scratch/
 
-# NCERT → NotebookLM pipeline: generated outputs and local run state
-# (keep run.py / README.md / COMMANDS.md tracked; ignore everything generated)
-pipeline/output/
-pipeline/progress.csv
-pipeline/pipeline.log
-pipeline/.pipeline.lock
+# Baked into the wheel by hatch_build.py; never committed.
+src/notebooklm/_commit.py
+
+# Mobile reverse-engineering working files (local only)
+# The APK is ~39MB of Google's proprietary binaries — never commit it.
+notebooklm.apk/
+frida-scripts/
+error.log

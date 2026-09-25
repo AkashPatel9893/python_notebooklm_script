@@ -14,7 +14,7 @@ Tests can either:
 
        async def test_list_uses_rpc(fake_core):
            fake_core.rpc_executor.rpc_call.return_value = [payload]
-           api = NotebooksAPI(fake_core.rpc_executor)
+           api = WebNotebooksAPI(fake_core.rpc_executor)
            ...
 
 2. Use the ``make_fake_core`` fixture (the factory itself) when each
@@ -22,21 +22,21 @@ Tests can either:
 
        async def test_list_uses_rpc(make_fake_core):
            fake = make_fake_core(rpc_call=AsyncMock(return_value=[payload]))
-           api = NotebooksAPI(fake.rpc_executor)
+           api = WebNotebooksAPI(fake.rpc_executor)
            ...
 
-3. Or, equivalently, ``from _fixtures import make_fake_core`` and skip
-   the fixture indirection entirely (pytest discovery puts ``tests/`` on
-   ``sys.path``, so the underscore-prefixed module is importable). The
-   factory is the load-bearing substrate; the fixtures are convenience
-   wrappers.
+3. Or, equivalently, ``from tests._fixtures import make_fake_core`` and
+   skip the fixture indirection entirely (the ``tests/`` package chain is
+   complete, so the underscore-prefixed module is importable via its
+   fully-qualified ``tests._fixtures`` path). The factory is the
+   load-bearing substrate; the fixtures are convenience wrappers.
 
 To make these fixtures available across the whole test tree (rather than
 only in ``tests/_fixtures/``), a follow-up PR can register this module as
 a pytest plugin from the root ``tests/conftest.py`` via
-``pytest_plugins = ["_fixtures.conftest"]``. D1 PR-1 deliberately leaves
-the wiring opt-in so test files in D1 PR-2 and D1 PR-3 can exercise
-either invocation style without forcing a global change here.
+``pytest_plugins = ["tests._fixtures.conftest"]``. D1 PR-1 deliberately
+leaves the wiring opt-in so test files in D1 PR-2 and D1 PR-3 can
+exercise either invocation style without forcing a global change here.
 """
 
 from __future__ import annotations

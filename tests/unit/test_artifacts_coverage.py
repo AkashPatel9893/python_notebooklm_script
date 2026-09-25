@@ -1,5 +1,4 @@
 """Additional unit tests to improve _artifacts.py coverage.
-
 These tests target specific uncovered lines identified by coverage analysis.
 """
 
@@ -11,41 +10,42 @@ import httpx
 import pytest
 
 import notebooklm._artifact.downloads as _downloads
-from notebooklm._artifacts import ArtifactsAPI
+from notebooklm._web.artifacts import WebArtifactsAPI
+from notebooklm._web.wire.decoder import RPCError
 from notebooklm.exceptions import (
     ArtifactInProgressTimeoutError,
     ArtifactPendingTimeoutError,
     ArtifactTimeoutError,
     UnknownRPCMethodError,
+    ValidationError,
 )
-from notebooklm.rpc.decoder import RPCError
+from notebooklm.rpc.types import VideoFormat, VideoStyle
 from notebooklm.types import ArtifactDownloadError, GenerationStatus
 
 
 @pytest.fixture
 def mock_artifacts_api():
     """Create an ArtifactsAPI with mocked core and notes API."""
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     mock_core = make_fake_core(
         rpc_call=AsyncMock(),
         get_source_ids=AsyncMock(return_value=[]),
         operation_scope=MagicMock(side_effect=lambda _label: _noop_operation_scope()),
     )
-    # ``ArtifactsAPI`` constructs its own ``PollRegistry`` internally
-    # (``_artifacts.py:217``); the fake core does not need to provide one.
-    from notebooklm._mind_map import NoteBackedMindMapService
-    from notebooklm._note_service import NoteService
+    # ``ArtifactsAPI`` constructs its own ``PollRegistry`` internally; the fake
+    # core does not need to provide one.
+    from notebooklm._web.mind_maps import NoteBackedMindMapService
+    from notebooklm._web.notes import NoteService
 
     mind_maps = MagicMock(spec=NoteBackedMindMapService)
     mind_maps.list_mind_maps = AsyncMock(return_value=[])
     note_service = MagicMock(spec=NoteService)
     mock_notebooks = MagicMock()
     mock_notebooks.get_source_ids = AsyncMock(return_value=[])
-    api = ArtifactsAPI(
+    api = WebArtifactsAPI(
         rpc=mock_core,
-        drain=mock_core,
-        lifecycle=mock_core,
+        supervisor=mock_core,
         notebooks=mock_notebooks,
         mind_maps=mind_maps,
         note_service=note_service,
@@ -59,10 +59,8 @@ async def _noop_operation_scope():
 
 
 # =============================================================================
-# TIER 1: _download_urls_batch tests (lines 1360-1390)
+# TIER 1: _download_urls_batch tests
 # =============================================================================
-
-
 class TestDownloadUrlsBatch:
     """Test _download_urls_batch method for batch downloading."""
 
@@ -70,13 +68,11 @@ class TestDownloadUrlsBatch:
     async def test_batch_download_success(self, mock_artifacts_api, tmp_path):
         """Test successful batch download of multiple files."""
         api, _ = mock_artifacts_api
-
         # Create mock response with binary content
         mock_response = MagicMock()
         mock_response.content = b"binary media content"
         mock_response.headers = {"content-type": "video/mp4"}
         mock_response.raise_for_status = MagicMock()
-
         load_cookies = MagicMock(return_value={})
         with (
             patch.object(_downloads, "load_httpx_cookies", load_cookies),
@@ -87,14 +83,11 @@ class TestDownloadUrlsBatch:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_cls.return_value = mock_client
-
             urls_and_paths = [
                 ("https://storage.googleapis.com/file1.mp4", str(tmp_path / "file1.mp4")),
                 ("https://storage.googleapis.com/file2.mp4", str(tmp_path / "file2.mp4")),
             ]
-
             result = await api._download_urls_batch(urls_and_paths)
-
         # Bite-check (ADR-0007 Form-2): the injected seam alias is exercised.
         load_cookies.assert_called_once()
         assert result.all_succeeded
@@ -106,7 +99,6 @@ class TestDownloadUrlsBatch:
     @pytest.mark.asyncio
     async def test_batch_download_html_response_aggregated(self, mock_artifacts_api, tmp_path):
         """HTML-payload ``ArtifactDownloadError`` is aggregated into ``failed``.
-
         The batch surface now treats policy violations the same as
         transport errors: they land in ``result.failed`` so siblings can
         still complete. The single-URL ``download_url`` path still
@@ -114,13 +106,11 @@ class TestDownloadUrlsBatch:
         ``tests/integration/test_artifacts_integration.py``.
         """
         api, _ = mock_artifacts_api
-
         # Mock response returning HTML instead of media
         mock_response = MagicMock()
         mock_response.content = b"<html>Login page</html>"
         mock_response.headers = {"content-type": "text/html"}
         mock_response.raise_for_status = MagicMock()
-
         load_cookies = MagicMock(return_value={})
         with (
             patch.object(_downloads, "load_httpx_cookies", load_cookies),
@@ -131,13 +121,10 @@ class TestDownloadUrlsBatch:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_cls.return_value = mock_client
-
             urls_and_paths = [
                 ("https://storage.googleapis.com/file.mp4", str(tmp_path / "file.mp4")),
             ]
-
             result = await api._download_urls_batch(urls_and_paths)
-
         # Bite-check (ADR-0007 Form-2): the injected seam alias is exercised.
         load_cookies.assert_called_once()
         assert result.succeeded == []
@@ -151,12 +138,10 @@ class TestDownloadUrlsBatch:
     async def test_batch_download_partial_failure(self, mock_artifacts_api, tmp_path):
         """Test batch download with one success and one failure."""
         api, _ = mock_artifacts_api
-
         success_response = MagicMock()
         success_response.content = b"valid content"
         success_response.headers = {"content-type": "video/mp4"}
         success_response.raise_for_status = MagicMock()
-
         load_cookies = MagicMock(return_value={})
         with (
             patch.object(_downloads, "load_httpx_cookies", load_cookies),
@@ -167,14 +152,11 @@ class TestDownloadUrlsBatch:
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_cls.return_value = mock_client
-
             urls_and_paths = [
                 ("https://storage.googleapis.com/file1.mp4", str(tmp_path / "file1.mp4")),
                 ("https://storage.googleapis.com/file2.mp4", str(tmp_path / "file2.mp4")),
             ]
-
             result = await api._download_urls_batch(urls_and_paths)
-
         # Bite-check (ADR-0007 Form-2): the injected seam alias is exercised.
         load_cookies.assert_called_once()
         # Only first file should succeed; second is recorded in failed.
@@ -188,10 +170,8 @@ class TestDownloadUrlsBatch:
 
 
 # =============================================================================
-# TIER 1: _call_generate rate limit tests (lines 1326-1334)
+# TIER 1: _call_generate rate limit tests
 # =============================================================================
-
-
 class TestCallGenerateRateLimit:
     """Test _call_generate handling of rate limit errors."""
 
@@ -199,12 +179,10 @@ class TestCallGenerateRateLimit:
     async def test_rate_limit_refusal_raises(self, mock_artifacts_api):
         """v0.8.0 (#1342): a USER_DISPLAYABLE_ERROR refusal re-raises the error."""
         api, mock_core = mock_artifacts_api
-
         # Simulate rate limit error from RPC
         mock_core.rpc_executor.rpc_call.side_effect = RPCError(
             "Rate limit exceeded", rpc_code="USER_DISPLAYABLE_ERROR"
         )
-
         with pytest.raises(RPCError, match="Rate limit"):
             await api.generate_video("nb_123")
 
@@ -212,20 +190,46 @@ class TestCallGenerateRateLimit:
     async def test_other_rpc_error_propagates(self, mock_artifacts_api):
         """Test that non-rate-limit RPC errors propagate."""
         api, mock_core = mock_artifacts_api
-
         mock_core.rpc_executor.rpc_call.side_effect = RPCError(
             "Server error", rpc_code="INTERNAL_ERROR"
         )
-
         with pytest.raises(RPCError, match="Server error"):
             await api.generate_video("nb_123")
 
 
-# =============================================================================
-# TIER 1: wait_for_completion timeout tests (lines 1085-1157)
-# =============================================================================
+class TestShortVideoStyleValidation:
+    """#1805: short video has a fixed style; an explicit style is rejected."""
+
+    @pytest.mark.asyncio
+    async def test_short_rejects_explicit_style(self, mock_artifacts_api):
+        api, mock_core = mock_artifacts_api
+        with pytest.raises(ValidationError, match="not supported for short videos"):
+            await api.generate_video(
+                "nb_123", video_format=VideoFormat.SHORT, video_style=VideoStyle.ANIME
+            )
+        mock_core.rpc_executor.rpc_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_short_rejects_style_prompt(self, mock_artifacts_api):
+        api, mock_core = mock_artifacts_api
+        with pytest.raises(ValidationError, match="not supported for short videos"):
+            await api.generate_video(
+                "nb_123", video_format=VideoFormat.SHORT, style_prompt="painterly"
+            )
+
+    @pytest.mark.asyncio
+    async def test_short_allows_auto_style(self, mock_artifacts_api):
+        # AUTO_SELECT (or unset) is fine — short just uses its fixed style.
+        api, _ = mock_artifacts_api
+        status = await api.generate_video(
+            "nb_123", video_format=VideoFormat.SHORT, video_style=VideoStyle.AUTO_SELECT
+        )
+        assert isinstance(status, GenerationStatus)
 
 
+# =============================================================================
+# TIER 1: wait_for_completion timeout tests
+# =============================================================================
 class TestWaitForCompletion:
     """Test wait_for_completion timeout and backoff logic."""
 
@@ -233,7 +237,6 @@ class TestWaitForCompletion:
     async def test_timeout_raises_error(self, mock_artifacts_api):
         """Test that timeout is raised after max wait time."""
         api, mock_core = mock_artifacts_api
-
         # Always return in_progress status via LIST_ARTIFACTS format
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -242,14 +245,12 @@ class TestWaitForCompletion:
                     "Title",
                     2,  # REPORT type (no URL check needed)
                     None,
-                    1,  # PROCESSING status
+                    2,  # PROCESSING status -> "in_progress"
                 ]
             ]
         ]
-
         # Patch the event loop time to simulate time passing
         loop = asyncio.get_running_loop()
-
         time_values = iter([0, 0.1, 0.2, 0.5, 1.0, 2.0])
 
         def mock_time():
@@ -261,9 +262,44 @@ class TestWaitForCompletion:
         with (
             patch.object(loop, "time", mock_time),
             patch("asyncio.sleep", new_callable=AsyncMock),
-            pytest.raises(ArtifactInProgressTimeoutError, match="timed out"),
+            pytest.raises(ArtifactInProgressTimeoutError, match="timed out") as exc_info,
         ):
             await api.wait_for_completion("nb_123", "task_123", timeout=1.5)
+        # Pin the phase fields to the same depth as the wire-code-1 companion
+        # below: ``_artifact_timeout_error`` classifies off the literal
+        # "in_progress" string, so ``stalled_phase`` is the load-bearing output,
+        # not just the exception class.
+        assert exc_info.value.last_status == "in_progress"
+        assert exc_info.value.stalled_phase == "in_progress"
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_wire_code_1_is_classified_pending(self, mock_artifacts_api):
+        """Wire code 1 (INITIALIZED) stalls are a *pending* timeout, not in-progress.
+
+        The companion of ``test_timeout_raises_error`` (wire code 2). Together
+        they pin that the timeout classification follows the corrected codes:
+        before #2127 the two exception types were selected off each other's
+        wire code.
+        """
+        api, mock_core = mock_artifacts_api
+        mock_core.rpc_executor.rpc_call.return_value = [[["task_123", "Title", 2, None, 1]]]
+        loop = asyncio.get_running_loop()
+        time_values = iter([0, 0.1, 0.2, 0.5, 1.0, 2.0])
+
+        def mock_time():
+            try:
+                return next(time_values)
+            except StopIteration:
+                return 10.0  # Exceed timeout
+
+        with (
+            patch.object(loop, "time", mock_time),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ArtifactPendingTimeoutError) as exc_info,
+        ):
+            await api.wait_for_completion("nb_123", "task_123", timeout=1.5)
+        assert exc_info.value.last_status == "pending"
+        assert exc_info.value.stalled_phase == "pending"
 
     @pytest.mark.asyncio
     async def test_pending_timeout_raises_structured_artifact_timeout(self, mock_artifacts_api):
@@ -275,7 +311,6 @@ class TestWaitForCompletion:
                 GenerationStatus("task_123", "pending"),
             ]
         )
-
         clock = 0.0
         loop = asyncio.get_running_loop()
 
@@ -298,7 +333,6 @@ class TestWaitForCompletion:
                 max_interval=0.001,
                 timeout=0.005,
             )
-
         exc = exc_info.value
         assert isinstance(exc, TimeoutError)
         assert isinstance(exc, ArtifactTimeoutError)
@@ -325,7 +359,6 @@ class TestWaitForCompletion:
                 ),
             ]
         )
-
         clock = 0.0
         loop = asyncio.get_running_loop()
 
@@ -348,7 +381,6 @@ class TestWaitForCompletion:
                 max_interval=0.001,
                 timeout=0.005,
             )
-
         exc = exc_info.value
         assert exc.last_status == "in_progress"
         assert exc.status_history == ("pending", "in_progress")
@@ -362,10 +394,9 @@ class TestWaitForCompletion:
     async def test_wait_completes_successfully(self, mock_artifacts_api):
         """Test successful completion without timeout."""
         api, mock_core = mock_artifacts_api
-
         # Return completed on second poll via LIST_ARTIFACTS format
         mock_core.rpc_executor.rpc_call.side_effect = [
-            # First poll - in_progress
+            # First poll - still queued (code 1 = INITIALIZED -> "pending")
             [
                 [
                     [
@@ -373,7 +404,7 @@ class TestWaitForCompletion:
                         "Title",
                         2,  # REPORT type (no URL check needed)
                         None,
-                        1,  # PROCESSING status
+                        1,  # PENDING status
                     ]
                 ]
             ],
@@ -390,22 +421,18 @@ class TestWaitForCompletion:
                 ]
             ],
         ]
-
         with patch("asyncio.sleep", new_callable=AsyncMock):
             result = await api.wait_for_completion("nb_123", "task_123", timeout=60.0)
-
         assert result.status == "completed"
 
     @pytest.mark.asyncio
     async def test_poll_returns_not_found_when_artifact_not_in_list(self, mock_artifacts_api):
         """Test poll_status returns not_found when artifact ID not in list.
-
         Previously this returned status='pending', but 'not_found' is now
         the correct value so that wait_for_completion can distinguish a
         brief propagation lag from a quota-removed artifact.
         """
         api, mock_core = mock_artifacts_api
-
         # LIST_ARTIFACTS returns list without our artifact ID
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -418,72 +445,67 @@ class TestWaitForCompletion:
                 ]
             ]
         ]
-
         result = await api.poll_status("nb_123", "task_123")
-
         assert result.status == "not_found"
         assert result.is_not_found is True
         assert result.task_id == "task_123"
 
 
 # =============================================================================
-# TIER 1: _parse_generation_result tests (lines 1423-1457)
+# TIER 1: _parse_generation_result tests
 # =============================================================================
-
-
 class TestParseGenerationResult:
     """Test _parse_generation_result parsing logic."""
 
     def test_parse_null_result(self, mock_artifacts_api):
         """Parsing a ``None`` result raises under strict decoding.
-
         Strict decoding is the only mode (the ``NOTEBOOKLM_STRICT_DECODE=0``
         soft-mode opt-out was retired in v0.7.0); deeper drift coverage lives
         in ``tests/unit/test_artifacts_drift.py``.
         """
         api, _ = mock_artifacts_api
-
         with pytest.raises(UnknownRPCMethodError):
             api._parse_generation_result(None, method_id="R7cb6c")
 
     def test_parse_empty_list_result(self, mock_artifacts_api):
         """Parsing an empty list raises under strict decoding."""
         api, _ = mock_artifacts_api
-
         with pytest.raises(UnknownRPCMethodError):
             api._parse_generation_result([], method_id="R7cb6c")
 
-    def test_parse_valid_in_progress(self, mock_artifacts_api):
-        """Test parsing valid in_progress status (code 1)."""
+    def test_parse_valid_pending(self, mock_artifacts_api):
+        """A fresh CREATE_ARTIFACT row carries code 1 (INITIALIZED) -> "pending"."""
         api, _ = mock_artifacts_api
-
-        # Valid result with status code 1 (in_progress)
         result = api._parse_generation_result(
             [["artifact_001", "Title", 1, None, 1]], method_id="R7cb6c"
         )
+        assert result.task_id == "artifact_001"
+        assert result.status == "pending"
 
+    def test_parse_valid_in_progress(self, mock_artifacts_api):
+        """Code 2 (PROCESSING) — the state a live artifact reports while generating."""
+        api, _ = mock_artifacts_api
+        result = api._parse_generation_result(
+            [["artifact_001", "Title", 1, None, 2]], method_id="R7cb6c"
+        )
         assert result.task_id == "artifact_001"
         assert result.status == "in_progress"
 
     def test_parse_valid_completed(self, mock_artifacts_api):
         """Test parsing valid completed status (code 3)."""
         api, _ = mock_artifacts_api
-
         result = api._parse_generation_result(
             [["artifact_002", "Title", 1, None, 3]], method_id="R7cb6c"
         )
-
         assert result.task_id == "artifact_002"
         assert result.status == "completed"
 
     def test_parse_unknown_status_code(self, mock_artifacts_api):
         """Test parsing unknown status code returns unknown."""
         api, _ = mock_artifacts_api
-
         result = api._parse_generation_result(
             [["artifact_003", "Title", 1, None, 99]], method_id="R7cb6c"
         )
-
         assert result.task_id == "artifact_003"
         assert result.status == "unknown"  # Unknown codes return "unknown"
 
@@ -491,21 +513,17 @@ class TestParseGenerationResult:
 # =============================================================================
 # TIER 2: Removed poll_interval keyword
 # =============================================================================
-
-
 class TestRemovedPollIntervalKeyword:
     """The deprecated ``poll_interval`` keyword was removed in v0.7.0."""
 
     @pytest.mark.asyncio
     async def test_poll_interval_keyword_rejected(self, mock_artifacts_api):
         """Passing the removed ``poll_interval`` keyword raises ``TypeError``.
-
         ``wait_for_completion`` only accepts ``initial_interval`` now (see
         ``docs/deprecations.md``); the deprecated ``poll_interval`` alias was
         removed, so Python's argument binding rejects it.
         """
         api, _ = mock_artifacts_api
-
         with pytest.raises(TypeError):
             await api.wait_for_completion(
                 "nb_123",
@@ -517,8 +535,6 @@ class TestRemovedPollIntervalKeyword:
 # =============================================================================
 # MEDIA READINESS TESTS (Issue #21 fix)
 # =============================================================================
-
-
 class TestIsMediaReady:
     """Test _is_media_ready helper method."""
 
@@ -580,7 +596,6 @@ class TestIsMediaReady:
 
     def test_video_with_valid_url(self, mock_artifacts_api):
         """Test video artifact with valid URL returns True.
-
         Mirrors the structure parsed by ``download_video``: art[8] is a list of
         variants, each variant a list of URL entries, each URL entry a list with
         the URL string at index 0.
@@ -624,7 +639,6 @@ class TestIsMediaReady:
 
     def test_video_pre_url_metadata_returns_false(self, mock_artifacts_api):
         """Regression for issue #330: pre-URL metadata must not register as ready.
-
         Before the URL is populated, the inner URL-entry list is empty (or
         missing the URL string). Verify the empty-inner-list case explicitly so
         readiness depends on the URL-entry structure rather than accidental
@@ -646,7 +660,6 @@ class TestIsMediaReady:
 
     def test_video_legacy_two_level_shape_returns_false(self, mock_artifacts_api):
         """Issue #330 regression: a 2-level art[8] (no URL-entry wrapper) is invalid.
-
         The buggy implementation accidentally accepted this shape because
         ``item[0]`` happened to be a string. The real API never returns this
         shape, and accepting it would let ``wait_for_completion`` claim ready
@@ -691,7 +704,6 @@ class TestIsMediaReady:
 
     def test_infographic_with_valid_url(self, mock_artifacts_api):
         """Test infographic artifact with valid URL returns True.
-
         The shared infographic extractor scans artifact entries looking for:
         - item[2] = non-empty list (content)
         - item[2][0] = list with len > 1 (first_content)
@@ -767,11 +779,9 @@ class TestIsMediaReady:
         # Quiz (type 4) - no URL needed
         art = ["artifact_id", "title", 4, None, 3]
         assert api._is_media_ready(art, 4) is True
-
         # Report (type 2) - no URL needed
         art = ["artifact_id", "title", 2, None, 3]
         assert api._is_media_ready(art, 2) is True
-
         # Data Table (type 9) - no URL needed
         art = ["artifact_id", "title", 9, None, 3]
         assert api._is_media_ready(art, 9) is True
@@ -822,7 +832,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_audio_completed_with_url(self, mock_artifacts_api):
         """Test poll_status returns completed when audio URL is present."""
         api, mock_core = mock_artifacts_api
-
         # LIST_ARTIFACTS response
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -844,7 +853,6 @@ class TestPollStatusMediaReadiness:
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         assert status.status == "completed"
         assert status.url == "https://audio.url/file.mp4"
@@ -853,7 +861,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_audio_completed_without_url(self, mock_artifacts_api):
         """Test poll_status returns in_progress when audio URL is missing."""
         api, mock_core = mock_artifacts_api
-
         # LIST_ARTIFACTS response - status=COMPLETED but no URL
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -868,7 +875,6 @@ class TestPollStatusMediaReadiness:
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         # Should downgrade to in_progress because URL is missing
         assert status.status == "in_progress"
@@ -884,7 +890,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_video_completed_with_url(self, mock_artifacts_api):
         """poll_status surfaces the video download URL when extractable."""
         api, mock_core = mock_artifacts_api
-
         mock_core.rpc_executor.rpc_call.return_value = [
             [
                 [
@@ -900,7 +905,6 @@ class TestPollStatusMediaReadiness:
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         assert status.status == "completed"
         assert status.url == "https://video.url/file.mp4"
@@ -909,7 +913,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_infographic_completed_with_url(self, mock_artifacts_api):
         """poll_status surfaces the infographic image URL when extractable."""
         api, mock_core = mock_artifacts_api
-
         mock_core.rpc_executor.rpc_call.return_value = [
             [
                 [
@@ -922,7 +925,6 @@ class TestPollStatusMediaReadiness:
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         assert status.status == "completed"
         assert status.url == "https://image.url/info.png"
@@ -931,7 +933,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_slide_deck_completed_with_url(self, mock_artifacts_api):
         """poll_status surfaces the slide-deck PDF URL when extractable."""
         api, mock_core = mock_artifacts_api
-
         mock_core.rpc_executor.rpc_call.return_value = [
             [
                 ["task_123", "Slides", 8, None, 3]
@@ -939,7 +940,6 @@ class TestPollStatusMediaReadiness:
                 + [[None, None, None, "https://slides.url/deck.pdf"]]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         assert status.status == "completed"
         assert status.url == "https://slides.url/deck.pdf"
@@ -948,7 +948,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_video_completed_without_url(self, mock_artifacts_api):
         """Test poll_status returns in_progress when video URL is missing."""
         api, mock_core = mock_artifacts_api
-
         # LIST_ARTIFACTS - video with status=COMPLETED but no URL
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -965,7 +964,6 @@ class TestPollStatusMediaReadiness:
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         assert status.status == "in_progress"
 
@@ -973,7 +971,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_quiz_completed_without_url_check(self, mock_artifacts_api):
         """Test poll_status returns completed for quiz (no URL check needed)."""
         api, mock_core = mock_artifacts_api
-
         # LIST_ARTIFACTS - quiz
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -986,7 +983,6 @@ class TestPollStatusMediaReadiness:
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         # Quiz doesn't need URL check, should return completed
         assert status.status == "completed"
@@ -995,7 +991,6 @@ class TestPollStatusMediaReadiness:
     async def test_poll_status_processing_status_unchanged(self, mock_artifacts_api):
         """Test poll_status returns in_progress for PROCESSING status (no URL check)."""
         api, mock_core = mock_artifacts_api
-
         # LIST_ARTIFACTS - audio still processing
         mock_core.rpc_executor.rpc_call.return_value = [
             [
@@ -1004,27 +999,53 @@ class TestPollStatusMediaReadiness:
                     "Audio Overview",
                     1,  # AUDIO
                     None,
-                    1,  # PROCESSING (not COMPLETED)
+                    2,  # PROCESSING (not COMPLETED)
                     None,
                     [None, None, None, None, None, []],
                 ]
             ]
         ]
-
         status = await api.poll_status("nb_123", "task_123")
         # Should remain in_progress (original status)
         assert status.status == "in_progress"
+
+    @pytest.mark.asyncio
+    async def test_poll_status_ignores_malformed_optional_data_on_unrelated_row(
+        self, mock_artifacts_api
+    ):
+        """Polling id-matches before decoding optional fields on another artifact."""
+        api, mock_core = mock_artifacts_api
+        mock_core.rpc_executor.rpc_call.return_value = [
+            [
+                [
+                    "unrelated",
+                    "Broken quiz",
+                    4,
+                    None,
+                    3,
+                    None,
+                    None,
+                    None,
+                    None,
+                    [],  # Incomplete variant envelope would fail full decoding.
+                ],
+                ["task_123", "Report", 2, None, 3],
+            ]
+        ]
+
+        status = await api.poll_status("nb_123", "task_123")
+
+        assert status.status == "completed"
+        assert status.url is None
+        mock_core.rpc_executor.rpc_call.assert_awaited_once()
 
 
 # =============================================================================
 # suggest_reports: unwrap heuristic for GET_SUGGESTED_REPORTS (issue #1243)
 # =============================================================================
-
-
 class TestSuggestReportsUnwrap:
     """GET_SUGGESTED_REPORTS arrives either wrapped (``[[row, row]]``) or
     already-flat (``[row, row]``). Both must parse to the same suggestions.
-
     Regression for issue #1243: the previous ``result[0]`` unwrap mistook the
     first row's scalar fields for the suggestion rows in the flat case and
     returned ``[]``.
@@ -1042,9 +1063,7 @@ class TestSuggestReportsUnwrap:
         """``[[row, row]]`` (real wire shape) parses to both suggestions."""
         api, mock_core = mock_artifacts_api
         mock_core.rpc_executor.rpc_call.return_value = [list(self._ROWS)]
-
         suggestions = await api.suggest_reports("nb_123")
-
         assert [(s.title, s.prompt, s.audience_level) for s in suggestions] == [
             ("Briefing Doc", "Write a briefing.", 2),
             ("Study Guide", "Write a guide.", 1),
@@ -1055,9 +1074,7 @@ class TestSuggestReportsUnwrap:
         """``[row, row]`` (already-flat) parses identically to the wrapped shape."""
         api, mock_core = mock_artifacts_api
         mock_core.rpc_executor.rpc_call.return_value = list(self._ROWS)
-
         suggestions = await api.suggest_reports("nb_123")
-
         assert [(s.title, s.prompt, s.audience_level) for s in suggestions] == [
             ("Briefing Doc", "Write a briefing.", 2),
             ("Study Guide", "Write a guide.", 1),
@@ -1067,13 +1084,10 @@ class TestSuggestReportsUnwrap:
     async def test_wrapped_and_flat_agree(self, mock_artifacts_api):
         """The wrapped and flat shapes yield identical suggestions."""
         api, mock_core = mock_artifacts_api
-
         mock_core.rpc_executor.rpc_call.return_value = [list(self._ROWS)]
         wrapped = await api.suggest_reports("nb_123")
-
         mock_core.rpc_executor.rpc_call.return_value = list(self._ROWS)
         flat = await api.suggest_reports("nb_123")
-
         assert wrapped == flat
         assert len(flat) == 2
 
@@ -1082,9 +1096,7 @@ class TestSuggestReportsUnwrap:
         """A single flat row (``[row]``) is not mistaken for a wrapped list."""
         api, mock_core = mock_artifacts_api
         mock_core.rpc_executor.rpc_call.return_value = [list(self._ROWS[0])]
-
         suggestions = await api.suggest_reports("nb_123")
-
         assert len(suggestions) == 1
         assert suggestions[0].title == "Briefing Doc"
         assert suggestions[0].prompt == "Write a briefing."
@@ -1094,9 +1106,7 @@ class TestSuggestReportsUnwrap:
         """A wrapped single row (``[[row]]``) unwraps to one suggestion."""
         api, mock_core = mock_artifacts_api
         mock_core.rpc_executor.rpc_call.return_value = [[list(self._ROWS[0])]]
-
         suggestions = await api.suggest_reports("nb_123")
-
         assert len(suggestions) == 1
         assert suggestions[0].title == "Briefing Doc"
         assert suggestions[0].prompt == "Write a briefing."
@@ -1106,7 +1116,6 @@ class TestSuggestReportsUnwrap:
         """An empty response yields no suggestions."""
         api, mock_core = mock_artifacts_api
         mock_core.rpc_executor.rpc_call.return_value = []
-
         assert await api.suggest_reports("nb_123") == []
 
     @pytest.mark.asyncio
@@ -1114,5 +1123,4 @@ class TestSuggestReportsUnwrap:
         """A wrapped-empty response (``[[]]``) yields no suggestions without error."""
         api, mock_core = mock_artifacts_api
         mock_core.rpc_executor.rpc_call.return_value = [[]]
-
         assert await api.suggest_reports("nb_123") == []

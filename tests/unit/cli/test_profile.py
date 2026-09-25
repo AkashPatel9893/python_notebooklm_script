@@ -3,10 +3,12 @@
 import importlib
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -146,6 +148,22 @@ class TestProfileListAccountMetadata:
         }
         assert result.stderr == ""
 
+    def test_text_reports_filesystem_error(self, runner, tmp_path):
+        # The text-mode list path used to be unwrapped (the --json path above is
+        # already routed through handle_errors), so a filesystem failure escaped
+        # as a raw traceback. It must now surface a friendly error + exit 1.
+        with patch.object(profile_module, "list_profiles", side_effect=OSError("denied")):
+            result = runner.invoke(
+                cli,
+                ["profile", "list"],
+                env=notebooklm_env(tmp_path),
+                catch_exceptions=True,
+            )
+
+        assert result.exit_code == 1, result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Failed to list profiles: denied" in result.output
+
 
 class TestProfileCreateCommand:
     @pytest.mark.parametrize("name", [".", "-work", "_work", "work/team", "../work"])
@@ -163,6 +181,26 @@ class TestProfileCreateCommand:
 
         assert result.exit_code == 1
         assert "Profile 'work' already exists." in result.output
+
+    def test_create_reports_mkdir_failure(self, runner, tmp_path):
+        # A filesystem failure while materializing the profile directory must
+        # yield a friendly error + exit 1, not a raw traceback / exit 2.
+        def fake_get_profile_dir(name, create=False):
+            if create:
+                raise OSError("read-only filesystem")
+            return tmp_path / "profiles" / name
+
+        with patch.object(profile_module, "get_profile_dir", side_effect=fake_get_profile_dir):
+            result = runner.invoke(
+                cli,
+                ["profile", "create", "work"],
+                env=notebooklm_env(tmp_path),
+                catch_exceptions=True,
+            )
+
+        assert result.exit_code == 1, result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Failed to create profile 'work': read-only filesystem" in result.output
 
 
 class TestProfileSwitchCommand:
@@ -228,7 +266,7 @@ class TestProfileSwitchCommand:
         config_path = tmp_path / "config.json"
 
         with patch.object(
-            profile_module, "_atomic_write_config", side_effect=OSError("permission denied")
+            profile_module, "atomic_update_json", side_effect=OSError("permission denied")
         ):
             result = runner.invoke(
                 cli,
@@ -299,6 +337,31 @@ class TestProfileDeleteCommand:
         assert "Profile 'old' deleted." in result.output
         assert not (tmp_path / "profiles" / "old").exists()
 
+    def test_delete_reports_rmtree_failure(self, runner, tmp_path, monkeypatch):
+        # A locked/partially-deleted profile directory (common on Windows when
+        # the browser profile is held by AV/the browser) must yield a friendly
+        # error + exit 1, not a raw traceback or the exit-2 bug-report path.
+        make_profile(tmp_path, "old")
+
+        # Patch the consumer-side binding (profile_module.shutil) rather than the
+        # global shutil module: wrap the real module and override only rmtree, so
+        # the simulated failure stays isolated to this command and never mutates
+        # the process-wide shutil (ADR-0007 object-target form on the consumer).
+        fake_shutil = MagicMock(wraps=shutil)
+        fake_shutil.rmtree.side_effect = OSError("locked")
+        monkeypatch.setattr(profile_module, "shutil", fake_shutil)
+        result = runner.invoke(
+            cli,
+            ["profile", "delete", "old", "--confirm"],
+            env=notebooklm_env(tmp_path),
+            catch_exceptions=True,
+        )
+
+        assert result.exit_code == 1, result.output
+        # Friendly Click error path — never an uncaught traceback.
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Failed to delete profile 'old': locked" in result.output
+
 
 class TestProfileRenameCommand:
     def test_rename_profile_success(self, runner, tmp_path):
@@ -315,6 +378,30 @@ class TestProfileRenameCommand:
         assert "Profile renamed: work" in result.output
         assert not (tmp_path / "profiles" / "work").exists()
         assert (tmp_path / "profiles" / "client" / "context.json").exists()
+
+    def test_rename_reports_move_failure(self, runner, tmp_path, monkeypatch):
+        # A failure moving the profile directory (e.g. a locked browser-profile
+        # file held by AV/the browser on Windows) must yield a friendly error +
+        # exit 1, not a raw traceback / exit 2.
+        make_profile(tmp_path, "work")
+
+        # Patch the consumer-side binding (profile_module.os) rather than the
+        # global os module: wrap the real module and override only rename, so
+        # the simulated failure stays isolated to this command and never mutates
+        # the process-wide os (ADR-0007 object-target form on the consumer).
+        fake_os = MagicMock(wraps=os)
+        fake_os.rename.side_effect = OSError("locked")
+        monkeypatch.setattr(profile_module, "os", fake_os)
+        result = runner.invoke(
+            cli,
+            ["profile", "rename", "work", "client"],
+            env=notebooklm_env(tmp_path),
+            catch_exceptions=True,
+        )
+
+        assert result.exit_code == 1, result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "Failed to rename profile 'work': locked" in result.output
 
     def test_rename_updates_configured_default_profile(self, runner, tmp_path):
         make_profile(tmp_path, "work")
@@ -387,3 +474,183 @@ class TestProfileRenameCommand:
         assert result.exit_code == 0, result.output
         assert (tmp_path / "profiles" / "client").exists()
         assert read_config(tmp_path) == {}
+
+
+class TestProfileJsonOutput:
+    """``--json`` emits a single parseable document for every profile mutation."""
+
+    def test_create_json(self, runner, tmp_path):
+        result = runner.invoke(
+            cli, ["profile", "create", "work", "--json"], env=notebooklm_env(tmp_path)
+        )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == {"profile": "work", "status": "created"}
+        assert (tmp_path / "profiles" / "work").exists()
+
+    def test_switch_json(self, runner, tmp_path):
+        make_profile(tmp_path, "work")
+        result = runner.invoke(
+            cli, ["profile", "switch", "work", "--json"], env=notebooklm_env(tmp_path)
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload == {"profile": "work", "status": "switched"}
+        assert read_config(tmp_path)["default_profile"] == "work"
+
+    def test_delete_json_skips_confirm(self, runner, tmp_path):
+        make_profile(tmp_path, "default")
+        make_profile(tmp_path, "work")
+        # No --yes: --json must imply non-interactive and delete without prompting.
+        result = runner.invoke(
+            cli, ["profile", "delete", "work", "--json"], env=notebooklm_env(tmp_path)
+        )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == {"profile": "work", "status": "deleted"}
+        assert not (tmp_path / "profiles" / "work").exists()
+
+    def test_rename_json(self, runner, tmp_path):
+        make_profile(tmp_path, "work")
+        result = runner.invoke(
+            cli, ["profile", "rename", "work", "client", "--json"], env=notebooklm_env(tmp_path)
+        )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == {
+            "old_name": "work",
+            "new_name": "client",
+            "default_updated": False,
+            "status": "renamed",
+            "config_warning": None,
+        }
+        assert (tmp_path / "profiles" / "client").exists()
+
+    def test_create_duplicate_json_error_envelope(self, runner, tmp_path):
+        """A validation failure under ``--json`` still emits one JSON document on
+        stdout (the grouped-CLI ClickException -> envelope path), not human text."""
+        make_profile(tmp_path, "work")
+        result = runner.invoke(
+            cli, ["profile", "create", "work", "--json"], env=notebooklm_env(tmp_path)
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["error"] is True
+        assert payload["code"] == "VALIDATION_ERROR"
+
+    def test_switch_missing_json_error_envelope(self, runner, tmp_path):
+        result = runner.invoke(
+            cli, ["profile", "switch", "missing", "--json"], env=notebooklm_env(tmp_path)
+        )
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["error"] is True
+        assert payload["code"] == "VALIDATION_ERROR"
+
+
+class TestProfileNameTranslation:
+    """``_validate_profile_name_or_click`` owns the service->Click translation.
+
+    ADR-0015 Pattern B: the login service raises ``LoginConfigurationError``
+    and this command layer converts it, appending the hint when there is one.
+    """
+
+    def test_a_valid_name_passes_through(self):
+        assert profile_module._validate_profile_name_or_click("work") == "work"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="whitespace-only"),
+            pytest.param("!!bad", id="illegal-characters"),
+            pytest.param("../escape", id="path-traversal-shaped"),
+            pytest.param("-leading-hyphen", id="illegal-leading-character"),
+        ],
+    )
+    def test_an_invalid_name_is_reported_with_the_service_hint(self, name):
+        """Driven through the real validator rather than a patched one.
+
+        ``_validate_profile_name`` always attaches a hint, so the hintless
+        branch of the translation is unreachable without substituting the
+        validator — which the ADR-0007 monkeypatch guardrail forbids, and
+        which would only assert that a stub was called.
+        """
+        with pytest.raises(click.ClickException) as caught:
+            profile_module._validate_profile_name_or_click(name)
+
+        message = str(caught.value)
+        assert "Invalid profile name" in message
+        assert "alphanumeric characters, hyphens, and underscores" in message
+        # The service exception is not chained into the user-facing error.
+        assert caught.value.__cause__ is None
+
+
+class TestReadConfigErrorPolicy:
+    """``_read_config`` tolerates a corrupt config only when asked to."""
+
+    def test_a_missing_config_reads_as_empty(self, tmp_path):
+        assert profile_module._read_config(tmp_path / "absent.json") == {}
+
+    def test_a_corrupt_config_is_suppressed_by_default(self, tmp_path):
+        path = tmp_path / "config.json"
+        path.write_text("{not json", encoding="utf-8")
+
+        assert profile_module._read_config(path) == {}
+
+    def test_a_corrupt_config_propagates_when_errors_are_not_suppressed(self, tmp_path):
+        path = tmp_path / "config.json"
+        path.write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(json.JSONDecodeError):
+            profile_module._read_config(path, suppress_errors=False)
+
+    def test_a_non_object_payload_reads_as_empty(self, tmp_path):
+        path = tmp_path / "config.json"
+        path.write_text("[1, 2]", encoding="utf-8")
+
+        assert profile_module._read_config(path) == {}
+
+
+class TestProfilePathValidationIsTranslated:
+    """A traversal-shaped profile name surfaces as a friendly Click error.
+
+    ``get_profile_dir`` raises ``ValueError`` when the resolved name would
+    escape the profiles directory. Each command must translate that rather
+    than letting it escape as a traceback.
+    """
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            pytest.param(["profile", "create", "work"], id="create"),
+            pytest.param(["profile", "switch", "work"], id="switch"),
+            pytest.param(["profile", "delete", "work", "--yes"], id="delete"),
+            pytest.param(["profile", "rename", "work", "other"], id="rename"),
+        ],
+    )
+    def test_a_path_traversal_name_is_reported_not_raised(self, runner, tmp_path, argv):
+        with patch.object(
+            profile_module,
+            "get_profile_dir",
+            side_effect=ValueError("Profile name escapes the profiles directory"),
+        ):
+            result = runner.invoke(cli, argv, env=notebooklm_env(tmp_path))
+
+        assert result.exit_code == 1, result.output
+        assert "escapes the profiles directory" in result.output
+        assert "Traceback" not in result.output
+
+
+class TestRenameDestinationGuard:
+    def test_renaming_onto_an_existing_profile_is_refused(self, runner, tmp_path):
+        profiles = tmp_path / "profiles"
+        (profiles / "work").mkdir(parents=True)
+        (profiles / "taken").mkdir(parents=True)
+
+        result = runner.invoke(
+            cli, ["profile", "rename", "work", "taken"], env=notebooklm_env(tmp_path)
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "already exists" in result.output
+        # Neither directory is touched by the refusal.
+        assert (profiles / "work").exists()
+        assert (profiles / "taken").exists()

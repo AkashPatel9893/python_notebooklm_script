@@ -5,14 +5,14 @@ Why this file exists
 VCR cassette replay matches on the ``rpcids`` query param plus a *structural*
 ``f.req`` body matcher (``tests/vcr_config.py`` — ``_rpcids_matcher`` /
 ``_freq_body_matcher``). That matcher deliberately compares request **shape**,
-**not** leaf values (see the ``_shape_only`` docstring near
-``tests/vcr_config.py:420``: it compares structure, "not 'same leaf values'").
+**not** leaf values (see the ``_shape_only`` docstring in ``tests/vcr_config.py``:
+it compares structure, "not 'same leaf values'").
 Those tolerant matchers earn the suite cross-platform stability — a cassette
 recorded against one notebook replays for a different one — and we keep them.
 
 But that tolerance has one blind spot: a green cassette does **not** prove the
 *decoder* mapped the recorded bytes onto the right dataclass fields. A
-positional mis-map (the exact failure class the ``_row_adapters`` exist to
+positional mis-map (the exact failure class the ``_web.rows`` exist to
 prevent) or a leaf-shape drift can still replay green because the matcher never
 looks at the recorded *response* leaves — only the request shape. The rest of
 the VCR suite (``test_vcr_comprehensive.py``) mostly asserts
@@ -47,15 +47,14 @@ from __future__ import annotations
 
 import os
 import reprlib
-from contextlib import asynccontextmanager
-from typing import Any
 
 import pytest
-from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
-from tests.vcr_config import notebooklm_vcr
 
-from notebooklm import NotebookLMClient
-from notebooklm.types import Artifact, ArtifactType, Source, SourceType
+from notebooklm.types import Artifact, ArtifactType, Source, SourceType, utf16_len
+from tests.integration._golden_assert import assert_decoded_equals
+from tests.integration._vcr_helpers import vcr_client
+from tests.integration.conftest import skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # Skip all tests in this module if cassettes are not available.
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
@@ -80,37 +79,10 @@ MUTABLE_NOTEBOOK_ID = os.environ.get(
 _CHAT_MATCH_ON = ["method", "scheme", "host", "port", "path", "freq"]
 
 
-@asynccontextmanager
-async def vcr_client():
-    """Authenticated client bound to VCR replay (mock auth in replay mode)."""
-    auth = await get_vcr_auth()
-    async with NotebookLMClient(auth) as client:
-        yield client
-
-
-# =============================================================================
-# Golden helper
-# =============================================================================
-
-
-def assert_decoded_equals(actual: Any, expected: Any, *, field: str) -> None:
-    """Pin one decoded leaf value, with a decode-drift-flavoured failure message.
-
-    A thin wrapper over ``assert actual == expected`` whose only value is the
-    message: when a golden value diverges it is almost always a *decoder*
-    regression (a positional column mis-map or a leaf-shape change in the
-    recorded response), not a test bug — the message says so, and names the
-    field, so the failure points at the right place. ``field`` is a
-    human-readable label like ``"artifacts_list[0].kind"``.
-    """
-    assert actual == expected, (
-        f"Decoded golden value drift for {field}: "
-        f"expected {reprlib.repr(expected)}, got {reprlib.repr(actual)}. "
-        "The cassette replayed but the decoder produced a different leaf value than the "
-        "golden recording — likely a positional mis-map (row-adapter column moved) or a "
-        "leaf-shape change in the recorded response. If the cassette was deliberately "
-        "re-recorded against a different notebook, refresh the golden value here."
-    )
+# ``assert_decoded_equals`` and ``vcr_client`` live in
+# ``tests/integration/_golden_assert.py`` / ``_vcr_helpers.py`` so the
+# expansion module (``test_golden_decoded_vcr_expansion.py``) can share them
+# without a cross-test-module import.
 
 
 # =============================================================================
@@ -132,7 +104,7 @@ class TestChatGoldenDecoded:
     @pytest.mark.vcr
     @pytest.mark.asyncio
     @notebooklm_vcr.use_cassette("chat_ask.yaml", match_on=_CHAT_MATCH_ON)
-    async def test_ask_decoded_golden(self):
+    async def test_ask_decoded_golden(self, legacy_vcr_follow_up_probe):
         """``chat.ask`` decodes the recorded answer / conversation / references."""
         async with vcr_client() as client:
             result = await client.chat.ask(
@@ -148,27 +120,39 @@ class TestChatGoldenDecoded:
             "This notebook is about **NotebookLM**, an online research"
         ), f"Unexpected answer head: {reprlib.repr(result.answer)}"
 
-        # Conversation id + turn metadata.
+        # Conversation id + turn metadata. The cassette's pre-POST hPTbtc
+        # resolve returns a current conversation id (bc0666c8), so this null ask
+        # resumes the notebook's existing conversation → is_follow_up is True
+        # (#1965). The fixture supplies its one prior server turn, so even this
+        # fresh client reports the coherent server-derived ordinal (#1976).
         assert_decoded_equals(
             result.conversation_id,
             "bc0666c8-34b5-4bf8-817f-554867ea6ee8",
             field="chat_ask.conversation_id",
         )
-        assert_decoded_equals(result.turn_number, 1, field="chat_ask.turn_number")
-        assert_decoded_equals(result.is_follow_up, False, field="chat_ask.is_follow_up")
+        assert_decoded_equals(result.turn_number, 2, field="chat_ask.turn_number")
+        assert_decoded_equals(result.is_follow_up, True, field="chat_ask.is_follow_up")
 
         # References: pin (citation_number, source_id, start_char, end_char) for
         # every reference, in order. This is the positional-decode canary — a
         # column slip in the reference parser would scramble the offset pairing
         # or the citation ordering while the cassette still replays.
+        #
+        # Refreshed by #2120: every end_char moved outward because the citation
+        # decoder now descends the whole ``Citation.fragment``, not just its
+        # first block. Reference 1 went 1459..1610 -> 1459..2089, and the
+        # fragments now tile the source contiguously (1459-2089-2744-3378-3905
+        # -4595-5247-5967) exactly as adjacent chunks of one document should.
+        # This is a *decoder* change, not a re-recording: the cassette is
+        # untouched.
         expected_refs = [
-            (1, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 1459, 1610),
-            (2, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2089, 2396),
-            (3, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3905, 4071),
-            (4, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3378, 3679),
-            (5, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 4595, 5000),
-            (6, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 5247, 5725),
-            (7, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2744, 2751),
+            (1, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 1459, 2089),
+            (2, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2089, 2744),
+            (3, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3905, 4595),
+            (4, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3378, 3905),
+            (5, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 4595, 5247),
+            (6, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 5247, 5967),
+            (7, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2744, 3378),
         ]
         actual_refs = [
             (r.citation_number, r.source_id, r.start_char, r.end_char) for r in result.references
@@ -181,10 +165,40 @@ class TestChatGoldenDecoded:
             assert ref.start_char is not None and ref.end_char is not None
             assert ref.start_char <= ref.end_char
 
+        # Answer-side annotation map (#2120): the answer's own responseDoc
+        # carries 15 anchors over a 1,762-unit document — a coordinate
+        # space distinct from the 1,871-character answer string, which also
+        # carries markdown emphasis and the inline [N] markers. Every reference
+        # is anchored, and each anchor is joined by object id, not by position.
+        assert_decoded_equals(
+            len(result.answer_document.blocks), 7, field="chat_ask.answer_document blocks"
+        )
+        assert_decoded_equals(
+            len(result.answer_document.annotations),
+            15,
+            field="chat_ask.answer_document annotations",
+        )
+        assert_decoded_equals(
+            utf16_len(result.answer_document.text),
+            1762,
+            field="chat_ask.answer_document extent",
+        )
+        actual_answer_ranges = [
+            (r.answer_anchor_start, r.answer_anchor_end) for r in result.references
+        ]
+        assert_decoded_equals(
+            actual_answer_ranges,
+            [(33, 153), (33, 153), (389, 527), (527, 657), (887, 1050), (887, 1050), (1073, 1247)],
+            field="chat_ask.references answer-document ranges",
+        )
+        for ref in result.references:
+            # Anchors are UTF-16 offsets, so bound them in UTF-16 units.
+            assert ref.answer_anchor_end <= utf16_len(result.answer_document.text)
+
     @pytest.mark.vcr
     @pytest.mark.asyncio
     @notebooklm_vcr.use_cassette("chat_ask_with_references.yaml", match_on=_CHAT_MATCH_ON)
-    async def test_ask_with_references_decoded_golden(self):
+    async def test_ask_with_references_decoded_golden(self, legacy_vcr_follow_up_probe):
         """``chat.ask`` decodes per-reference offsets AND server relevance scores.
 
         This cassette additionally exercises the ``score`` slot (server-side
@@ -209,16 +223,19 @@ class TestChatGoldenDecoded:
         )
 
         # (citation_number, source_id, start_char, end_char) — in answer order.
+        # Refreshed by #2120 (see the note on the sibling test): reference 9's
+        # range went 5967..5983 -> 5967..9894, i.e. 16 characters of cited text
+        # to 3,945. The cassette is unchanged; only the decoder moved.
         expected_refs = [
-            (1, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 1459, 1610),
-            (2, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2089, 2396),
-            (3, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2744, 2751),
-            (4, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3378, 3679),
-            (5, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 4595, 5000),
-            (6, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3905, 4071),
-            (7, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 5247, 5725),
-            (8, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 9894, 9989),
-            (9, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 5967, 5983),
+            (1, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 1459, 2089),
+            (2, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2089, 2744),
+            (3, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 2744, 3378),
+            (4, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3378, 3905),
+            (5, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 4595, 5247),
+            (6, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 3905, 4595),
+            (7, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 5247, 5967),
+            (8, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 9894, 10342),
+            (9, "466b9ee3-c1ce-45ef-861c-1d4bfcd939ad", 5967, 9894),
         ]
         actual_refs = [
             (r.citation_number, r.source_id, r.start_char, r.end_char) for r in result.references
@@ -236,6 +253,42 @@ class TestChatGoldenDecoded:
         ]
         assert_decoded_equals(
             actual_scores, expected_scores, field="chat_ask_with_references.reference scores"
+        )
+
+        # Cited text now spans the whole fragment (#2120). Pinning the lengths
+        # is the regression canary for the two-level descent: the pre-fix
+        # decoder returned only each fragment's first block, and the naive
+        # one-level "fix" returns None for every one of these. Reference 9 is
+        # the headline: 16 characters before, 3,945 now. Reference 1's 632
+        # includes 234 characters of infobox *table* text, which no version of
+        # this decoder reached before #2128 taught it to walk table cells.
+        #
+        # These lengths do NOT all equal their ranges above, and that is a
+        # property of the cassette rather than of the decoder: the scrubber
+        # substitutes the 13-character literal SCRUBBED_NAME for shorter real
+        # names without adjusting the recorded offsets, so each redacted run
+        # carries a couple of characters more than it declares. Refs 1/6/9 run
+        # long for that reason and refs 2/8 short because their fragments span
+        # positions this client does not decode as text. ``cited_text`` is the
+        # verbatim reading; ``document.slice()`` is the one whose length is
+        # guaranteed. Changing the scrub placeholder will move these numbers.
+        actual_cited_lengths = [len(r.cited_text or "") for r in result.references]
+        assert_decoded_equals(
+            actual_cited_lengths,
+            [632, 654, 634, 527, 652, 692, 720, 442, 3945],
+            field="chat_ask_with_references.cited_text lengths",
+        )
+        assert all(r.cited_text for r in result.references)
+        # Answer-side annotation map (#2120).
+        assert_decoded_equals(
+            len(result.answer_document.annotations),
+            19,
+            field="chat_ask_with_references.answer_document annotations",
+        )
+        assert_decoded_equals(
+            utf16_len(result.answer_document.text),
+            1933,
+            field="chat_ask_with_references.answer_document extent",
         )
         for ref in result.references:
             assert ref.score is not None

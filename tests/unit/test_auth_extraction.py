@@ -1,8 +1,8 @@
-"""Tests for auth cookie/token extraction and AuthTokens dataclass (split from tests/unit/test_auth.py for D1 PR-2).
+"""Tests for auth cookie/token extraction and AuthTokens dataclass (split in D1 PR-2).
 
 This file owns one concern from the auth subpackage. The original
-``tests/unit/test_auth.py`` (4090 LOC) was split into six concern-aligned
-files alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
+monolithic auth test module was split into six concern-aligned files
+alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
 (superseded) and ADR-0007 (test-monkeypatch policy) for the rationale.
 """
 
@@ -10,16 +10,17 @@ import json
 
 import pytest
 
-from notebooklm._auth.extraction import _safe_url
+from notebooklm._auth.cookies import load_httpx_cookies
+from notebooklm._auth.extraction import (
+    _safe_url,
+    extract_csrf_from_html,
+    extract_session_id_from_html,
+)
+from notebooklm._auth.storage import save_cookies_to_storage, snapshot_cookie_jar
 from notebooklm.auth import (
     AuthTokens,
     build_httpx_cookies_from_storage,
     extract_cookies_from_storage,
-    extract_csrf_from_html,
-    extract_session_id_from_html,
-    load_httpx_cookies,
-    save_cookies_to_storage,
-    snapshot_cookie_jar,
 )
 
 
@@ -36,11 +37,12 @@ class TestAuthTokens:
             ("__Secure-1PSIDTS", ".google.com", "/"): "test_1psidts",
             ("HSID", ".google.com", "/"): "def",
         }
-        assert tokens.flat_cookies == {
-            "SID": "abc",
-            "__Secure-1PSIDTS": "test_1psidts",
-            "HSID": "def",
-        }
+        with pytest.warns(DeprecationWarning, match="flat_cookies"):
+            assert tokens.flat_cookies == {
+                "SID": "abc",
+                "__Secure-1PSIDTS": "test_1psidts",
+                "HSID": "def",
+            }
         assert tokens.csrf_token == "csrf123"
         assert tokens.session_id == "sess456"
 
@@ -425,8 +427,8 @@ class TestCookieAttributePreservation:
         """Load → save (no mutation) → reload preserves attrs.
 
         This is the silent-erosion path users hit on idle calls: nothing
-        changes, but the save side appends fresh entries from the in-memory
-        jar (auth.py:1095). Without the load-side fix, those appended entries
+        changes, but the save side appends fresh entries from the in-memory jar
+        (``notebooklm._auth.storage.save_cookies_to_storage``). Without the load-side fix, those appended entries
         would carry default ``path=/``, ``secure=False``, ``httpOnly=False``.
         """
         storage_file = tmp_path / "storage_state.json"
@@ -669,7 +671,7 @@ class TestExtractCookiesEdgeCases:
         assert len(cookies) == 2
 
     def test_handles_cookie_with_empty_value(self):
-        """Test handles cookies with empty values."""
+        """Empty required values are skipped and produce the typed failure."""
         storage_state = {
             "cookies": [
                 {"name": "SID", "value": "", "domain": ".google.com"},
@@ -677,8 +679,8 @@ class TestExtractCookiesEdgeCases:
             ]
         }
 
-        cookies = extract_cookies_from_storage(storage_state)
-        assert cookies["SID"] == ""
+        with pytest.raises(ValueError, match="Missing required cookies: SID"):
+            extract_cookies_from_storage(storage_state)
 
 
 class TestExtractCSRFRedirect:
@@ -692,12 +694,20 @@ class TestExtractCSRFRedirect:
         with pytest.raises(ValueError, match="Authentication expired"):
             extract_csrf_from_html(html, final_url)
 
-    def test_raises_on_redirect_to_accounts_in_html(self):
-        """Test raises error when redirected to accounts.google.com (HTML content)."""
+    def test_accounts_link_in_body_alone_is_not_an_expiry(self):
+        """An accounts.google.com link in the BODY must not be read as expiry (#2038).
+
+        This previously raised "Authentication expired or invalid" via the
+        ``contains_google_auth_redirect(html)`` fallback. Nearly every
+        Google-served page carries such a link, so the fallback made a
+        wrong-page failure indistinguishable from a real expiry. Without a
+        final URL saying otherwise, the honest answer is "token not found".
+        """
         html = '<html><body><a href="https://accounts.google.com/signin">Sign in</a></body></html>'
 
-        with pytest.raises(ValueError, match="Authentication expired"):
+        with pytest.raises(ValueError, match="CSRF token not found") as exc:
             extract_csrf_from_html(html)
+        assert "Authentication expired" not in str(exc.value)
 
 
 class TestExtractSessionIdRedirect:
@@ -711,9 +721,263 @@ class TestExtractSessionIdRedirect:
         with pytest.raises(ValueError, match="Authentication expired"):
             extract_session_id_from_html(html, final_url)
 
-    def test_raises_on_redirect_to_accounts_in_html(self):
-        """Test raises error when redirected to accounts.google.com (HTML content)."""
+    def test_accounts_link_in_body_alone_is_not_an_expiry(self):
+        """Body-scan symmetry with the CSRF sibling — see that test's rationale."""
         html = '<html><body><a href="https://accounts.google.com/signin">Sign in</a></body></html>'
 
-        with pytest.raises(ValueError, match="Authentication expired"):
+        with pytest.raises(ValueError, match="Session ID not found") as exc:
             extract_session_id_from_html(html)
+        assert "Authentication expired" not in str(exc.value)
+
+
+class TestUnavailableRedirectClassification:
+    """A redirect to notebooklm.google is the region/anti-abuse gate, not a drift (#1630)."""
+
+    _MARKETING_HTML = "<html><body>NotebookLM marketing splash — no WIZ_global_data.</body></html>"
+
+    def test_csrf_classifies_location_unsupported_redirect(self):
+        with pytest.raises(ValueError) as exc:
+            extract_csrf_from_html(
+                self._MARKETING_HTML, "https://notebooklm.google/?location=unsupported"
+            )
+        msg = str(exc.value)
+        assert "region / anti-abuse access gate" in msg
+        assert "location=unsupported" in msg  # the diagnostic is surfaced, not swallowed
+        assert "page structure" not in msg  # NOT the misleading file-a-bug message
+
+    def test_session_id_classifies_redirect(self):
+        with pytest.raises(ValueError) as exc:
+            extract_session_id_from_html(self._MARKETING_HTML, "https://notebooklm.google")
+        msg = str(exc.value)
+        assert "region / anti-abuse access gate" in msg
+        assert "page structure" not in msg
+
+    def test_app_host_drift_still_says_page_structure(self):
+        # A token-less response from the real APP host (not the gate) keeps the
+        # original "page structure" message — the gate branch must not capture it.
+        with pytest.raises(ValueError, match="page structure"):
+            extract_csrf_from_html(self._MARKETING_HTML, "https://notebooklm.google.com/")
+
+    # The real notebooklm.google gate page carries an accounts.google.com sign-in
+    # link; the authoritative final-URL gate check must win over the body scan,
+    # otherwise it mis-routes to "Authentication expired" (the codex finding).
+    _GATE_HTML_WITH_SIGNIN = (
+        '<html><body>NotebookLM <a href="https://accounts.google.com/ServiceLogin">'
+        "Sign in</a></body></html>"
+    )
+
+    def test_csrf_gate_wins_over_accounts_link_in_body(self):
+        with pytest.raises(ValueError) as exc:
+            extract_csrf_from_html(
+                self._GATE_HTML_WITH_SIGNIN, "https://notebooklm.google/?location=unsupported"
+            )
+        msg = str(exc.value)
+        assert "region / anti-abuse access gate" in msg
+        assert "Authentication expired" not in msg
+
+    def test_session_id_gate_wins_over_accounts_link_in_body(self):
+        with pytest.raises(ValueError) as exc:
+            extract_session_id_from_html(
+                self._GATE_HTML_WITH_SIGNIN, "https://notebooklm.google/?location=unsupported"
+            )
+        msg = str(exc.value)
+        assert "region / anti-abuse access gate" in msg
+        assert "Authentication expired" not in msg
+
+    def test_gate_message_does_not_trigger_auto_refresh(self):
+        # An environmental gate must NOT match the auth-error signals that drive
+        # NOTEBOOKLM_REFRESH_CMD — re-auth can't fix it, so refreshing is futile.
+        # Pin it so a careless reword of the message can't silently re-enable it.
+        from notebooklm._auth.refresh import _AUTH_ERROR_SIGNALS
+
+        with pytest.raises(ValueError) as exc:
+            extract_csrf_from_html(
+                self._GATE_HTML_WITH_SIGNIN, "https://notebooklm.google/?location=unsupported"
+            )
+        lowered = str(exc.value).lower()
+        assert not any(signal in lowered for signal in _AUTH_ERROR_SIGNALS)
+
+
+class TestExtractionFailureTaxonomy:
+    """Each distinct extraction failure must produce a distinguishable message (#2038).
+
+    Before this taxonomy existed, the drift path fell back to
+    ``contains_google_auth_redirect(html)`` — a scan that returns True for any
+    ``accounts.google.com`` URL anywhere in the body. Practically every
+    Google-served page qualifies, so a wrong-page failure was reported as
+    "Authentication expired or invalid. Run 'notebooklm login' to
+    re-authenticate." with no final URL attached.
+
+    That is not hypothetical: the scheduled ``rpc-health`` workflow failed with
+    exactly that message every day from 2026-07-28 to 2026-08-03 (#2019) while
+    the credentials were valid the whole time — proven by a passing nightly
+    Windows E2E run on the same ``NOTEBOOKLM_AUTH_JSON``. Three users piled onto
+    the auto-filed issue assuming an unrelated login bug.
+
+    The four fixtures below are the four real conditions. They must never
+    collapse into one another again.
+    """
+
+    # 1. Genuine expiry — the chain actually landed on the login host.
+    _LOGIN_HTML = "<html><body>Sign in to continue</body></html>"
+    _LOGIN_URL = "https://accounts.google.com/ServiceLogin"
+
+    # 2. Cookie mismatch — the interstitial 302s onward, so it is visible ONLY
+    #    in the redirect history. This is the real #2019 chain.
+    _MISMATCH_HOP = "https://accounts.google.com/CookieMismatch?continue=https%3A%2F%2Fx"
+    _SUPPORT_URL = "https://support.google.com/accounts/answer/32050"
+
+    # 3. False positive — an ordinary HTTP 200 Google help article. Its body is
+    #    full of accounts.google.com links; the session is fine.
+    _HELP_HTML = (
+        "<html><body><h1>Why Google signed you out</h1>"
+        '<a href="https://accounts.google.com/signin">Sign in</a>'
+        '<a href="https://accounts.google.com/b/0/AddMailService">Add account</a>'
+        "</body></html>"
+    )
+
+    # 4. Real structure change — served BY the app host, but no WIZ_global_data.
+    _APP_HTML = "<html><body><div id='app'>NotebookLM</div></body></html>"
+    _APP_URL = "https://notebooklm.google.com/"
+
+    @staticmethod
+    def _message(html: str, final_url: str, *redirect_urls: str) -> str:
+        """Run one fixture through the classifier and return the message it raised."""
+        with pytest.raises(ValueError) as exc:
+            extract_csrf_from_html(html, final_url, redirect_urls=redirect_urls)
+        return str(exc.value)
+
+    def _messages(self) -> dict[str, str]:
+        """Raise all four fixtures and collect their messages, keyed by condition."""
+        return {
+            "expiry": self._message(self._LOGIN_HTML, self._LOGIN_URL),
+            "mismatch": self._message(self._HELP_HTML, self._SUPPORT_URL, self._MISMATCH_HOP),
+            "false_positive": self._message(self._HELP_HTML, self._SUPPORT_URL),
+            "structure": self._message(self._APP_HTML, self._APP_URL),
+        }
+
+    def test_all_four_messages_are_distinct(self):
+        """The whole point: four conditions, four messages."""
+        messages = self._messages()
+        assert len(set(messages.values())) == 4, messages
+
+    def test_every_message_carries_the_final_url(self):
+        """Requirement 1 — the final URL is the single most useful evidence."""
+        messages = self._messages()
+        expected_host = {
+            "expiry": "accounts.google.com",
+            "mismatch": "support.google.com",
+            "false_positive": "support.google.com",
+            "structure": "notebooklm.google.com",
+        }
+        for name, message in messages.items():
+            assert expected_host[name] in message, f"{name} lost the final URL: {message!r}"
+
+    def test_genuine_expiry_still_says_expired(self):
+        """The legacy substring contract survives, now with the URL attached."""
+        message = self._messages()["expiry"]
+        assert "Authentication expired" in message
+        assert "notebooklm login" in message
+        # accounts.google.com paths are credential-shaped and stay redacted.
+        assert "ServiceLogin" not in message
+
+    def test_cookie_mismatch_is_its_own_diagnostic(self):
+        """Requirement 2 — a CookieMismatch hop is NOT folded into "expired"."""
+        message = self._messages()["mismatch"]
+        assert "CookieMismatch" in message
+        assert "Authentication expired" not in message
+        assert "cookie-scoping" in message
+        # The ``continue=`` target is credential-shaped and must not leak.
+        assert "continue=" not in message
+
+    def test_false_positive_is_not_reported_as_expiry(self):
+        """Regression for #2019: a help article is not an expired session.
+
+        Written to FAIL against the pre-#2038 implementation, which raised
+        "Authentication expired or invalid" here.
+        """
+        message = self._messages()["false_positive"]
+        assert "Authentication expired" not in message
+        assert "CSRF token not found" in message
+        assert "never reached the app" in message
+
+    def test_structure_change_still_says_page_structure(self):
+        """A token-less page served BY the app host is a real drift signal."""
+        message = self._messages()["structure"]
+        assert "page structure has changed" in message
+        assert "Authentication expired" not in message
+        # ...and must NOT be mistaken for the off-host case.
+        assert "never reached the app" not in message
+
+    def test_taxonomy_is_symmetric_for_session_id(self):
+        """``extract_session_id_from_html`` shares the classifier, not a copy."""
+        with pytest.raises(ValueError) as exc:
+            extract_session_id_from_html(
+                self._HELP_HTML, self._SUPPORT_URL, redirect_urls=(self._MISMATCH_HOP,)
+            )
+        assert "CookieMismatch" in str(exc.value)
+
+        with pytest.raises(ValueError) as exc:
+            extract_session_id_from_html(self._HELP_HTML, self._SUPPORT_URL)
+        message = str(exc.value)
+        assert "Authentication expired" not in message
+        assert "Session ID not found" in message
+
+    def test_cookie_mismatch_as_final_url_also_classified(self):
+        """An unfollowed chain that ENDS on the interstitial must not say "expired".
+
+        ``final_url`` is checked alongside the history, so a caller that stopped
+        at the interstitial (or a transport that reports no history) still gets
+        the cookie-scoping diagnosis rather than the auth-redirect one.
+        """
+        with pytest.raises(ValueError) as exc:
+            extract_csrf_from_html(self._LOGIN_HTML, "https://accounts.google.com/CookieMismatch")
+        message = str(exc.value)
+        assert "CookieMismatch" in message
+        assert "Authentication expired" not in message
+
+    def test_cookie_mismatch_still_drives_refresh_cmd(self):
+        """Behaviour preservation: this case triggered NOTEBOOKLM_REFRESH_CMD before.
+
+        Today the same chain raises "Authentication expired ... run 'notebooklm
+        login'", which matches ``_AUTH_ERROR_SIGNALS`` and fires the refresh
+        command. Re-extracting cookies genuinely can fix a flattened-domain jar,
+        so the reworded message must keep matching — unlike the environmental
+        gate message, which deliberately does not (see
+        ``test_gate_message_does_not_trigger_auto_refresh``).
+        """
+        from notebooklm._auth.refresh import _AUTH_ERROR_SIGNALS
+
+        message = self._messages()["mismatch"].lower()
+        assert any(signal in message for signal in _AUTH_ERROR_SIGNALS)
+
+    def test_only_confirmed_login_redirect_has_private_recovery_type(self):
+        """L3/L4 can key on type without widening the public ValueError API."""
+        from notebooklm._auth import extraction
+
+        login = extraction._url_only_extraction_failure(self._LOGIN_URL, ())
+        mismatch = extraction._url_only_extraction_failure(
+            "https://accounts.google.com/CookieMismatch", ()
+        )
+
+        assert isinstance(login, ValueError)
+        assert isinstance(login, extraction._LoginRedirectError)
+        assert isinstance(mismatch, ValueError)
+        assert not isinstance(mismatch, extraction._LoginRedirectError)
+
+    def test_gate_still_wins_over_cookie_mismatch_ordering(self):
+        """#1630 must not regress: the region gate is classified first."""
+        with pytest.raises(ValueError) as exc:
+            extract_csrf_from_html(
+                self._HELP_HTML,
+                "https://notebooklm.google/?location=unsupported",
+                redirect_urls=(self._MISMATCH_HOP,),
+            )
+        assert "region / anti-abuse access gate" in str(exc.value)
+
+    def test_redirect_urls_is_keyword_only_and_optional(self):
+        """The added parameter must not break positional callers."""
+        with pytest.raises(ValueError, match="CSRF token not found"):
+            extract_csrf_from_html(self._APP_HTML, self._APP_URL)
+        with pytest.raises(TypeError):
+            extract_csrf_from_html(self._APP_HTML, self._APP_URL, (self._MISMATCH_HOP,))  # type: ignore[misc]

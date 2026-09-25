@@ -1,7 +1,7 @@
-"""Tests for ``ResearchAPI.import_sources_with_verification``.
+"""Tests for ``WebResearchAPI.import_sources_with_verification``.
 
-The retry-with-verification logic for ``IMPORT_RESEARCH`` timeouts lives
-on ``ResearchAPI`` as of issue #315. These tests were originally in
+The one-send import and bounded read-only inspection logic lives on
+``WebResearchAPI``. These tests were originally in
 ``tests/unit/cli/test_helpers.py::TestImportWithRetry`` (the logic used to
 live in ``cli/research_import.py``); they were moved here when the policy
 became a library-layer concern so Python API users get the same fix the
@@ -13,903 +13,459 @@ delegate — its tests cover only the wiring (still in ``test_helpers.py``).
 
 from __future__ import annotations
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import notebooklm._research as _research_mod
-from notebooklm._research import ResearchAPI
-from notebooklm.exceptions import NetworkError, RPCError, RPCTimeoutError
+import notebooklm._research as research_module
+from notebooklm._web.research import WebResearchAPI
+from notebooklm.exceptions import (
+    NetworkError,
+    ResearchTaskMismatchError,
+    RPCError,
+    RPCTimeoutError,
+)
+from tests._fixtures.fake_core import make_fake_core
 
 
-def _make_research() -> tuple[ResearchAPI, MagicMock, MagicMock]:
-    """Build a ``ResearchAPI`` with a mocked source-lister seam.
+class _RecordingRpc:
+    """A minimal injected ``RpcCaller`` that records each call's read timeout.
+
+    Constructor injection rather than assigning an ``AsyncMock`` onto a
+    duck-typed fake's RPC attribute — ADR-0007 forbids exactly that. Queued
+    outcomes are replayed in order.
+
+    Two details keep the double honest rather than merely convenient:
+
+    * a queued :class:`RPCTimeoutError` gets its ``timeout_seconds`` from the
+      window this call was actually handed, exactly as the real executor
+      derives it (``_web/transport/executor.py``). Hardcoding it would hide a defect
+      where the clamp reaches the wire but the raised error still reports the
+      unclamped window;
+    * ``advance`` moves the injected clock *while the call is in flight*, so a
+      retry is late because time passed during a failed attempt — the real
+      causal chain — rather than because a positional clock stub said so.
+    """
+
+    def __init__(self, outcomes: list[object], clock: dict[str, float] | None = None) -> None:
+        self._outcomes = list(outcomes)
+        self._clock = clock
+        self.read_timeouts: list[float | None] = []
+
+    async def rpc_call(
+        self,
+        method: object,
+        params: object,
+        source_path: str = "/",
+        allow_null: bool = False,
+        **kwargs: object,
+    ) -> object:
+        read_timeout = kwargs.get("read_timeout")
+        self.read_timeouts.append(read_timeout)  # type: ignore[arg-type]
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, _Advance):
+            if self._clock is not None:
+                self._clock["now"] += outcome.seconds
+            outcome = outcome.then
+        if isinstance(outcome, RPCTimeoutError):
+            # Mirror the executor: the error reports the window actually used.
+            outcome = RPCTimeoutError(str(outcome), timeout_seconds=read_timeout)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _Advance:
+    """Queue entry: advance the injected clock, then produce ``then``."""
+
+    def __init__(self, seconds: float, then: object) -> None:
+        self.seconds = seconds
+        self.then = then
+
+
+def _make_research() -> tuple[WebResearchAPI, MagicMock, MagicMock]:
+    """Build a ``WebResearchAPI`` with a mocked source-lister seam.
 
     Returns ``(research, mock_rpc, mock_source_lister)``. Override
     ``research.import_sources`` / ``mock_source_lister.list`` per test.
 
-    ResearchAPI now mirrors ``NotebooksAPI``'s default-builder pattern, so
+    WebResearchAPI mirrors ``NotebooksAPI``'s default-builder pattern, so
     injecting a mock lister bypasses the cross-API dependency entirely —
     the test does not need a SourcesAPI handle.
     """
     mock_rpc = MagicMock()
     mock_source_lister = MagicMock()
-    research = ResearchAPI(mock_rpc, source_lister=mock_source_lister)
+    research = WebResearchAPI(
+        mock_rpc,
+        supervisor=make_fake_core(),
+        source_lister=mock_source_lister,
+    )
     return research, mock_rpc, mock_source_lister
 
 
 class TestImportSourcesWithVerification:
     @pytest.mark.asyncio
-    async def test_empty_sources_returns_empty_without_calling_rpc(self):
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock()
+    async def test_empty_sources_returns_without_network_calls(self) -> None:
+        research, _, source_lister = _make_research()
+        source_lister.list = AsyncMock()
         research.import_sources = AsyncMock()
 
-        imported = await research.import_sources_with_verification("nb_123", "task_123", [])
-
-        assert imported == []
+        assert await research.import_sources_with_verification("nb", "task", []) == []
+        source_lister.list.assert_not_awaited()
         research.import_sources.assert_not_awaited()
-        mock_source_lister.list.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_retries_rpc_timeout_then_succeeds(self):
-        # Empty baseline + empty post-timeout probe → verification fails →
-        # falls through to legacy retry. This exercises the retry path
-        # explicitly rather than relying on a snapshot exception.
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(return_value=[])
-        research.import_sources = AsyncMock(
+    async def test_transport_loss_is_inspected_but_never_replayed(self) -> None:
+        research, _, source_lister = _make_research()
+        error = NetworkError("response lost")
+        source_lister.list = AsyncMock(
             side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_1", "title": "Source 1"}],
+                [],
+                [MagicMock(id="possible", url="https://a.example", title="A")],
             ]
         )
+        research.import_sources = AsyncMock(side_effect=error)
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-                initial_delay=5,
-                max_delay=60,
-            )
-
-        assert imported == [{"id": "src_1", "title": "Source 1"}]
-        assert research.import_sources.await_count == 2
-        mock_sleep.assert_awaited_once_with(5)
-
-    @pytest.mark.asyncio
-    async def test_raises_after_elapsed_budget(self):
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(return_value=[])
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
-        )
-
-        # time.monotonic is read once at start, then on each timeout. Two values
-        # cover the snapshot path plus the timeout-handling path (elapsed
-        # check). Past-budget on the second read forces the raise.
-        with (
-            patch.object(
-                _research_mod.time,
-                "monotonic",
-                side_effect=[0.0, 1801.0],
-            ),
-            patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep,
-            pytest.raises(RPCTimeoutError),
-        ):
+        with pytest.raises(NetworkError) as raised:
             await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-                max_elapsed=1800,
+                "nb", "task", [{"url": "https://a.example", "title": "A"}]
             )
 
-        mock_sleep.assert_not_awaited()
+        assert raised.value is error
+        assert getattr(error, "unconfirmed", False) is True
+        assert error.reconciliation_candidates == ("possible",)  # type: ignore[attr-defined]
+        assert research.import_sources.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_does_not_retry_non_timeout_error(self):
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(return_value=[])
-        research.import_sources = AsyncMock(side_effect=ValueError("boom"))
+    async def test_candidate_inspection_reprobes_empty_and_failed_reads_with_capped_backoff(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = {"now": 100.0}
+        delays: list[float] = []
 
-        with (
-            patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep,
-            pytest.raises(ValueError, match="boom"),
-        ):
+        async def advance(delay: float) -> None:
+            delays.append(delay)
+            clock["now"] += delay
+
+        monkeypatch.setattr(research_module.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(research_module.asyncio, "sleep", advance)
+        research, _, source_lister = _make_research()
+        error = NetworkError("response lost")
+        source_lister.list = AsyncMock(
+            side_effect=[
+                [],
+                [],
+                NetworkError("inspection unavailable"),
+                [MagicMock(id="possible", url="https://a.example", title="A")],
+            ]
+        )
+        research.import_sources = AsyncMock(side_effect=error)
+
+        with pytest.raises(NetworkError) as raised:
             await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
+                "nb",
+                "task",
+                [{"url": "https://a.example", "title": "A"}],
+                max_elapsed=10,
+                initial_delay=1,
+                backoff_factor=3,
+                max_delay=2,
             )
 
+        assert raised.value is error
         assert research.import_sources.await_count == 1
-        mock_sleep.assert_not_awaited()
+        assert source_lister.list.await_count == 4
+        assert delays == [1, 2]
+        assert error.reconciliation_candidates == ("possible",)  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_skips_retry_when_server_state_shows_import_succeeded(self):
-        """If the import RPC times out but sources.list shows our URLs were
-        added server-side, treat it as success and skip retry. This avoids
-        the duplicate-on-retry inflation that otherwise multiplies sources
-        by the retry count.
-        """
-        baseline_src = MagicMock(id="src_pre", title="Pre-existing", url="https://pre.example.com")
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com")
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [baseline_src],  # snapshot before import
-                [baseline_src, new_src],  # probe after timeout — URL is now there
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
+    async def test_decoded_success_returns_only_decoded_rows(self) -> None:
+        research, _, source_lister = _make_research()
+        concurrent = MagicMock(id="foreign", url="https://b.example", title="B")
+        source_lister.list = AsyncMock(return_value=[])
+        research.import_sources = AsyncMock(return_value=[{"id": "returned", "title": "A"}])
+
+        result = await research.import_sources_with_verification(
+            "nb",
+            "task",
+            [
+                {"url": "https://a.example", "title": "A"},
+                {"url": "https://b.example", "title": "B"},
+            ],
         )
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-            )
-
-        assert imported == [{"id": "src_new", "title": "Source 1"}]
-        # Single import attempt — no retry.
-        assert research.import_sources.await_count == 1
-        # Snapshot + post-timeout probe — exactly two sources.list calls.
-        assert mock_source_lister.list.await_count == 2
-        # No sleep, no retry — straight to verified-success exit.
-        mock_sleep.assert_not_awaited()
+        assert result == [{"id": "returned", "title": "A"}]
+        assert concurrent.id not in {entry["id"] for entry in result}
+        source_lister.list.assert_awaited_once_with("nb", strict=False)
 
     @pytest.mark.asyncio
-    async def test_skips_retry_when_url_normalization_matches(self):
-        """Server-side URL normalization (case folding, trailing-slash strip)
-        is handled by normalizing both sides before the subset check, so a
-        cosmetic difference between request and stored URL doesn't force a
-        duplicating retry.
-        """
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com")
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(side_effect=[[], [new_src]])
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
-        )
+    async def test_positive_rejection_evidence_is_not_reclassified_or_inspected(self) -> None:
+        from notebooklm._idempotency import mark_commit_state
+        from notebooklm.outcomes import CommitState
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                # Trailing slash + uppercase host differ from server-normalized form.
-                [{"url": "https://Example.com/", "title": "Source 1"}],
-            )
+        research, _, source_lister = _make_research()
+        refusal = mark_commit_state(RPCError("request refused", rpc_code=9), CommitState.REJECTED)
+        source_lister.list = AsyncMock(return_value=[])
+        research.import_sources = AsyncMock(side_effect=refusal)
 
-        assert imported == [{"id": "src_new", "title": "Source 1"}]
-        assert research.import_sources.await_count == 1
-        mock_sleep.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_skips_retry_when_only_url_fragment_differs(self):
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com/a")
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(side_effect=[[], [new_src]])
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com/a#top", "title": "Source 1"}],
-            )
-
-        assert imported == [{"id": "src_new", "title": "Source 1"}]
-        assert research.import_sources.await_count == 1
-        mock_sleep.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_retries_when_server_state_shows_no_progress(self):
-        """If sources.list shows the requested URLs were NOT imported, fall
-        back to the original retry behavior.
-        """
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(return_value=[])  # always empty
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_1", "title": "Source 1"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-                initial_delay=5,
-            )
-
-        assert imported == [{"id": "src_1", "title": "Source 1"}]
-        assert research.import_sources.await_count == 2
-        mock_sleep.assert_awaited_once_with(5)
-
-    @pytest.mark.asyncio
-    async def test_partial_timeout_retries_only_missing_urls(self):
-        """If a timed-out import partially committed URLs, the retry payload
-        must drop already-visible URLs to avoid duplicating them.
-        """
-        imported_src = MagicMock(id="src_1", title="Source 1", url="https://one.example.com")
-        sources = [
-            {"url": "https://one.example.com", "title": "Source 1"},
-            {"url": "https://two.example.com", "title": "Source 2"},
-            {"url": "https://three.example.com", "title": "Source 3"},
-        ]
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline
-                [imported_src],  # post-timeout probe — 1 of 3 is visible
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_2", "title": "Source 2"}, {"id": "src_3", "title": "Source 3"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                sources,
-                initial_delay=5,
-            )
-
-        assert imported == [
-            {"id": "src_1", "title": "Source 1"},
-            {"id": "src_2", "title": "Source 2"},
-            {"id": "src_3", "title": "Source 3"},
-        ]
-        assert research.import_sources.await_count == 2
-        first_call_sources = research.import_sources.await_args_list[0].args[2]
-        retry_call_sources = research.import_sources.await_args_list[1].args[2]
-        assert first_call_sources == sources
-        assert retry_call_sources == [
-            {"url": "https://two.example.com", "title": "Source 2"},
-            {"url": "https://three.example.com", "title": "Source 3"},
-        ]
-        mock_sleep.assert_awaited_once_with(5)
-
-    @pytest.mark.asyncio
-    async def test_partial_timeout_drops_report_entries_when_any_url_committed(self):
-        """When the partial-success probe shows at least one requested URL
-        already in the notebook, no-URL entries (deep-research reports) MUST
-        be dropped from the retry batch.
-
-        Reports are appended first in the IMPORT_RESEARCH payload (see
-        ``_build_report_import_entry`` usage in ``ResearchAPI.import_sources``),
-        so a verified URL implies the report committed too. Retrying the
-        report on each subsequent timeout would create duplicate report
-        sources server-side (gemini-code-assist review on PR #882).
-        """
-        imported_src = MagicMock(id="src_1", title="Source 1", url="https://one.example.com")
-        report_entry = {
-            "title": "Research Report",
-            "report_markdown": "# Findings\n...",
-            "result_type": 5,
-        }
-        sources = [
-            {"url": "https://one.example.com", "title": "Source 1"},
-            {"url": "https://two.example.com", "title": "Source 2"},
-            report_entry,
-        ]
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline
-                [imported_src],  # post-timeout probe — URL 1 is visible
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_2", "title": "Source 2"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock):
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                sources,
-                initial_delay=5,
-            )
-
-        # The retry batch must NOT include the report entry.
-        retry_call_sources = research.import_sources.await_args_list[1].args[2]
-        assert retry_call_sources == [
-            {"url": "https://two.example.com", "title": "Source 2"},
-        ], "Report entry should be dropped from retry batch once any URL is verified committed"
-
-        # Returned set: URL 1 (verified during partial probe) + URL 2 (from
-        # the retry's successful response). The report is not in the
-        # return list because the function has no reliable way to attribute
-        # a no-URL source to this call vs. concurrent activity once the
-        # report was already committed under the timed-out RPC.
-        assert imported == [
-            {"id": "src_1", "title": "Source 1"},
-            {"id": "src_2", "title": "Source 2"},
-        ]
-
-    @pytest.mark.asyncio
-    async def test_partial_timeout_keeps_report_entry_when_no_url_committed(self):
-        """When the partial-success probe shows NO requested URLs in the
-        notebook, no-URL report entries stay in the retry batch — their
-        fate is unknown and dropping them would lose the report.
-
-        The report-only retry path is then bounded by the no-URL attempt
-        cap below (``test_report_only_import_bounded_retries_on_persistent_timeout``).
-        """
-        report_entry = {
-            "title": "Research Report",
-            "report_markdown": "# Findings\n...",
-            "result_type": 5,
-        }
-        sources = [
-            {"url": "https://one.example.com", "title": "Source 1"},
-            report_entry,
-        ]
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline
-                [],  # post-timeout probe — nothing committed yet
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_1", "title": "Source 1"}, {"id": "src_report", "title": "Report"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock):
+        with pytest.raises(RPCError) as raised:
             await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                sources,
-                initial_delay=5,
+                "nb", "task", [{"url": "https://a.example", "title": "A"}]
             )
 
-        # No URL was verified committed → keep the report in the retry.
-        retry_call_sources = research.import_sources.await_args_list[1].args[2]
-        assert retry_call_sources == sources, (
-            "Report must remain in retry batch when nothing was verified committed"
-        )
+        assert raised.value is refusal
+        assert getattr(refusal, "unconfirmed", False) is False
+        source_lister.list.assert_awaited_once_with("nb", strict=False)
+        research.import_sources.assert_awaited_once()
+
+
+class TestImportSourcesIdempotency:
+    """#1961: pre-filter already-present URLs up front on every attempt.
+
+    The timeout-retry path already drops already-present URLs; these tests
+    cover the generalization to the happy path (no timeout), plus the
+    ``already_present`` side channel and the ``allow_duplicate`` opt-out.
+    """
 
     @pytest.mark.asyncio
-    async def test_partial_timeout_merges_prior_verified_sources_on_later_verified_success(self):
-        """When multiple timeouts happen, later verified-success returns must
-        include sources verified during earlier partial probes.
-        """
-        source_1 = MagicMock(id="src_1", title="Source 1", url="https://one.example.com")
-        source_2 = MagicMock(id="src_2", title="Source 2", url="https://two.example.com")
-        sources = [
-            {"url": "https://one.example.com", "title": "Source 1"},
-            {"url": "https://two.example.com", "title": "Source 2"},
+    async def test_repeat_import_all_present_imports_nothing(self):
+        existing = [
+            MagicMock(id="src_a", title="A", url="https://a.example.com"),
+            MagicMock(id="src_b", title="B", url="https://b.example.com"),
         ]
         research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline
-                [source_1],  # first timeout — only URL 1 is visible, so retry URL 2
-                [source_1, source_2],  # second timeout — URL 2 is now visible
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-            ]
+        mock_source_lister.list = AsyncMock(return_value=existing)
+        research.import_sources = AsyncMock(return_value=[])
+
+        imported = await research.import_sources_with_verification(
+            "nb_123",
+            "task_123",
+            [
+                {"url": "https://a.example.com", "title": "A"},
+                {"url": "https://b.example.com", "title": "B"},
+            ],
         )
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                sources,
-                initial_delay=5,
-            )
-
-        assert imported == [
-            {"id": "src_1", "title": "Source 1"},
-            {"id": "src_2", "title": "Source 2"},
+        assert list(imported) == []
+        assert imported.already_present == [
+            {"id": "src_a", "title": "A", "url": "https://a.example.com"},
+            {"id": "src_b", "title": "B", "url": "https://b.example.com"},
         ]
-        assert research.import_sources.await_count == 2
-        retry_call_sources = research.import_sources.await_args_list[1].args[2]
-        assert retry_call_sources == [{"url": "https://two.example.com", "title": "Source 2"}]
-        mock_sleep.assert_awaited_once_with(5)
+        # Everything already present → no import RPC at all.
+        research.import_sources.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_snapshot_failure_deduplicates_retries_without_verified_success(self):
-        """A malformed pre-import snapshot must not masquerade as an empty
-        notebook. Without a reliable baseline we can still drop URLs already
-        visible after a timeout, but we must not classify all current rows
-        as newly imported by this call.
-        """
-        source_1 = MagicMock(id="src_1", title="Source 1", url="https://one.example.com")
-        source_2 = MagicMock(id="src_2", title="Source 2", url="https://two.example.com")
-        source_3 = MagicMock(id="src_3", title="Source 3", url="https://three.example.com")
-        sources = [
-            {"url": "https://one.example.com", "title": "Source 1"},
-            {"url": "https://two.example.com", "title": "Source 2"},
-            {"url": "https://three.example.com", "title": "Source 3"},
+    async def test_partial_present_imports_only_absent(self):
+        existing = [MagicMock(id="src_a", title="A", url="https://a.example.com")]
+        research, _, mock_source_lister = _make_research()
+        mock_source_lister.list = AsyncMock(return_value=existing)
+        research.import_sources = AsyncMock(return_value=[{"id": "src_b", "title": "B"}])
+
+        imported = await research.import_sources_with_verification(
+            "nb_123",
+            "task_123",
+            [
+                {"url": "https://a.example.com", "title": "A"},
+                {"url": "https://b.example.com", "title": "B"},
+            ],
+        )
+
+        assert list(imported) == [{"id": "src_b", "title": "B"}]
+        assert imported.already_present == [
+            {"id": "src_a", "title": "A", "url": "https://a.example.com"}
         ]
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                RPCError("snapshot unavailable"),
-                [source_1],
-                [source_1, source_2, source_3],
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                sources,
-                initial_delay=5,
-            )
-
-        assert imported == []
-        assert research.import_sources.await_count == 2
-        assert mock_source_lister.list.await_count == 3
-        assert all(
-            awaited_call.kwargs.get("strict") is True
-            for awaited_call in mock_source_lister.list.await_args_list
-        )
-        assert research.import_sources.await_args_list[0].args[2] == sources
-        assert research.import_sources.await_args_list[1].args[2] == [
-            {"url": "https://two.example.com", "title": "Source 2"},
-            {"url": "https://three.example.com", "title": "Source 3"},
+        # Only the genuinely-absent source B was handed to import_sources.
+        assert research.import_sources.await_args.args[2] == [
+            {"url": "https://b.example.com", "title": "B"}
         ]
-        mock_sleep.assert_awaited_once_with(5)
 
     @pytest.mark.asyncio
-    async def test_partial_timeout_skips_retry_when_filter_removes_all_sources(self):
-        """If every requested URL is already visible after the timeout, there
-        is nothing left to retry.
-        """
-        existing_src = MagicMock(id="src_existing", title="Old", url="https://example.com")
+    async def test_allow_duplicate_reimports_all(self):
+        existing = [MagicMock(id="src_a", title="A", url="https://a.example.com")]
         research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [existing_src],  # baseline already has the URL
-                [existing_src],  # post-timeout probe still shows it
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
+        mock_source_lister.list = AsyncMock(return_value=existing)
+        research.import_sources = AsyncMock(return_value=[{"id": "src_a2", "title": "A"}])
+
+        imported = await research.import_sources_with_verification(
+            "nb_123",
+            "task_123",
+            [{"url": "https://a.example.com", "title": "A"}],
+            allow_duplicate=True,
         )
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Old (request)"}],
-                initial_delay=5,
-            )
-
-        assert imported == []
-        assert research.import_sources.await_count == 1
-        mock_sleep.assert_not_awaited()
+        assert list(imported) == [{"id": "src_a2", "title": "A"}]
+        assert imported.already_present == []
+        # allow_duplicate → no pre-filter, the present URL is re-sent.
+        assert research.import_sources.await_args.args[2] == [
+            {"url": "https://a.example.com", "title": "A"}
+        ]
 
     @pytest.mark.asyncio
-    async def test_retries_when_pre_existing_url_meets_concurrent_unrelated_addition(
-        self,
-    ):
-        """Combined edge case: the requested URL was already in the notebook
-        before the import, AND a concurrent session added an unrelated source
-        during the timeout window. The verified-success branch must NOT fire
-        — neither the pre-existing URL nor the unrelated addition is proof
-        our import wrote anything. The retry payload filter should still
-        avoid re-adding the requested URL because it is already present.
-        """
-        existing_src = MagicMock(id="src_existing", title="Old", url="https://example.com")
-        unrelated_src = MagicMock(
-            id="src_unrelated",
-            title="Unrelated (concurrent)",
-            url="https://other.example.com",
-        )
+    async def test_report_entry_preserved_when_url_already_present(self):
+        existing = [MagicMock(id="src_a", title="A", url="https://a.example.com")]
+        report_entry = {"title": "Report", "report_markdown": "# R", "result_type": 5}
         research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [existing_src],  # baseline already has the requested URL
-                # post-timeout: pre-existing + unrelated concurrent addition,
-                # but no truly-new source matching the requested URL.
-                [existing_src, unrelated_src],
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_existing", "title": "Old"}],
-            ]
+        mock_source_lister.list = AsyncMock(return_value=existing)
+        research.import_sources = AsyncMock(return_value=[{"id": "rep_1", "title": "Report"}])
+
+        imported = await research.import_sources_with_verification(
+            "nb_123",
+            "task_123",
+            [{"url": "https://a.example.com", "title": "A"}, report_entry],
         )
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Old (request)"}],
-                initial_delay=5,
-            )
-
-        assert imported == []
-        assert research.import_sources.await_count == 1
-        mock_sleep.assert_not_awaited()
+        assert list(imported) == [{"id": "rep_1", "title": "Report"}]
+        assert imported.already_present == [
+            {"id": "src_a", "title": "A", "url": "https://a.example.com"}
+        ]
+        # Report entry has no dedupable URL → kept; the present URL is dropped.
+        assert research.import_sources.await_args.args[2] == [report_entry]
 
     @pytest.mark.asyncio
-    async def test_pre_existing_url_does_not_prove_report_entry_committed(self):
-        """Pre-existing URLs de-dupe URL entries but must not drop no-URL reports.
-
-        A URL visible before the timed-out request is not proof that this
-        request committed the preceding report entry. Only a requested URL
-        newly observed after the attempt may suppress no-URL report retries.
-        """
-        existing_src = MagicMock(id="src_existing", title="Old", url="https://example.com")
-        report_entry = {
-            "title": "Research Report",
-            "report_markdown": "# Findings\n...",
-            "result_type": 5,
-        }
+    async def test_snapshot_failure_imports_all_without_filter(self):
         research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [existing_src],  # baseline already has the requested URL
-                [existing_src],  # post-timeout: no newly committed URL
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_report", "title": "Research Report"}],
-            ]
+        mock_source_lister.list = AsyncMock(side_effect=NetworkError("snapshot down"))
+        research.import_sources = AsyncMock(return_value=[{"id": "src_a", "title": "A"}])
+
+        imported = await research.import_sources_with_verification(
+            "nb_123",
+            "task_123",
+            [{"url": "https://a.example.com", "title": "A"}],
         )
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [
-                    report_entry,
-                    {"url": "https://example.com", "title": "Old (request)"},
-                ],
-                initial_delay=5,
-            )
-
-        assert imported == [{"id": "src_report", "title": "Research Report"}]
-        assert research.import_sources.await_count == 2
-        assert research.import_sources.await_args_list[1].args[2] == [report_entry]
-        mock_sleep.assert_awaited_once_with(5)
+        assert list(imported) == [{"id": "src_a", "title": "A"}]
+        # No baseline → can't tell what's present → import everything (fallback).
+        assert imported.already_present == []
+        assert research.import_sources.await_args.args[2] == [
+            {"url": "https://a.example.com", "title": "A"}
+        ]
 
     @pytest.mark.asyncio
-    async def test_returned_list_includes_non_url_sources_like_research_reports(self):
-        """When the request includes a research-report entry (no URL, only
-        title + ``report_markdown``), the verified-success return value must
-        surface the matching new no-URL source so callers can count it as
-        imported.
-        """
-        report_src = MagicMock(id="src_report", title="Research Report", url=None)
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com")
+    async def test_provenance_validated_before_filter_when_all_present(self):
+        """A wrong ``research_task_id`` raises even when every requested URL is
+        already present — provenance is validated before the idempotency
+        pre-filter can drop the entries (coderabbit review on #1961)."""
+        from notebooklm.exceptions import ResearchTaskMismatchError
+
+        existing = [MagicMock(id="src_a", title="A", url="https://a.example.com")]
         research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # empty baseline
-                [report_src, new_src],  # both new after the timeout
-            ]
-        )
+        mock_source_lister.list = AsyncMock(return_value=existing)
         research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
+            side_effect=AssertionError("import_sources must not be called")
         )
 
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock):
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [
-                    # Mixed request: one URL + one report entry.
-                    {"url": "https://example.com", "title": "Source 1"},
-                    {
-                        "title": "Research Report",
-                        "report_markdown": "# Findings\n...",
-                        "result_type": 5,
-                    },
-                ],
-            )
-
-        ids_returned = {entry["id"] for entry in imported}
-        assert ids_returned == {"src_report", "src_new"}
-
-    @pytest.mark.asyncio
-    async def test_no_url_verified_success_is_capped_to_requested_no_url_count(self):
-        """Concurrent no-URL rows must not inflate the synthesized import count."""
-        requested_report = MagicMock(id="src_report", title="Research Report", url=None)
-        concurrent_report = MagicMock(id="src_concurrent", title="Concurrent Report", url=None)
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com")
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[[], [requested_report, concurrent_report, new_src]]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock):
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [
-                    {"url": "https://example.com", "title": "Source 1"},
-                    {
-                        "title": "Research Report",
-                        "report_markdown": "# Findings\n...",
-                        "result_type": 5,
-                    },
-                ],
-            )
-
-        ids_returned = {entry["id"] for entry in imported}
-        assert ids_returned == {"src_report", "src_new"}
-
-    @pytest.mark.asyncio
-    async def test_does_not_over_report_concurrent_no_url_source(self):
-        """When the request has NO no-URL entries (URLs only), a concurrent
-        no-URL source added during the timeout window must NOT be reported
-        as imported — even if the requested URL itself was successfully
-        written. Otherwise the caller's ``len(imported)`` overstates what
-        this call actually added.
-        """
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com")
-        concurrent_report = MagicMock(
-            id="src_concurrent_report", title="Unrelated Report", url=None
-        )
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # empty baseline
-                [new_src, concurrent_report],
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock):
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-            )
-
-        assert imported == [{"id": "src_new", "title": "Source 1"}]
-
-    @pytest.mark.asyncio
-    async def test_does_not_falsely_succeed_on_unrelated_concurrent_source(self):
-        """Concurrent activity from another session (e.g. web UI, parallel
-        CLI) can add unrelated sources during the import window. The
-        verification condition must NOT fire on those — success must require
-        the *requested* URLs to actually appear among the new sources, not
-        just that the post-timeout source count grew.
-
-        Without this guard, a real timeout coinciding with any concurrent
-        addition would skip the retry and return the unrelated source as
-        "imported" — silently losing the user's import.
-        """
-        unrelated_src = MagicMock(
-            id="src_unrelated",
-            title="Unrelated",
-            url="https://other.example.com",
-        )
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline: empty
-                # Post-timeout: only the unrelated concurrent addition is
-                # visible; our requested URL is NOT there.
-                [unrelated_src],
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_new", "title": "Source 1"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-                initial_delay=5,
-            )
-
-        # Must retry, not falsely return the unrelated source.
-        assert imported == [{"id": "src_new", "title": "Source 1"}]
-        assert research.import_sources.await_count == 2
-        mock_sleep.assert_awaited_once_with(5)
-
-    @pytest.mark.asyncio
-    async def test_does_not_falsely_succeed_on_pre_existing_requested_url(self):
-        """If the requested URL was already in the notebook before the
-        import and the post-timeout snapshot shows no truly-new source
-        matching it, verification must NOT fire — even though
-        ``requested_urls.issubset(current_urls)`` is trivially true. The
-        retry filter then drops the already-present URL instead of re-adding
-        a duplicate.
-        """
-        existing_src = MagicMock(id="src_existing", title="Old", url="https://example.com")
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [existing_src],  # baseline: already has the URL
-                [existing_src],  # post-timeout: nothing changed
-                [existing_src],  # post-retry probe (if reached)
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_existing", "title": "Old"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Old (request)"}],
-                initial_delay=5,
-            )
-
-        assert research.import_sources.await_count == 1
-        mock_sleep.assert_not_awaited()
-        assert imported == []
-
-    @pytest.mark.asyncio
-    async def test_report_only_import_bounded_retries_on_persistent_timeout(self):
-        """Report-only deep-research imports (no URLs) can't use the
-        URL-match verification path. To bound the worst-case duplicate
-        inflation, the retry loop must give up after a small number of
-        attempts rather than burning the full ``max_elapsed`` budget —
-        otherwise a persistent timeout still produces 5-6× duplicate reports.
-
-        Patches ``time.monotonic`` to never advance past budget, so the only
-        thing that can bound the loop is an explicit retry cap on the
-        no-URL path.
-        """
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(return_value=[])
-        research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
-        )
-
-        with (
-            # Time budget never expires — only the retry cap can stop the loop.
-            patch.object(_research_mod.time, "monotonic", return_value=0.0),
-            patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep,
-            pytest.raises(RPCTimeoutError),
-        ):
+        with pytest.raises(ResearchTaskMismatchError):
             await research.import_sources_with_verification(
                 "nb_123",
                 "task_123",
                 [
                     {
-                        "title": "Research Report",
-                        "report_markdown": "# Findings\n...",
-                        "result_type": 5,
+                        "url": "https://a.example.com",
+                        "title": "A",
+                        "research_task_id": "wrong-task",
                     }
                 ],
-                initial_delay=1,
             )
-
-        # Exactly 2 attempts (1 original + 1 retry) before raising. ``<= 2``
-        # would also pass if the retry disappeared entirely, which would
-        # mask a regression — assert the cap and the single backoff sleep.
-        assert research.import_sources.await_count == 2
-        mock_sleep.assert_awaited_once_with(1)
-
-    @pytest.mark.asyncio
-    async def test_falls_back_to_retry_when_post_timeout_probe_raises(self):
-        """If the post-timeout ``sources.list`` probe itself fails (transient
-        network blip, server hiccup), the function must log and fall back to
-        the legacy retry path rather than crashing or skipping verification
-        silently.
-        """
-        new_src = MagicMock(id="src_new", title="Source 1", url="https://example.com")
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline
-                NetworkError("probe down"),  # post-timeout probe fails
-                [new_src],  # post-retry probe (would succeed if reached, unused)
-            ]
-        )
-        research.import_sources = AsyncMock(
-            side_effect=[
-                RPCTimeoutError("Timed out", timeout_seconds=30.0),
-                [{"id": "src_new", "title": "Source 1"}],
-            ]
-        )
-
-        with patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock) as mock_sleep:
-            imported = await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-                initial_delay=5,
-            )
-
-        assert imported == [{"id": "src_new", "title": "Source 1"}]
-        # Probe failure → legacy retry path → 2 import attempts.
-        assert research.import_sources.await_count == 2
-        mock_sleep.assert_awaited_once_with(5)
-
-    @pytest.mark.asyncio
-    async def test_snapshot_propagates_cancelled_error(self):
-        """``asyncio.CancelledError`` from the pre-import snapshot must
-        propagate so callers can cleanly cancel the operation. A bare
-        ``except Exception`` would swallow it and continue running.
-        """
-        research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(side_effect=asyncio.CancelledError())
-        research.import_sources = AsyncMock()
-
-        with pytest.raises(asyncio.CancelledError):
-            await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-            )
-
-        # The import should never run — cancellation aborted the snapshot.
         research.import_sources.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_probe_propagates_cancelled_error(self):
-        """``asyncio.CancelledError`` from the post-timeout probe must
-        propagate, not be swallowed and converted into a retry.
-        """
+    async def test_already_present_reported_once_for_repeated_url(self):
+        """A request repeating the same (normalized) already-present URL reports
+        that existing source once, not once per duplicate input (coderabbit)."""
+        existing = [MagicMock(id="src_a", title="A", url="https://a.example.com")]
         research, _, mock_source_lister = _make_research()
-        mock_source_lister.list = AsyncMock(
-            side_effect=[
-                [],  # baseline OK
-                asyncio.CancelledError(),  # probe cancelled
-            ]
-        )
+        mock_source_lister.list = AsyncMock(return_value=existing)
         research.import_sources = AsyncMock(
-            side_effect=RPCTimeoutError("Timed out", timeout_seconds=30.0)
+            side_effect=AssertionError("import_sources must not be called")
         )
 
-        with (
-            patch.object(_research_mod.asyncio, "sleep", new_callable=AsyncMock),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await research.import_sources_with_verification(
-                "nb_123",
-                "task_123",
-                [{"url": "https://example.com", "title": "Source 1"}],
-            )
+        imported = await research.import_sources_with_verification(
+            "nb_123",
+            "task_123",
+            [
+                {"url": "https://a.example.com", "title": "A"},
+                # Same normalized URL (trailing slash stripped) — a duplicate input.
+                {"url": "https://a.example.com/", "title": "A again"},
+            ],
+        )
 
-        # Only the original attempt — no retry after cancellation.
-        assert research.import_sources.await_count == 1
+        assert list(imported) == []
+        assert imported.already_present == [
+            {"id": "src_a", "title": "A", "url": "https://a.example.com"}
+        ]
+        research.import_sources.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_empty_source_list_returns_without_touching_the_backend(self) -> None:
+        research, mock_rpc, mock_source_lister = _make_research()
+
+        result = await research._import_sources_with_verification("nb1", "task-1", [])
+
+        assert result == []
+        mock_rpc.rpc_call.assert_not_called()
+        mock_source_lister.list.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_source_from_another_research_task_is_refused(self) -> None:
+        research, mock_rpc, _lister = _make_research()
+        sources = [{"url": "https://a.example/x", "research_task_id": "task-OTHER"}]
+
+        with pytest.raises(ResearchTaskMismatchError) as caught:
+            await research._import_sources_with_verification("nb1", "task-1", sources)
+
+        assert caught.value.task_id == "task-1"
+        assert caught.value.source_research_task_id == "task-OTHER"
+        mock_rpc.rpc_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_batch_spanning_two_research_tasks_is_refused(self) -> None:
+        """Each source matches the caller's id individually is not enough."""
+        research, mock_rpc, _lister = _make_research()
+        sources = [
+            {"url": "https://a.example/x", "research_task_id": "task-1"},
+            {"url": "https://b.example/y", "research_task_id": "task-2"},
+        ]
+
+        with pytest.raises(ResearchTaskMismatchError):
+            await research._import_sources_with_verification("nb1", "task-1", sources)
+
+        mock_rpc.rpc_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sources_without_provenance_are_admitted(self) -> None:
+        """An unstamped source inherits the caller's task id rather than failing."""
+        research, _rpc, mock_source_lister = _make_research()
+        mock_source_lister.list = AsyncMock(return_value=[])
+        research.import_sources = AsyncMock(return_value=[])
+
+        await research._import_sources_with_verification(
+            "nb1", "task-1", [{"url": "https://a.example/x"}]
+        )
+
+        research.import_sources.assert_awaited()
+        # ``assert_awaited`` alone would pass if a different task id were sent.
+        assert research.import_sources.await_args.args[1] == "task-1"
+
+
+class TestResearchPublicHelperDelegation:
+    """The API surfaces the module-level helpers under stable names."""
+
+    def test_normalize_url_matches_the_public_helper(self) -> None:
+        from notebooklm import research as research_pub
+
+        raw = "HTTPS://Example.COM/a/../b?utm_source=x"
+
+        assert WebResearchAPI._normalize_url(raw) == research_pub.normalize_url(raw)
+
+    def test_extract_report_urls_matches_the_public_helper(self) -> None:
+        from notebooklm import research as research_pub
+
+        report = "See https://a.example/one and https://b.example/two for detail."
+
+        assert WebResearchAPI.extract_report_urls(report) == research_pub.extract_report_urls(
+            report
+        )
+        assert WebResearchAPI.extract_report_urls(report) == {
+            "https://a.example/one",
+            "https://b.example/two",
+        }

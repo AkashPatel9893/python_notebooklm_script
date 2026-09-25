@@ -8,9 +8,9 @@ reason-tagged exemption. But a static walk **never executes a method**, so it
 cannot catch the exact historical ``mind_maps`` bug — a ``get()`` correctly
 annotated ``MindMap | None`` that *forgot to warn* on a miss (#1358). That
 miss-behaviour is hand-duplicated across ``_sources`` / ``_artifacts`` /
-``_notes`` / ``_mind_maps_api`` as ``result = await self.get_or_none(...); if
-result is None: warn_get_returns_none("x"); return result`` — exactly the kind of
-copy that silently rots when one copy is dropped.
+``_notes`` / ``_mind_maps_api`` as each namespace moved off the old
+None-on-miss warning runway — exactly the kind of copy that silently rots when
+one copy is dropped.
 
 This module adds the **behavioural** half of the Tier-1 floor. For each lookup
 namespace it instantiates the backing API with a fake backend (reusing the
@@ -47,21 +47,28 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from notebooklm._artifacts import ArtifactsAPI
+from notebooklm._collections import CollectionsAPI
 from notebooklm._labels import LabelsAPI
-from notebooklm._mind_map import NoteBackedMindMapService
 from notebooklm._mind_maps_api import MindMapsAPI
-from notebooklm._note_service import NoteService
-from notebooklm._notebooks import NotebooksAPI
-from notebooklm._notes import NotesAPI
 from notebooklm._sources import SourcesAPI
+from notebooklm._web.artifacts import WebArtifactsAPI
+from notebooklm._web.collections import WebCollectionsAPI
+from notebooklm._web.labels import WebLabelsAPI
+from notebooklm._web.mind_maps import NoteBackedMindMapService, WebMindMapsAPI
+from notebooklm._web.notebooks import WebNotebooksAPI
+from notebooklm._web.notes import NoteService, WebNotesAPI
+from notebooklm._web.sources import WebSourcesAPI
 from notebooklm.exceptions import (
     ArtifactNotFoundError,
+    CollectionNotFoundError,
     LabelNotFoundError,
     MindMapNotFoundError,
     NotebookNotFoundError,
     NoteNotFoundError,
     SourceNotFoundError,
 )
+from notebooklm.types import ArtifactListing
+from tests._fixtures.fake_core import make_fake_core
 
 # This behavioural table is the executable companion of the static
 # ``LOOKUP_NAMESPACES`` set in ``test_public_api_contract.py``: the same six
@@ -77,8 +84,7 @@ from notebooklm.exceptions import (
 # Each factory builds the backing API through constructor injection only
 # (``make_fake_core`` / ``MagicMock`` collaborators) so the behavioural walk
 # needs no auth, event loop, or network — mirroring the fixtures in
-# ``test_get_or_none.py`` / ``test_get_returns_none_deprecation.py`` but
-# consolidated behind one flip-durable table.
+# ``test_get_or_none.py`` but consolidated behind one post-#1247 table.
 # ---------------------------------------------------------------------------
 
 
@@ -86,38 +92,37 @@ def _make_sources_api() -> SourcesAPI:
     # No ``make_fake_core`` here: ``_arrange_list_miss`` overrides ``api.list``
     # before any RPC path is reached, so the first positional collaborator is
     # never called (matches how ``test_get_or_none.py`` builds its sources API).
-    return SourcesAPI(MagicMock(), uploader=MagicMock())
+    return WebSourcesAPI(MagicMock(), supervisor=MagicMock(), uploader=MagicMock())
 
 
 def _make_artifacts_api() -> ArtifactsAPI:
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock(), get_source_ids=AsyncMock(return_value=[]))
     mind_maps = MagicMock(spec=NoteBackedMindMapService)
     mind_maps.list_mind_maps = AsyncMock(return_value=[])
     notebooks = MagicMock()
     notebooks.get_source_ids = AsyncMock(return_value=[])
-    return ArtifactsAPI(
+    return WebArtifactsAPI(
         rpc=core,
-        drain=core,
-        lifecycle=core,
+        supervisor=core,
         notebooks=notebooks,
         mind_maps=mind_maps,
         note_service=MagicMock(spec=NoteService),
     )
 
 
-def _make_notes_api() -> NotesAPI:
-    from _fixtures.fake_core import make_fake_core
+def _make_notes_api() -> WebNotesAPI:
+    from tests._fixtures.fake_core import make_fake_core
 
     # ``None`` is the empty-notebook payload (a notebook with no notes); it is
     # the realistic miss shape that ``fetch_note_rows`` resolves to ``[]``. A
     # truthy non-list payload would now raise ``DecodingError`` as drift (#1344),
     # so it can no longer stand in for "empty".
     core = make_fake_core(rpc_call=AsyncMock(return_value=None))
-    note_service = NoteService(core)
+    note_service = NoteService(core, supervisor=core)
     mind_maps = NoteBackedMindMapService(note_service)
-    return NotesAPI(notes=note_service, mind_maps=mind_maps)
+    return WebNotesAPI(supervisor=core, notes=note_service, mind_maps=mind_maps)
 
 
 def _make_mind_maps_api() -> MindMapsAPI:
@@ -126,11 +131,13 @@ def _make_mind_maps_api() -> MindMapsAPI:
     artifacts = MagicMock()
     artifacts.list = AsyncMock(return_value=[])
     notebooks = MagicMock()
-    return MindMapsAPI(
+    return WebMindMapsAPI(
         rpc=MagicMock(),
+        supervisor=make_fake_core(),
         mind_maps=mind_maps,
         artifacts=artifacts,
         notebooks=notebooks,
+        notes=MagicMock(),
     )
 
 
@@ -138,17 +145,31 @@ def _make_labels_api() -> LabelsAPI:
     # ``_arrange_list_miss`` overrides ``api.list`` before any RPC path is reached
     # (``labels.get`` scans ``self.list``), so the rpc collaborator and
     # ``list_sources`` are never called on the miss path.
-    return LabelsAPI(MagicMock(), list_sources=AsyncMock(return_value=[]))
+    return WebLabelsAPI(
+        MagicMock(),
+        supervisor=make_fake_core(),
+        list_sources=AsyncMock(return_value=[]),
+    )
 
 
-def _make_notebooks_api() -> NotebooksAPI:
-    from _fixtures.fake_core import make_fake_core
+def _make_collections_api() -> CollectionsAPI:
+    # Account-level sibling of labels: ``collections.get`` scans ``self.list()``
+    # (no notebook scope), so ``_arrange_list_miss`` stubbing ``list`` to ``[]`` is
+    # the same backend-agnostic miss lever; the rpc collaborator and
+    # ``list_notebooks`` are never reached on the miss path.
+    return WebCollectionsAPI(
+        MagicMock(),
+        supervisor=make_fake_core(),
+        list_notebooks=AsyncMock(return_value=[]),
+    )
 
+
+def _make_notebooks_api() -> WebNotebooksAPI:
     # An empty/degenerate GET_NOTEBOOK payload is the unknown-id shape that
     # ``notebooks.get`` post-validates into ``NotebookNotFoundError`` — so this
     # factory is already arranged for a miss (see ``_arrange_notebooks_miss``).
     core = make_fake_core(rpc_call=AsyncMock(return_value=[[]]))
-    return NotebooksAPI(core.rpc_executor, sources_api=MagicMock())
+    return WebNotebooksAPI(core.rpc_executor, supervisor=core, sources_api=MagicMock())
 
 
 def _arrange_list_miss(api: object) -> None:
@@ -169,6 +190,10 @@ def _arrange_list_miss(api: object) -> None:
     internal path.
     """
     api.list = AsyncMock(return_value=[])  # type: ignore[attr-defined]
+    if isinstance(api, ArtifactsAPI):
+        api.list_with_status = AsyncMock(  # type: ignore[method-assign]
+            return_value=ArtifactListing((), is_complete=True)
+        )
 
 
 def _arrange_notebooks_miss(api: object) -> None:
@@ -272,6 +297,15 @@ LOOKUP_CASES: tuple[LookupCase, ...] = (
         not_found_error=LabelNotFoundError,
         get_warns=False,  # v0.8.0: labels.get raises LabelNotFoundError on a miss
     ),
+    LookupCase(
+        namespace="collections",
+        factory=_make_collections_api,
+        arrange_miss=_arrange_list_miss,
+        get_args=("missing",),  # account-level: single id arg (no notebook scope)
+        resource="collection",
+        not_found_error=CollectionNotFoundError,
+        get_warns=False,  # collections.get raises CollectionNotFoundError on a miss
+    ),
 )
 
 _CASES_BY_ID = [pytest.param(case, id=case.namespace) for case in LOOKUP_CASES]
@@ -297,12 +331,9 @@ def _build_missing(case: LookupCase) -> object:
 # ---------------------------------------------------------------------------
 # The two error-contract modes the miss path is exercised under
 #
-# ``NOTEBOOKLM_FUTURE_ERRORS`` (v0.7.0 opt-in preview, default off) makes the
-# warn-runway namespaces adopt their v0.8.0 raise-target early (#1247). Both
-# ``get`` test methods run under both modes so the warn path (today's default)
-# and the raise path (the previewed flip, and v0.8.0's eventual default) are
-# pinned in lock-step — and the #1247 flip becomes a one-field edit
-# (``get_warns=False``) that keeps passing under both modes by construction.
+# ``NOTEBOOKLM_FUTURE_ERRORS`` is retired in v0.8.0 and ignored. Both ``get``
+# test methods still run under set/unset modes so the matrix verifies behavior
+# is identical with the compatibility env var present or absent.
 # ---------------------------------------------------------------------------
 
 _FUTURE_MODES = [
@@ -313,12 +344,7 @@ _FUTURE_MODES = [
 
 @pytest.fixture
 def _apply_future_errors(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> bool:
-    """Set/clear ``NOTEBOOKLM_FUTURE_ERRORS`` per the parametrized mode.
-
-    Returns the boolean mode so a test can compute whether a given ``get`` row
-    *raises* (future-on, or already-flipped) or *warns* (the warn-runway under
-    future-off).
-    """
+    """Set/clear the retired ``NOTEBOOKLM_FUTURE_ERRORS`` env var."""
     # Hermetic both ways: the future-off branch asserts a DeprecationWarning
     # fires, so a parent process exporting NOTEBOOKLM_QUIET_DEPRECATIONS=1 would
     # otherwise silence the warn path and fail the warn-runway rows. Clear it so
@@ -345,7 +371,7 @@ def test_table_covers_all_lookup_namespaces() -> None:
     contract being covered here too — the static and behavioural halves of the
     Tier-1 floor stay in lock-step.
     """
-    from test_public_api_contract import LOOKUP_NAMESPACES
+    from tests.unit.test_public_api_contract import LOOKUP_NAMESPACES
 
     covered = {case.namespace for case in LOOKUP_CASES}
     assert covered == set(LOOKUP_NAMESPACES), (
@@ -366,22 +392,7 @@ class TestGetMissContract:
     async def test_get_on_miss_warns_or_raises(
         self, case: LookupCase, _apply_future_errors: bool
     ) -> None:
-        """``get(<missing>)`` warns + returns ``None`` today; raises post-#1247-flip.
-
-        Run under both error-contract modes. The effective branch is "warns"
-        only when the namespace is still on its warn-runway (``get_warns``) AND
-        the future-errors preview is off; otherwise the miss must raise the
-        namespace's ``*NotFoundError``. So:
-
-        * future-off + ``get_warns`` → warn + return ``None`` (today's default);
-        * future-on + ``get_warns`` → raise (the ``NOTEBOOKLM_FUTURE_ERRORS``
-          preview of the v0.8.0 flip, #1247);
-        * ``get_warns=False`` (``notebooks``, and any namespace after the #1247
-          flip) → raise under both modes.
-
-        Flipping a namespace with #1247 is one table edit (``get_warns=False``)
-        and this test keeps passing under both modes by construction.
-        """
+        """``get(<missing>)`` raises after #1247, with the retired env var ignored."""
         future_on = _apply_future_errors
         api = _build_missing(case)
         if case.get_warns and not future_on:
@@ -432,10 +443,8 @@ class TestGetOrNoneMissContract:
         This contract is invariant across the #1247 flip — ``get_or_none`` is the
         sanctioned ``None``-on-miss path for every namespace, before and after
         ``get`` starts raising — so it is asserted unconditionally for all rows.
-        It is also invariant under ``NOTEBOOKLM_FUTURE_ERRORS``: the preview flag
-        only changes the *deprecated* ``get`` runway, never the sanctioned
-        optional-lookup, so ``get_or_none`` must stay silent-and-``None`` in both
-        modes (asserted by running under both ``_FUTURE_MODES``).
+        It is also invariant under the retired ``NOTEBOOKLM_FUTURE_ERRORS`` env
+        var, which is ignored in v0.8.0.
         """
         api = _build_missing(case)
         with warnings.catch_warnings():

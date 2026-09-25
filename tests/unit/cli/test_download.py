@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+from notebooklm.cli import helpers as helpers_module
+from notebooklm.cli.services.download import build_download_envelope
 from notebooklm.notebooklm_cli import cli
 from notebooklm.types import Artifact
 
@@ -38,38 +41,31 @@ def runner():
 
 @pytest.fixture
 def mock_auth():
-    from notebooklm.auth import AuthTokens
-
-    auth = AuthTokens(
-        cookies={
-            "SID": "test",
-            "HSID": "test",
-            "SSID": "test",
-            "APISID": "test",
-            "SAPISID": "test",
-        },
-        csrf_token="csrf",
-        session_id="session",
-    )
+    cookies = {
+        "SID": "test",
+        "HSID": "test",
+        "SSID": "test",
+        "APISID": "test",
+        "SAPISID": "test",
+    }
 
     with (
-        patch("notebooklm.cli.helpers.load_auth_from_storage") as mock_load,
-        patch("notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock) as mock_fetch,
+        patch.object(helpers_module, "load_auth_from_storage", return_value=cookies) as mock_load,
+        patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch,
     ):
-        mock_load.return_value = auth.flat_cookies
         mock_fetch.return_value = ("csrf", "session")
         yield mock_load
 
 
 @pytest.fixture
 def mock_fetch_tokens():
-    """Mock fetch_tokens and load_auth_from_storage at download module level.
-
-    Download.py imports these functions directly, so we must patch at the module
-    level where they're imported (not at helpers where they're defined).
-    """
+    """Mock ``fetch_tokens_with_domains`` for download CLI commands."""
     with (
-        patch("notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock) as mock_fetch,
+        patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch,
     ):
         mock_fetch.return_value = ("csrf", "session")
         yield mock_fetch
@@ -128,8 +124,8 @@ class TestDownloadStandardTypes:
         if output_mode == "json":
             args.append("--json")
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -167,8 +163,8 @@ class TestDownloadStandardTypes:
         )
         mock_client.artifacts.download_slide_deck = mock_download_slide_deck
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -194,8 +190,8 @@ class TestDownloadAudio:
         )
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -213,8 +209,8 @@ class TestDownloadAudio:
         mock_client.artifacts.list = AsyncMock(return_value=[])
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -255,8 +251,8 @@ class TestDownloadFlags:
         mock_client.artifacts.download_audio = mock_download_audio
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -292,8 +288,8 @@ class TestDownloadFlags:
         mock_client.artifacts.download_audio = mock_download_audio
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -323,8 +319,8 @@ class TestDownloadFlags:
         mock_client.artifacts.download_audio = mock_download_audio
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -348,8 +344,8 @@ class TestDownloadFlags:
         output_file.write_bytes(b"existing content")
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -372,11 +368,10 @@ class TestDownloadJsonOutputUnicode:
     def test_download_json_output_preserves_unicode(self, runner, mock_auth):
         """`download <type> --json` should emit CJK / emoji as real UTF-8, not \\uXXXX.
 
-        Patch target updated for P3.T2: the per-leaf generic helper was
-        extracted to ``cli/services/download.py::execute_download``. The
-        Click handler still calls it via ``services.download.execute_download``
-        — patching there short-circuits the entire async download pipeline
-        the same way patching ``_download_artifacts_generic`` did before.
+        The per-leaf generic helper now lives behind
+        ``services.download.execute_download``. Patching there short-circuits
+        the entire async download pipeline the same way the old generic-helper
+        patch did before.
         """
         fake_result = {
             "artifact_id": "audio_123",
@@ -388,12 +383,13 @@ class TestDownloadJsonOutputUnicode:
             return fake_result
 
         with (
-            patch(
-                "notebooklm.cli.download_cmd.execute_download",
+            patch.object(
+                download_module,
+                "execute_download",
                 fake_execute_download,
             ),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -422,9 +418,9 @@ class TestDownloadWarnings:
             }
 
         with (
-            patch("notebooklm.cli.download_cmd.execute_download", fake_execute_download),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(download_module, "execute_download", fake_execute_download),
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -486,8 +482,8 @@ class TestDownloadCommandsExist:
         mock_client.artifacts.download_video = mock_download_video
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -632,7 +628,7 @@ class TestDownloadAll:
         assert result.exit_code == 0
         assert output_dir.exists()
         # Check that files were downloaded
-        downloaded_files = list(output_dir.glob("*.mp3"))
+        downloaded_files = list(output_dir.glob("*.m4a"))
         assert len(downloaded_files) == 2
 
     def test_download_all_dry_run(self, runner, mock_auth, mock_fetch_tokens, tmp_path):
@@ -698,7 +694,7 @@ class TestDownloadAll:
         # is non-zero because at least one item failed.
         assert result.exit_code != 0
         # One file should be downloaded
-        downloaded_files = list(output_dir.glob("*.mp3"))
+        downloaded_files = list(output_dir.glob("*.m4a"))
         assert len(downloaded_files) == 1
         # The text-mode renderer must show the structured "Failed" section
         # listing the actual error, not just the boolean "Error: True" guard.
@@ -708,6 +704,129 @@ class TestDownloadAll:
         assert "failed" in output_lower
         assert "network error" in output_lower
         assert "error: true" not in output_lower
+
+
+class TestDownloadAuthPropagation:
+    """Authentication failures on the transfer hop retain their typed shape."""
+
+    def test_single_download_hop_auth_error_reaches_typed_handler(
+        self, runner, mock_auth, mock_fetch_tokens
+    ):
+        from notebooklm.exceptions import AuthError
+
+        mock_client = create_mock_client()
+        mock_client.artifacts.list = AsyncMock(
+            return_value=[make_artifact("audio_1", "Podcast", 1)]
+        )
+        mock_client.artifacts.download_audio = AsyncMock(
+            side_effect=AuthError("download credential expired")
+        )
+
+        result = runner.invoke(
+            cli,
+            ["download", "audio", "--json", "-n", "nb_123"],
+            obj=inject_client(mock_client),
+        )
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output)
+        assert payload["code"] == "AUTH_ERROR"
+        assert "download credential expired" in payload["message"]
+
+    def test_single_download_hop_auth_error_prints_login_hint(
+        self, runner, mock_auth, mock_fetch_tokens
+    ):
+        from notebooklm.exceptions import AuthError
+
+        mock_client = create_mock_client()
+        mock_client.artifacts.list = AsyncMock(
+            return_value=[make_artifact("audio_1", "Podcast", 1)]
+        )
+        mock_client.artifacts.download_audio = AsyncMock(side_effect=AuthError("expired"))
+
+        result = runner.invoke(
+            cli,
+            ["download", "audio", "-n", "nb_123"],
+            obj=inject_client(mock_client),
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "Authentication error" in result.output
+        assert "notebooklm login" in result.output
+
+    def test_download_all_auth_error_keeps_partial_rows_and_guidance(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        from notebooklm.exceptions import AuthError
+
+        mock_client = create_mock_client()
+        output_dir = tmp_path / "downloads"
+        mock_client.artifacts.list = AsyncMock(
+            return_value=[
+                make_artifact("audio_1", "First", 1),
+                make_artifact("audio_2", "Second", 1),
+            ]
+        )
+        mock_client.artifacts.download_audio = AsyncMock(
+            side_effect=[AuthError("download credential expired"), str(output_dir / "Second.m4a")]
+        )
+
+        result = runner.invoke(
+            cli,
+            ["download", "audio", "--all", "--json", str(output_dir), "-n", "nb_123"],
+            obj=inject_client(mock_client),
+        )
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output)
+        assert payload["error"] is True
+        assert payload["code"] == "AUTH_ERROR"
+        assert "notebooklm login" in payload["hint"]
+        assert [row["status"] for row in payload["artifacts"]] == ["failed", "downloaded"]
+
+    def test_download_all_text_auth_error_prints_login_guidance(
+        self, runner, mock_auth, mock_fetch_tokens, tmp_path
+    ):
+        from notebooklm.exceptions import AuthError
+
+        mock_client = create_mock_client()
+        output_dir = tmp_path / "downloads"
+        mock_client.artifacts.list = AsyncMock(return_value=[make_artifact("audio_1", "First", 1)])
+        mock_client.artifacts.download_audio = AsyncMock(side_effect=AuthError("expired"))
+
+        result = runner.invoke(
+            cli,
+            ["download", "audio", "--all", str(output_dir), "-n", "nb_123"],
+            obj=inject_client(mock_client),
+        )
+
+        assert result.exit_code == 1, result.output
+        assert "Authentication error" in result.output
+        assert "notebooklm login" in result.output
+
+
+def test_download_envelope_projects_bulk_auth_fields() -> None:
+    from notebooklm._app.download import DownloadFailure, DownloadOutcome, DownloadResult
+
+    result = DownloadResult(
+        outcome=DownloadOutcome.ALL_EXECUTED,
+        total=2,
+        succeeded_count=1,
+        failed_count=1,
+        is_failure=True,
+        failure=DownloadFailure("authentication", detail="expired"),
+        artifacts=(
+            {"id": "a1", "status": "failed"},
+            {"id": "a2", "status": "downloaded"},
+        ),
+    )
+
+    envelope = build_download_envelope(result)
+
+    assert envelope["code"] == "AUTH_ERROR"
+    assert envelope["message"] == "Authentication error: expired"
+    assert "notebooklm login" in envelope["hint"]
+    assert len(envelope["artifacts"]) == 2
 
 
 class TestDownloadAllExitCodeContract:
@@ -942,7 +1061,7 @@ class TestDownloadAllNameFilter:
 
         assert result.exit_code == 0
         assert sorted(downloaded_ids) == ["audio_beta1", "audio_beta2"]
-        downloaded_files = list(output_dir.glob("*.mp3"))
+        downloaded_files = list(output_dir.glob("*.m4a"))
         assert len(downloaded_files) == 2
 
     def test_name_filter_dry_run_previews_only_matches(
@@ -1067,9 +1186,9 @@ class TestDownloadAllDryRunFilenameParity:
         # All three filenames must be distinct (the second and third get
         # auto-renamed via (2)/(3) suffixes — same as the execution path).
         assert len(set(filenames)) == 3
-        assert "Duplicate Title.mp3" in filenames
-        assert "Duplicate Title (2).mp3" in filenames
-        assert "Duplicate Title (3).mp3" in filenames
+        assert "Duplicate Title.m4a" in filenames
+        assert "Duplicate Title (2).m4a" in filenames
+        assert "Duplicate Title (3).m4a" in filenames
 
     def test_dry_run_matches_execution_filenames(
         self, runner, mock_auth, mock_fetch_tokens, tmp_path
@@ -1143,7 +1262,7 @@ class TestDownloadAllDryRunFilenameParity:
         output_dir = tmp_path / "downloads"
         output_dir.mkdir(parents=True)
         # Create existing file
-        (output_dir / "First Audio.mp3").write_bytes(b"existing")
+        (output_dir / "First Audio.m4a").write_bytes(b"existing")
 
         async def mock_download_audio(notebook_id, output_path, artifact_id=None, **kwargs):
             Path(output_path).write_bytes(b"new content")
@@ -1165,9 +1284,9 @@ class TestDownloadAllDryRunFilenameParity:
 
         assert result.exit_code == 0
         # First file should remain unchanged
-        assert (output_dir / "First Audio.mp3").read_bytes() == b"existing"
+        assert (output_dir / "First Audio.m4a").read_bytes() == b"existing"
         # Second file should be downloaded
-        assert (output_dir / "Second Audio.mp3").exists()
+        assert (output_dir / "Second Audio.m4a").exists()
 
 
 # =============================================================================
@@ -2010,7 +2129,7 @@ class TestDownloadFlashcardsStandardFlags:
 #     <N>s" in text mode.
 #   - AuthError surfaces a re-authentication hint
 #     ("Run 'notebooklm login' to re-authenticate.") in text mode.
-#   - Typed exit codes from error_handler.py:64-67:
+#   - Typed exit codes from ``handle_errors``:
 #       1 = library/user error (RateLimit, Auth, Validation, Network, ...)
 #       2 = unexpected/system error (anything else)
 # =============================================================================
@@ -2022,10 +2141,10 @@ class TestDownloadTypedErrorPath:
     def _list_raises(self, exc: Exception):
         """Build a mock client whose `artifacts.list` raises ``exc``.
 
-        The exception fires at the first awaited call inside
-        ``_download_artifacts_generic``, which surfaces directly to the outer
-        ``_run_artifact_download`` exception handler — the exact site under
-        test. The single-download / --all per-artifact try/except
+        The exception fires at the first awaited artifact listing inside
+        ``notebooklm._app.download.execute_download``, which surfaces directly
+        to the outer ``_run_artifact_download`` exception handler — the exact
+        site under test. The single-download / --all per-artifact try/except
         blocks deliberately swallow API errors into ``{"error": ...}`` rows;
         forcing the failure on ``list`` exercises the *typed* handler path.
         """
@@ -2121,7 +2240,7 @@ class TestDownloadTypedErrorPath:
     # ----- Unexpected exceptions (typed exit code 2) ------------------------
 
     def test_unexpected_exception_exits_with_code_2(self, runner, mock_auth, mock_fetch_tokens):
-        """Unknown exceptions exit 2 per error_handler.py:64-67 policy."""
+        """Unknown exceptions exit 2 per ``handle_errors`` policy."""
         result = runner.invoke(
             cli,
             ["download", "audio", "-n", "nb_123"],
@@ -2188,13 +2307,12 @@ class TestDownloadTypedErrorPath:
     def test_json_returned_error_envelope_unchanged_exit_1(
         self, runner, mock_auth, mock_fetch_tokens
     ):
-        """The pre-existing "no completed artifacts" → JSON {"error": "..."} + exit 1
-        path (download.py:709-710) is preserved by the typed-handler refactor.
+        """The pre-existing "no completed artifacts" JSON error path is preserved.
 
         That branch surfaces a *returned* dict-shaped error from
-        ``_download_artifacts_generic`` (not a raised exception), so it must
-        NOT be re-routed through the typed handler — exit 1 with the legacy
-        ``error: "<msg>"`` JSON shape is the documented behavior.
+        the ``DownloadOutcome.NO_ARTIFACTS`` branch (not a raised exception),
+        so it must NOT be re-routed through the typed handler — exit 1 with
+        the legacy ``error: "<msg>"`` JSON shape is the documented behavior.
         """
         mock_client = create_mock_client()
         mock_client.artifacts.list = AsyncMock(return_value=[])
@@ -2223,7 +2341,7 @@ class TestDownloadTypedErrorPath:
         ``tests/integration/cli_vcr/test_downloads.py`` (which asserts
         ``exit_code in (0, 1)`` for unauth invocations) keeps passing.
         """
-        with patch("notebooklm.cli.helpers.get_auth_tokens") as mock_get_auth_tokens:
+        with patch.object(helpers_module, "get_auth_tokens") as mock_get_auth_tokens:
             mock_get_auth_tokens.side_effect = FileNotFoundError(
                 "Storage file not found: /tmp/missing/storage_state.json"
             )
@@ -2237,7 +2355,7 @@ class TestDownloadTypedErrorPath:
 
     def test_missing_storage_json_emits_auth_required_envelope(self, runner):
         """Missing storage in --json mode emits AUTH_REQUIRED envelope, exit 1."""
-        with patch("notebooklm.cli.helpers.get_auth_tokens") as mock_get_auth_tokens:
+        with patch.object(helpers_module, "get_auth_tokens") as mock_get_auth_tokens:
             mock_get_auth_tokens.side_effect = FileNotFoundError("Storage file not found")
             result = runner.invoke(cli, ["download", "audio", "--json", "-n", "nb_123"])
 

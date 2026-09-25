@@ -3,7 +3,7 @@
 ``_app/chat.py`` had **zero** direct coverage before this file — it was
 exercised only through ``CliRunner`` in ``tests/unit/cli/test_chat.py``. These
 tests pin the Click-free chat business logic at the ``_app`` boundary with a
-``MagicMock`` client and a tiny in-memory :class:`ProgressSink`, independent of
+``MagicMock`` client and a tiny in-memory :class:`ChatEventSink`, independent of
 the Click adapter / exit-code policy:
 
 * the conversation-id selection ladder (:func:`determine_conversation_id`) and
@@ -26,6 +26,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from notebooklm._app.chat import (
+    ChatEvent,
+    ChatEventSink,
+    ChatValidationError,
     ClearCacheResult,
     ConfigureResult,
     HistoryFetch,
@@ -40,34 +43,29 @@ from notebooklm._app.chat import (
     save_answer_as_note,
     validate_ask_flags,
 )
-from notebooklm._app.events import ProgressEvent, ProgressSink
 from notebooklm.exceptions import ValidationError
 from notebooklm.rpc.types import ChatGoal, ChatResponseLength
-from notebooklm.types import AskResult, ChatMode, Note
+from notebooklm.types import AskResult, ChatMode, ChatSettings, Note
 
 
 class _RecordingSink:
-    """In-memory :class:`ProgressSink` that records emitted messages."""
+    """In-memory :class:`ChatEventSink` that records semantic events."""
 
     def __init__(self) -> None:
-        self.events: list[ProgressEvent] = []
+        self.events: list[ChatEvent] = []
 
-    def emit(self, event: ProgressEvent) -> None:
+    def emit(self, event: ChatEvent) -> None:
         self.events.append(event)
 
-    @property
-    def messages(self) -> list[str]:
-        return [e.message for e in self.events]
 
+def test_recording_sink_conforms_to_chat_event_sink_protocol() -> None:
+    """The test double honors the real (runtime-checkable) ChatEventSink seam.
 
-def test_recording_sink_conforms_to_progress_sink_protocol() -> None:
-    """The test double honors the real (runtime-checkable) ProgressSink seam.
-
-    Guards against drift: if ``ProgressSink.emit`` ever changes shape, the
+    Guards against drift: if ``ChatEventSink.emit`` ever changes shape, the
     status-emission assertions below would silently exercise a non-conforming
     double otherwise.
     """
-    assert isinstance(_RecordingSink(), ProgressSink)
+    assert isinstance(_RecordingSink(), ChatEventSink)
 
 
 def _client() -> MagicMock:
@@ -90,10 +88,12 @@ def test_validate_ask_flags_allows_each_alone() -> None:
 
 
 def test_validate_ask_flags_rejects_new_with_conversation_id() -> None:
-    with pytest.raises(ValidationError) as exc:
+    with pytest.raises(ChatValidationError) as exc:
         validate_ask_flags(new_conversation=True, conversation_id="conv_1")
-    assert "--new" in str(exc.value)
-    assert "--conversation-id" in str(exc.value)
+    assert exc.value.code == "NEW_WITH_CONVERSATION_ID"
+    assert exc.value.conversation_id == "conv_1"
+    assert "--new" not in str(exc.value)
+    assert "--conversation-id" not in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ def test_determine_conversation_notebook_switch_starts_fresh() -> None:
         progress=sink,
     )
     assert result is None
-    assert any("new conversation" in m for m in sink.messages)
+    assert sink.events == [ChatEvent("NOTEBOOK_CHANGED")]
 
 
 def test_determine_conversation_falls_back_to_cached() -> None:
@@ -172,7 +172,7 @@ def test_determine_conversation_explicit_notebook_but_no_cached_falls_through() 
         progress=sink,
     )
     assert result == "conv_cached"
-    assert sink.messages == []
+    assert sink.events == []
 
 
 def test_determine_conversation_no_explicit_notebook_skips_notebook_read() -> None:
@@ -201,7 +201,7 @@ async def test_get_latest_conversation_returns_server_id() -> None:
     sink = _RecordingSink()
     result = await get_latest_conversation_from_server(client, "nb_1", progress=sink)
     assert result == "conv-server-abc"
-    assert any("Continuing conversation" in m for m in sink.messages)
+    assert sink.events == [ChatEvent("HISTORY_CONTINUING", conversation_id="conv-server-abc")]
 
 
 @pytest.mark.asyncio
@@ -220,7 +220,7 @@ async def test_get_latest_conversation_swallows_fetch_error() -> None:
     sink = _RecordingSink()
     result = await get_latest_conversation_from_server(client, "nb_1", progress=sink)
     assert result is None
-    assert any("history unavailable" in m for m in sink.messages)
+    assert sink.events == [ChatEvent("HISTORY_UNAVAILABLE")]
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +249,42 @@ async def test_execute_configure_mode_short_circuits_to_set_mode() -> None:
     assert result.persona is None
     assert result.response_length is None
     client.chat.set_mode.assert_awaited_once_with("nb_123", ChatMode.LEARNING_GUIDE)
+    client.chat.configure.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("persona", "response_length"), [("tutor", None), (None, "longer")])
+async def test_execute_configure_mode_with_custom_field_rejected(persona, response_length) -> None:
+    """A preset cannot be combined with a custom persona/response_length (no RPC)."""
+    client = _client()
+    client.chat.set_mode = AsyncMock(return_value=None)
+    client.chat.configure = AsyncMock(return_value=None)
+
+    with pytest.raises(ValidationError, match="chat_mode preset"):
+        await execute_configure(
+            client,
+            "nb_123",
+            chat_mode="detailed",
+            persona=persona,
+            response_length=response_length,
+        )
+    client.chat.set_mode.assert_not_called()
+    client.chat.configure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_mode_with_empty_persona_ok() -> None:
+    """An empty persona ("") is a no-op, so it does not block a preset."""
+    client = _client()
+    client.chat.set_mode = AsyncMock(return_value=None)
+    client.chat.configure = AsyncMock(return_value=None)
+
+    result = await execute_configure(
+        client, "nb_123", chat_mode="concise", persona="", response_length=None
+    )
+    assert result.mode == "concise"
+    client.chat.set_mode.assert_awaited_once_with("nb_123", ChatMode.CONCISE)
+    # The preset short-circuits: the custom configure block must not be written.
     client.chat.configure.assert_not_called()
 
 
@@ -300,6 +336,205 @@ async def test_execute_configure_no_flags_leaves_goal_and_length_none() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_execute_configure_no_flags_skips_getter() -> None:
+    """The bare reset path must NOT read current settings (no round-trip, no merge)."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock()
+
+    await execute_configure(client, "nb_123", chat_mode=None, persona=None, response_length=None)
+
+    client.chat.get_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_both_supplied_skips_getter() -> None:
+    """When both fields are given the block is complete — a single write, no getter read."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock()
+
+    result = await execute_configure(
+        client, "nb_123", chat_mode=None, persona="tutor", response_length="longer"
+    )
+
+    client.chat.get_settings.assert_not_awaited()
+    assert result.goal_name == "custom"
+    assert result.persona == "tutor"
+    assert result.response_length == "longer"
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123",
+        goal=ChatGoal.CUSTOM,
+        response_length=ChatResponseLength.LONGER,
+        custom_prompt="tutor",
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_persona_only_preserves_length() -> None:
+    """persona-only merges: the omitted response_length is preserved from current (#1751)."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock(
+        return_value=ChatSettings(
+            goal=ChatGoal.DEFAULT,
+            response_length=ChatResponseLength.SHORTER,
+            custom_prompt=None,
+        )
+    )
+
+    result = await execute_configure(
+        client, "nb_123", chat_mode=None, persona="chemistry tutor", response_length=None
+    )
+
+    client.chat.get_settings.assert_awaited_once_with("nb_123")
+    # Effective write preserves SHORTER; result reports only the delta (persona).
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123",
+        goal=ChatGoal.CUSTOM,
+        response_length=ChatResponseLength.SHORTER,
+        custom_prompt="chemistry tutor",
+    )
+    assert result.goal_name == "custom"
+    assert result.persona == "chemistry tutor"
+    assert result.response_length is None
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_length_only_preserves_goal_and_prompt() -> None:
+    """length-only merges: the omitted CUSTOM goal + persona are preserved from current (#1751)."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock(
+        return_value=ChatSettings(
+            goal=ChatGoal.CUSTOM,
+            response_length=ChatResponseLength.DEFAULT,
+            custom_prompt="keep this persona",
+        )
+    )
+
+    result = await execute_configure(
+        client, "nb_123", chat_mode=None, persona=None, response_length="longer"
+    )
+
+    client.chat.get_settings.assert_awaited_once_with("nb_123")
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123",
+        goal=ChatGoal.CUSTOM,
+        response_length=ChatResponseLength.LONGER,
+        custom_prompt="keep this persona",
+    )
+    # Delta reporting: persona/goal_name stay None because THIS call didn't set them.
+    assert result.goal_name is None
+    assert result.persona is None
+    assert result.response_length == "longer"
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_empty_persona_no_length_is_bare_reset() -> None:
+    """persona="" with no length is a bare reset (empty persona is a no-op), no getter."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock()
+
+    result = await execute_configure(
+        client, "nb_123", chat_mode=None, persona="", response_length=None
+    )
+
+    client.chat.get_settings.assert_not_awaited()
+    assert result.goal_name is None
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123", goal=None, response_length=None, custom_prompt=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_partial_propagates_get_settings_drift() -> None:
+    """A get_settings decode-drift on a partial update fails loud — never falls back to clobbering."""
+    from notebooklm.exceptions import UnknownRPCMethodError
+
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock(side_effect=UnknownRPCMethodError("drift"))
+
+    with pytest.raises(UnknownRPCMethodError):
+        await execute_configure(
+            client, "nb_123", chat_mode=None, persona="tutor", response_length=None
+        )
+
+    # The write must NOT happen when the read fails (no silent clobber).
+    client.chat.configure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_whitespace_persona_no_length_is_bare_reset() -> None:
+    """A whitespace-only persona is a no-op (repo convention), so alone it's a bare reset."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock()
+
+    result = await execute_configure(
+        client, "nb_123", chat_mode=None, persona="   ", response_length=None
+    )
+
+    client.chat.get_settings.assert_not_awaited()
+    assert result.goal_name is None
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123", goal=None, response_length=None, custom_prompt=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_whitespace_persona_with_length_merges() -> None:
+    """A whitespace-only persona + a length is a length-only partial write (persona not-supplied)."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock(
+        return_value=ChatSettings(
+            goal=ChatGoal.CUSTOM,
+            response_length=ChatResponseLength.DEFAULT,
+            custom_prompt="keep me",
+        )
+    )
+
+    await execute_configure(
+        client, "nb_123", chat_mode=None, persona="   ", response_length="longer"
+    )
+
+    client.chat.get_settings.assert_awaited_once_with("nb_123")
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123",
+        goal=ChatGoal.CUSTOM,
+        response_length=ChatResponseLength.LONGER,
+        custom_prompt="keep me",
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_configure_empty_persona_with_length_merges() -> None:
+    """persona="" + a length is a length-only partial write (empty persona not-supplied)."""
+    client = _client()
+    client.chat.configure = AsyncMock(return_value=None)
+    client.chat.get_settings = AsyncMock(
+        return_value=ChatSettings(
+            goal=ChatGoal.LEARNING_GUIDE,
+            response_length=ChatResponseLength.DEFAULT,
+            custom_prompt=None,
+        )
+    )
+
+    await execute_configure(client, "nb_123", chat_mode=None, persona="", response_length="shorter")
+
+    client.chat.get_settings.assert_awaited_once_with("nb_123")
+    client.chat.configure.assert_awaited_once_with(
+        "nb_123",
+        goal=ChatGoal.LEARNING_GUIDE,
+        response_length=ChatResponseLength.SHORTER,
+        custom_prompt=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # save_answer_as_note — the ask --save-as-note secondary action
 # ---------------------------------------------------------------------------
@@ -319,16 +554,19 @@ def _ask_result(*, answer: str, references: list | None = None) -> AskResult:
 @pytest.mark.asyncio
 async def test_save_answer_no_answer_returns_error_outcome() -> None:
     client = _client()
+    sink = _RecordingSink()
     outcome = await save_answer_as_note(
         client,
         "nb_1",
         _ask_result(answer=""),
         note_title=None,
         question="Q?",
+        progress=sink,
     )
     assert isinstance(outcome, SaveNoteOutcome)
     assert outcome.note is None
     assert outcome.error == "No answer to save as note"
+    assert sink.events == [ChatEvent("NOTE_NO_ANSWER")]
 
 
 @pytest.mark.asyncio
@@ -337,6 +575,7 @@ async def test_save_answer_citation_rich_uses_chat_save_path() -> None:
     note = Note(id="note_abc123", notebook_id="nb_1", title="My title", content="A")
     client.chat.save_answer_as_note = AsyncMock(return_value=note)
     result = _ask_result(answer="The answer.", references=[object()])
+    sink = _RecordingSink()
 
     outcome = await save_answer_as_note(
         client,
@@ -344,6 +583,7 @@ async def test_save_answer_citation_rich_uses_chat_save_path() -> None:
         result,
         note_title="My title",
         question="Q?",
+        progress=sink,
     )
 
     assert outcome.error is None
@@ -351,6 +591,7 @@ async def test_save_answer_citation_rich_uses_chat_save_path() -> None:
     assert outcome.note == {"id": "note_abc123", "title": "My title"}
     client.chat.save_answer_as_note.assert_awaited_once_with("nb_1", result, title="My title")
     client.notes.create.assert_not_called()
+    assert sink.events == [ChatEvent("NOTE_SAVED", note_id="note_abc123", note_title="My title")]
 
 
 @pytest.mark.asyncio
@@ -372,7 +613,10 @@ async def test_save_answer_without_citations_falls_back_to_plain_text() -> None:
     assert outcome.plain_text_fallback is True
     assert outcome.note == {"id": "note_def456", "title": "Chat: Q?"}
     client.notes.create.assert_awaited_once()
-    assert any("plain-text note" in m for m in sink.messages)
+    assert sink.events == [
+        ChatEvent("NOTE_PLAIN_TEXT_FALLBACK"),
+        ChatEvent("NOTE_SAVED", note_id="note_def456", note_title="Chat: Q?"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -380,6 +624,7 @@ async def test_save_answer_folds_exception_into_error_outcome() -> None:
     """A save failure is non-fatal: the error is returned, not raised."""
     client = _client()
     client.chat.save_answer_as_note = AsyncMock(side_effect=RuntimeError("save boom"))
+    sink = _RecordingSink()
 
     outcome = await save_answer_as_note(
         client,
@@ -387,10 +632,12 @@ async def test_save_answer_folds_exception_into_error_outcome() -> None:
         _ask_result(answer="The answer.", references=[object()]),
         note_title="T",
         question="Q?",
+        progress=sink,
     )
 
     assert outcome.note is None
     assert outcome.error == "save boom"
+    assert sink.events == [ChatEvent("NOTE_SAVE_FAILED", detail="save boom")]
 
 
 # ---------------------------------------------------------------------------

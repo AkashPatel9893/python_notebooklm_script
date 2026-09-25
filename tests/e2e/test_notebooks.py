@@ -8,6 +8,7 @@ from .conftest import requires_auth
 @requires_auth
 class TestNotebookOperations:
     @pytest.mark.asyncio
+    @pytest.mark.impersonate_smoke
     async def test_list_notebooks(self, client):
         notebooks = await client.notebooks.list()
         assert isinstance(notebooks, list)
@@ -45,8 +46,10 @@ class TestNotebookOperations:
 
 
 @requires_auth
+@pytest.mark.live_chat_ask
 class TestNotebookAsk:
     @pytest.mark.asyncio
+    @pytest.mark.impersonate_smoke
     async def test_ask_notebook(self, client, read_only_notebook_id):
         result = await client.chat.ask(read_only_notebook_id, "What is this notebook about?")
         assert result.answer is not None
@@ -100,8 +103,14 @@ class TestNotebookSummary:
         """Test getting raw notebook data."""
         raw_data = await client.notebooks.get_raw(read_only_notebook_id)
         assert raw_data is not None
-        # Raw data is typically a list with notebook structure
-        assert isinstance(raw_data, list)
+        if client.backends["notebooks"] == "android":
+            # Android projects the known protobuf fields to a JSON-safe dict;
+            # assert the named proto envelope rather than a web row shape.
+            assert isinstance(raw_data, dict)
+            assert raw_data["project"]["id"] == read_only_notebook_id
+            assert isinstance(raw_data["project"]["metadata"], dict)
+        else:
+            assert isinstance(raw_data, list)
 
 
 @requires_auth

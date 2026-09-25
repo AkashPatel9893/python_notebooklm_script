@@ -131,7 +131,7 @@ four verbs above.
 ## 2. RPC-callable Protocol names (CC3)
 
 Most feature modules type their RPC dependency as the shared
-`RpcCaller` object Protocol from `_runtime_contracts`. Only middleware-chain
+`RpcCaller` object Protocol from `_web/contracts.py`. Only middleware-chain
 callables and upload's keyword-injected registration callback keep local
 callable shapes. These names are NOT interchangeable — the divergence is
 structural, not stylistic. This section explains what each name signals so new
@@ -141,9 +141,9 @@ code picks the right shape.
 
 | Name | Defined in | Protocol shape | Used by |
 |---|---|---|---|
-| `NextCall` | `_middleware/core.py` | **type alias**, not a class: `Callable[[RpcRequest], Awaitable[RpcResponse]]` | Every `Middleware.__call__` — the "call the next link" function passed into around-style middlewares |
-| `RpcCallback` | `_source/upload.py` | **Callable** Protocol: `async def __call__(method, params, ...)` | `SourceUploadPipeline.register_file_source` — RPC entrypoint passed as a **keyword argument** at call time |
-| `RpcCaller` | `_runtime/contracts.py` | **Object** Protocol: `async def rpc_call(method, params, ...)` (i.e. `obj.rpc_call(...)`) | The canonical shared capability Protocol for pure-RPC feature APIs and helper services (`NotesAPI`, `SourceLister`, `ShareManager`, etc.) |
+| `NextCall` | `_web/transport/middleware/core.py` | **type alias**, not a class: `Callable[[RpcRequest], Awaitable[RpcResponse]]` | Every `Middleware.__call__` — the "call the next link" function passed into around-style middlewares |
+| `RpcCallback` | `_web/sources/upload.py` | **Callable** Protocol: `async def __call__(method, params, ...)` | `SourceUploadPipeline.register_file_source` — RPC entrypoint passed as a **keyword argument** at call time |
+| `RpcCaller` | `_web/contracts.py` | **Object** Protocol: `async def rpc_call(method, params, ...)` (i.e. `obj.rpc_call(...)`) | The canonical web capability Protocol for batchexecute feature APIs and helper services (`WebNotesAPI`, `SourceLister`, `ShareManager`, etc.) |
 
 ### Why they diverge
 
@@ -173,10 +173,11 @@ lets mypy flag keyword-name typos at the call site.
 ### Choosing a name in new code
 
 - New pure-RPC feature API? Type the dependency as
-  **`RpcCaller`** from `_runtime_contracts`. This is the shared capability
+  **`RpcCaller`** from `_web/contracts.py`. This is the shared web capability
   Protocol; see [`docs/architecture.md`](./architecture.md) for the protocol
-  catalogue. Concrete `Session` satisfies it structurally.
-- New middleware? Use **`NextCall`** from `_middleware/core.py` for the chain
+  catalogue. The concrete `RpcExecutor` and `NotebookLMClient` satisfy it
+  structurally.
+- New middleware? Use **`NextCall`** from `_web/transport/middleware/core.py` for the chain
   callable — do not invent a new alias.
 - New feature that takes the RPC entrypoint as a **keyword argument** at call
   time? Define a local Protocol named **`RpcCallback`** so the keyword-typo
@@ -190,7 +191,7 @@ lets mypy flag keyword-name typos at the call site.
 
 This convention is guarded by
 `tests/_guardrails/test_no_legacy_rpc_callable_aliases.py`: `RpcCall` and `ShareRpc`
-must stay deleted, and `RpcCallback` must stay local to `_source/upload.py`.
+must stay deleted, and `RpcCallback` must stay local to `_web/sources/upload.py`.
 
 ---
 
@@ -216,8 +217,8 @@ Examples (all on `ClientMetrics`):
 Shared backend: `ClientMetrics._record_wait` (private; the three public
 methods are typed wrappers around it).
 
-> A `Session.record_upload_queue_wait` proxy exists too; it forwards to the
-> `ClientMetrics` instance. The verb stays `record_*` because the contract is
+> Upload queue waits are recorded through the `ClientMetrics` instance injected
+> into the upload pipeline. The verb stays `record_*` because the contract is
 > still sync + lock-protected counter mutation.
 
 ### `emit_X` — async, fires the user-supplied callback
@@ -263,7 +264,7 @@ one, this is what it means:
 | Token | Meaning |
 |-------|---------|
 | **`#NNNN`** | A GitHub pull request or issue number in `teng-lin/notebooklm-py`, e.g. <https://github.com/teng-lin/notebooklm-py/pull/1205>. Bare numbers are not clickable in most renderers; resolve them on GitHub. |
-| **ADR-NNN** | An Architecture Decision Record under [`docs/adr/`](./adr/) (zero-padded, e.g. ADR-0014 → `docs/adr/0014-*.md`). The authoritative source for a design decision and its trade-offs. |
+| **ADR-NNNN** | An Architecture Decision Record under [`docs/adr/`](./adr/) (zero-padded, e.g. ADR-0014 -> `docs/adr/0014-*.md`). The authoritative source for a design decision and its trade-offs. |
 | **Wave N** | A sequenced step of a larger multi-PR migration (e.g. the session-decoupling / host-protocol-removal effort). Waves are *planning* units, not releases; the durable record of what a wave did is the ADR it closed and the merged PRs. |
 | **Phase N** | A coarser planning grouping than a Wave, used by some older migrations. |
 | **Tier N** | Yet another planning grouping (e.g. "tier-12-13" migration); interchangeable with Phase in intent. |
@@ -276,7 +277,7 @@ rationale survives without the label.
 
 ## Related documents
 
-- [`docs/architecture.md`](./architecture.md) — the v0.5.0 collaborator graph,
+- [`docs/architecture.md`](./architecture.md) — the current runtime graph,
   capability Protocols, and the `RpcCaller` catalogue entry.
 - [`docs/development.md`](./development.md) — contributor on-ramp; this
   conventions doc is linked from its "Key Design Decisions" section.

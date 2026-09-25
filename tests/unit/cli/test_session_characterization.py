@@ -42,8 +42,18 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm._app.login_browser as login_browser_module
+import notebooklm.auth as auth_module
+import notebooklm.cli.context as context_module
+import notebooklm.cli.helpers as helpers_module
+import notebooklm.cli.resolve as resolve_module
+import notebooklm.cli.services.auth_source as auth_source_module
+import notebooklm.cli.services.session_context as session_context_module
+import notebooklm.cli.session_cmd as session_cmd
+import notebooklm.paths as paths_module
 from notebooklm.notebooklm_cli import cli
-from notebooklm.types import Notebook
+from notebooklm.types import Notebook, SharePermission
+from tests._fixtures import patch_session_login_dual
 
 from .conftest import create_mock_client, inject_client
 
@@ -88,9 +98,9 @@ def char_context_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_session_context, "get_context_path", _return_context_file)
     with (
-        patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.context.get_context_path", return_value=context_file),
-        patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
+        patch.object(helpers_module, "get_context_path", return_value=context_file),
+        patch.object(context_module, "get_context_path", return_value=context_file),
+        patch.object(resolve_module, "get_context_path", return_value=context_file),
     ):
         yield context_file
 
@@ -105,21 +115,20 @@ def char_storage_file(tmp_path, monkeypatch):
     """
     storage_file = tmp_path / "storage_state.json"
     with (
-        patch("notebooklm.paths.get_storage_path", return_value=storage_file),
-        patch("notebooklm.cli.session_cmd.get_storage_path", return_value=storage_file),
-        patch(
-            "notebooklm.cli.services.auth_source.get_storage_path",
+        patch.object(paths_module, "get_storage_path", return_value=storage_file),
+        patch.object(session_cmd, "get_storage_path", return_value=storage_file),
+        patch.object(
+            auth_source_module,
+            "get_storage_path",
             return_value=storage_file,
         ),
-        patch(
-            "notebooklm.cli.services.session_context.get_storage_path",
+        patch.object(
+            session_context_module,
+            "get_storage_path",
             return_value=storage_file,
             create=True,
         ),
-        patch(
-            "notebooklm.cli.services.playwright_login.get_storage_path",
-            return_value=storage_file,
-        ),
+        patch.object(login_browser_module, "get_storage_path", return_value=storage_file),
     ):
         yield storage_file
 
@@ -143,10 +152,11 @@ class TestLoginCharacterization:
     def test_login_browser_chrome_invokes_playwright(self, char_runner, tmp_path):
         """``login --browser chrome`` reaches the Playwright entry point."""
         with (
-            patch("notebooklm.cli.session_cmd._run_playwright_login") as mock_run,
-            patch("notebooklm.cli.session_cmd._sync_server_language_to_config") as mock_sync,
-            patch(
-                "notebooklm.cli.session_cmd.prepare_paths_or_exit",
+            patch.object(session_cmd, "run_login") as mock_run_login,
+            patch_session_login_dual("_sync_server_language_to_config") as mock_sync,
+            patch.object(
+                session_cmd,
+                "prepare_paths_or_exit",
                 return_value=(
                     tmp_path / "storage_state.json",
                     tmp_path / "browser_profile",
@@ -156,9 +166,11 @@ class TestLoginCharacterization:
             result = char_runner.invoke(cli, ["login", "--browser", "chrome"])
 
         assert result.exit_code == 0
-        mock_run.assert_called_once()
-        kwargs = mock_run.call_args.kwargs
-        assert kwargs["browser"] == "chrome"
+        mock_run_login.assert_called_once()
+        plan = mock_run_login.call_args.args[0]
+        assert plan.browser == "chrome"
+        assert plan.storage_path == tmp_path / "storage_state.json"
+        assert plan.browser_profile == tmp_path / "browser_profile"
         mock_sync.assert_called_once_with(
             storage_path=tmp_path / "storage_state.json",
             profile=None,
@@ -169,8 +181,8 @@ class TestLoginCharacterization:
     def test_login_no_browser_via_browser_cookies(self, char_runner):
         """``login --browser-cookies`` skips Playwright (no-browser path)."""
         with (
-            patch("notebooklm.cli.session_cmd._login_browser_cookies_single") as mock_single,
-            patch("notebooklm.cli.session_cmd._warn_missing_optional_domains"),
+            patch_session_login_dual("_login_browser_cookies_single") as mock_single,
+            patch_session_login_dual("_warn_missing_optional_domains"),
         ):
             result = char_runner.invoke(cli, ["login", "--browser-cookies", "chrome"])
 
@@ -206,11 +218,12 @@ class TestUseCharacterization:
             )
         )
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
-            patch(
-                "notebooklm.cli.session_cmd.resolve_notebook_id",
+            patch.object(
+                session_cmd,
+                "resolve_notebook_id",
                 new_callable=AsyncMock,
             ) as mock_resolve,
         ):
@@ -231,14 +244,16 @@ class TestUseCharacterization:
                 title="JSON Char Notebook",
                 created_at=datetime(2024, 2, 1),
                 is_owner=False,
+                role=SharePermission.VIEWER,
             )
         )
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
-            patch(
-                "notebooklm.cli.session_cmd.resolve_notebook_id",
+            patch.object(
+                session_cmd,
+                "resolve_notebook_id",
                 new_callable=AsyncMock,
             ) as mock_resolve,
         ):
@@ -258,7 +273,10 @@ class TestUseCharacterization:
                 "id": "nb_json_001",
                 "title": "JSON Char Notebook",
                 "is_owner": False,
+                "role": "viewer",
                 "created_at": "2024-02-01T00:00:00",
+                "last_viewed_at": None,
+                "modified_at": None,
             },
         }
 
@@ -332,6 +350,7 @@ class TestStatusCharacterization:
                     "notebook_id": "nb_status_2",
                     "title": "Status Notebook 2",
                     "is_owner": False,
+                    "role": "viewer",
                     "created_at": "2024-04-05",
                     "conversation_id": "conv_xyz",
                 }
@@ -346,12 +365,13 @@ class TestStatusCharacterization:
                 "id": "nb_status_2",
                 "title": "Status Notebook 2",
                 "is_owner": False,
+                "role": "viewer",
             },
             "conversation_id": "conv_xyz",
         }
 
     def test_status_paths_json(self, char_runner, char_context_file):
-        with patch("notebooklm.cli.services.session_context.get_path_info") as mock_path_info:
+        with patch.object(session_context_module, "get_path_info") as mock_path_info:
             mock_path_info.return_value = {
                 "home_dir": "/tmp/.notebooklm",
                 "home_source": "default",
@@ -400,7 +420,7 @@ class TestAuthCheckCharacterization:
     def test_auth_check_text_storage_missing(self, char_runner, char_storage_file):
         # storage file does not exist
         result = char_runner.invoke(cli, ["auth", "check"])
-        assert result.exit_code == 0  # text mode does not exit non-zero
+        assert result.exit_code == 1  # failed check ⇒ non-zero, matches --json (issue #1569)
         assert "Authentication Check" in result.output
         assert "Storage file not found" in result.output
 
@@ -448,12 +468,17 @@ class TestAuthCheckCharacterization:
         assert data["checks"]["json_valid"] is False
 
     def test_auth_check_oserror_text_p1t3(self, char_runner, char_storage_file):
-        """P1.T3 regression: OSError on read does not raise; reports error gracefully."""
+        """P1.T3 regression: OSError on read does not raise; reports error gracefully.
+
+        The read failure surfaces as a failed ``json_valid`` check, so text
+        mode exits non-zero (cleanly, no traceback) like --json (issue #1569).
+        """
         # File exists but read raises OSError (permission denied simulation).
-        char_storage_file.write_text("{}")
+        char_storage_file.write_text("{}", encoding="utf-8")
         with patch("pathlib.Path.read_text", side_effect=OSError("Permission denied")):
             result = char_runner.invoke(cli, ["auth", "check"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1
+        assert result.exception is None or isinstance(result.exception, SystemExit)
         assert "Storage unreadable" in result.output or "Permission denied" in result.output
 
     def test_auth_check_oserror_json_p1t3(self, char_runner, char_storage_file):
@@ -484,8 +509,9 @@ class TestAuthRefreshCharacterization:
     def test_auth_refresh_default_path_success(self, char_runner, char_storage_file):
         """Default path (no --browser-cookies) calls ``fetch_tokens_with_domains``."""
         char_storage_file.write_text(json.dumps({"cookies": [{"name": "SID", "value": "x"}]}))
-        with patch(
-            "notebooklm.cli.session_cmd.fetch_tokens_with_domains",
+        with patch.object(
+            session_cmd,
+            "fetch_tokens_with_domains",
             new_callable=AsyncMock,
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
@@ -496,8 +522,9 @@ class TestAuthRefreshCharacterization:
         assert "refreshed" in result.output
 
     def test_auth_refresh_quiet_suppresses_success_output(self, char_runner, char_storage_file):
-        with patch(
-            "notebooklm.cli.session_cmd.fetch_tokens_with_domains",
+        with patch.object(
+            session_cmd,
+            "fetch_tokens_with_domains",
             new_callable=AsyncMock,
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
@@ -506,7 +533,7 @@ class TestAuthRefreshCharacterization:
         assert result.output.strip() == ""
 
     def test_auth_refresh_browser_cookies_path(self, char_runner, char_storage_file):
-        with patch("notebooklm.cli.session_cmd._refresh_from_browser_cookies") as mock_refresh:
+        with patch_session_login_dual("_refresh_from_browser_cookies") as mock_refresh:
             result = char_runner.invoke(cli, ["auth", "refresh", "--browser-cookies", "chrome"])
         assert result.exit_code == 0
         mock_refresh.assert_called_once()
@@ -530,7 +557,7 @@ class TestAuthInspectCharacterization:
         """``auth inspect`` (text) lists accounts in a table."""
         fake_account_1 = MagicMock(email="a@example.com", is_default=True, browser_profile=None)
         fake_account_2 = MagicMock(email="b@example.com", is_default=False, browser_profile=None)
-        with patch("notebooklm.cli.session_cmd._enumerate_browser_accounts") as mock_enum:
+        with patch_session_login_dual("_enumerate_browser_accounts") as mock_enum:
             mock_enum.return_value = ("chrome", [fake_account_1, fake_account_2])
             result = char_runner.invoke(cli, ["auth", "inspect", "--browser", "chrome"])
         assert result.exit_code == 0
@@ -542,7 +569,7 @@ class TestAuthInspectCharacterization:
         fake_account = MagicMock(
             email="primary@example.com", is_default=True, browser_profile="Default"
         )
-        with patch("notebooklm.cli.session_cmd._enumerate_browser_accounts") as mock_enum:
+        with patch_session_login_dual("_enumerate_browser_accounts") as mock_enum:
             mock_enum.return_value = ("chrome", [fake_account])
             result = char_runner.invoke(cli, ["auth", "inspect", "--browser", "chrome", "--json"])
         assert result.exit_code == 0

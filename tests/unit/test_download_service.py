@@ -21,6 +21,8 @@ from notebooklm.cli.services.download import (
     execute_download,
 )
 from notebooklm.types import Artifact
+from tests._helpers.downloads import configure_prepared_artifact_downloads
+from tests._helpers.operation import ClientStub
 
 
 def _artifact(
@@ -70,10 +72,10 @@ def resolved_notebook(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_build_download_plan_rejects_force_and_no_clobber() -> None:
     spec = DOWNLOAD_SPECS_BY_NAME["audio"]
 
-    with pytest.raises(
-        DownloadPlanValidationError, match="Cannot specify both --force and --no-clobber"
-    ):
+    with pytest.raises(DownloadPlanValidationError) as exc_info:
         build_download_plan(spec, _args(force=True, no_clobber=True))
+
+    assert exc_info.value.reason == "conflicting_overwrite_policy"
 
 
 def test_build_download_plan_applies_registry_format_extension_and_warning() -> None:
@@ -87,9 +89,10 @@ def test_build_download_plan_applies_registry_format_extension_and_warning() -> 
 
     assert plan.file_extension == ".pptx"
     assert plan.format_choice == "pptx"
-    assert list(plan.warnings) == [
-        "Warning: output path 'deck.pdf' does not end with '.pptx' but --format pptx was requested."
-    ]
+    assert len(plan.warnings) == 1
+    assert plan.warnings[0].output_path == "deck.pdf"
+    assert plan.warnings[0].expected_extension == ".pptx"
+    assert plan.warnings[0].format_choice == "pptx"
 
 
 @pytest.mark.asyncio
@@ -107,7 +110,8 @@ async def test_execute_download_all_dry_run_applies_name_filter_and_duplicate_fi
         ),
         download_audio=AsyncMock(),
     )
-    facade = SimpleNamespace(artifacts=artifacts)
+    facade = ClientStub(artifacts=artifacts)
+    configure_prepared_artifact_downloads(facade)
     plan = build_download_plan(
         spec,
         _args(
@@ -127,8 +131,8 @@ async def test_execute_download_all_dry_run_applies_name_filter_and_duplicate_fi
         "count": 2,
         "output_dir": str(tmp_path / "downloads"),
         "artifacts": [
-            {"id": "a1", "title": "Episode", "filename": "Episode.mp3"},
-            {"id": "a2", "title": "Episode", "filename": "Episode (2).mp3"},
+            {"id": "a1", "title": "Episode", "filename": "Episode.m4a"},
+            {"id": "a2", "title": "Episode", "filename": "Episode (2).m4a"},
         ],
     }
     artifacts.download_audio.assert_not_called()
@@ -145,10 +149,11 @@ async def test_execute_download_all_reports_partial_failure_and_progress(tmp_pat
             ]
         ),
         download_audio=AsyncMock(
-            side_effect=[str(tmp_path / "Episode 1.mp3"), RuntimeError("boom")]
+            side_effect=[str(tmp_path / "Episode 1.m4a"), RuntimeError("boom")]
         ),
     )
-    facade = SimpleNamespace(artifacts=artifacts)
+    facade = ClientStub(artifacts=artifacts)
+    configure_prepared_artifact_downloads(facade)
     plan = build_download_plan(
         spec,
         _args(output_path=str(tmp_path), download_all=True),
@@ -176,13 +181,10 @@ async def test_execute_download_single_forwards_format_kwarg(tmp_path: Path) -> 
     quiz = _artifact("quiz_1", "Quiz", 4, variant=2)
     artifacts = SimpleNamespace(
         list=AsyncMock(return_value=[quiz]),
-        # Single-pass seam (#1488): the executor lists once via _list_for_download
-        # (typed + raw studio rows + mind-map rows) and threads the typed quiz
-        # list into download_quiz so it skips its own second LIST_ARTIFACTS.
-        _list_for_download=AsyncMock(return_value=([quiz], [], [])),
         download_quiz=AsyncMock(return_value=str(tmp_path / "quiz.md")),
     )
-    facade = SimpleNamespace(artifacts=artifacts)
+    facade = ClientStub(artifacts=artifacts)
+    configure_prepared_artifact_downloads(facade)
     plan = build_download_plan(
         spec,
         _args(output_path=str(tmp_path / "quiz.md"), output_format="markdown"),
@@ -192,13 +194,63 @@ async def test_execute_download_single_forwards_format_kwarg(tmp_path: Path) -> 
     result = await execute_download(plan, facade)
 
     assert result["status"] == "downloaded"
-    # The executor now lists once and threads the already-fetched typed quiz list
-    # into ``download_quiz`` so it skips its own second LIST_ARTIFACTS (#1488);
-    # the format kwarg is still forwarded alongside it.
+    # The typed selection carries the chosen representation to the adapter double.
+    assert artifacts.download.await_args.args[0].representation == "markdown"
     artifacts.download_quiz.assert_awaited_once_with(
         "nb_resolved",
         str(tmp_path / "quiz.md"),
-        artifacts=[quiz],
         artifact_id="quiz_1",
         output_format="markdown",
     )
+
+
+def _audio_facade(download_audio: AsyncMock) -> SimpleNamespace:
+    """A facade serving one completed audio artifact, downloaded by ``download_audio``."""
+    audio = _artifact("a1", "Deep Dive", 1)
+    facade = ClientStub(
+        artifacts=SimpleNamespace(
+            list=AsyncMock(return_value=[audio]),
+            download_audio=download_audio,
+        )
+    )
+    configure_prepared_artifact_downloads(facade)
+    return facade
+
+
+@pytest.mark.asyncio
+async def test_audio_derived_filename_is_m4a(tmp_path: Path) -> None:
+    """With no ``--output`` path, an audio download derives a ``.m4a`` name (#2034).
+
+    The Audio Overview bytes are AAC in an MP4 container (the artifact row itself
+    advertises ``audio/mp4``), so ``.mp3`` mislabelled every default-named
+    download.
+    """
+    spec = DOWNLOAD_SPECS_BY_NAME["audio"]
+    download_audio = AsyncMock(return_value=None)
+    facade = _audio_facade(download_audio)
+
+    plan = build_download_plan(spec, _args(latest=True), tmp_path)
+    result = await execute_download(plan, facade)
+
+    assert result["status"] == "downloaded"
+    assert result["output_path"] == str(tmp_path / "Deep Dive.m4a")
+    assert download_audio.await_args.args[1] == str(tmp_path / "Deep Dive.m4a")
+
+
+@pytest.mark.asyncio
+async def test_explicit_output_path_extension_is_still_honoured(tmp_path: Path) -> None:
+    """An explicit ``.mp3`` path is written verbatim — the #2034 fix is not a rename.
+
+    Only the DERIVED filename changed, so a script that already passes its own
+    output path keeps working unchanged (the bytes were always AAC either way).
+    """
+    spec = DOWNLOAD_SPECS_BY_NAME["audio"]
+    chosen = str(tmp_path / "legacy-name.mp3")
+    download_audio = AsyncMock(return_value=chosen)
+    facade = _audio_facade(download_audio)
+
+    plan = build_download_plan(spec, _args(latest=True, output_path=chosen), tmp_path)
+    result = await execute_download(plan, facade)
+
+    assert result["output_path"] == chosen
+    assert download_audio.await_args.args[1] == chosen

@@ -3,8 +3,9 @@
 import pytest
 
 from notebooklm import NoteNotFoundError
+from notebooklm._env import get_base_url
 
-from .conftest import requires_auth
+from .conftest import requires_auth, skip_or_fail_missing_reference
 
 
 @requires_auth
@@ -29,7 +30,7 @@ class TestNotesGet:
         """Get a specific note from test notebook - read-only."""
         notes = await client.notes.list(read_only_notebook_id)
         if not notes:
-            pytest.skip("No notes available in test notebook")
+            skip_or_fail_missing_reference("No notes available in test notebook")
 
         note = await client.notes.get(read_only_notebook_id, notes[0].id)
         assert note is not None
@@ -157,7 +158,7 @@ class TestSaveAnswerAsNote:
 
             print(
                 f"\n[Manual hover-anchor check] Open "
-                f"https://notebooklm.google.com/notebook/{temp_notebook.id}, "
+                f"{get_base_url()}/notebook/{temp_notebook.id}, "
                 f"find note '{note.title}' (id={note.id[:8]}...), hover any "
                 f"[N] marker, confirm the popup shows the cited passage."
             )

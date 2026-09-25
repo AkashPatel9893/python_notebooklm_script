@@ -4,10 +4,10 @@ This module pins, for every member of :class:`notebooklm.rpc.types.RPCMethod`:
 
 1. The string method ID itself (catches enum-value drift).
 2. The ``batchexecute`` ``f.req`` request envelope produced by
-   :func:`notebooklm.rpc.encoder.encode_rpc_request` for a representative
+   :func:`notebooklm._web.wire.encoder.encode_rpc_request` for a representative
    parameter list (catches encoder format drift and param-order regressions).
 3. The Python payload returned by
-   :func:`notebooklm.rpc.decoder.decode_response` when given a synthetic
+   :func:`notebooklm._web.wire.decoder.decode_response` when given a synthetic
    scrubbed response chunk for that method (catches decoder format drift).
 
 For methods that have a documented downstream parser / dataclass mapper,
@@ -25,15 +25,21 @@ Fixture schema is documented in ``tests/fixtures/rpc_golden/README.md``.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import json
-import warnings
+import re
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from notebooklm._artifact.payloads import (
+from notebooklm._app.serialize import to_jsonable
+from notebooklm._types.artifacts import Artifact, ArtifactType
+from notebooklm._types.sources import Source, SourceType
+from notebooklm._web.params.artifacts import (
+    DEFAULT_QUIZ_DIFFICULTY,
+    DEFAULT_QUIZ_QUANTITY,
     build_audio_artifact_params,
     build_cinematic_video_artifact_params,
     build_data_table_artifact_params,
@@ -48,29 +54,29 @@ from notebooklm._artifact.payloads import (
     build_suggest_reports_params,
     build_video_artifact_params,
 )
-from notebooklm._row_adapters.artifacts import ArtifactRow
-from notebooklm._row_adapters.notes import NoteRow
-from notebooklm._row_adapters.sources import SourceRow, SourceRowShape
-from notebooklm._source.upload_payloads import (
+from notebooklm._web.params.sources import (
     build_register_file_source_params,
     build_rename_source_params,
     build_resumable_upload_start_request,
 )
-from notebooklm._types.artifacts import Artifact, ArtifactType
-from notebooklm._types.sources import Source, SourceType
-from notebooklm.exceptions import (
-    ClientError,
-    RateLimitError,
-    RPCError,
-    UnknownRPCMethodError,
-)
-from notebooklm.rpc.decoder import (
+from notebooklm._web.rows.artifacts import ArtifactRow, decode_artifact, decode_mind_map_artifact
+from notebooklm._web.rows.notes import NoteRow
+from notebooklm._web.rows.source_models import source_from_row
+from notebooklm._web.rows.sources import SourceRow, SourceRowShape
+from notebooklm._web.wire.decoder import (
     collect_rpc_ids,
     decode_response,
     parse_chunked_response,
     strip_anti_xssi,
 )
-from notebooklm.rpc.encoder import encode_rpc_request
+from notebooklm._web.wire.encoder import encode_rpc_request
+from notebooklm.exceptions import (
+    ClientError,
+    RateLimitError,
+    RPCError,
+    UnknownRPCMethodError,
+    ValidationError,
+)
 from notebooklm.rpc.types import (
     FLASHCARDS_VARIANT,
     INTERACTIVE_MIND_MAP_VARIANT,
@@ -94,6 +100,14 @@ from notebooklm.rpc.types import (
 )
 
 FIXTURE_ROOT: Path = Path(__file__).parents[1] / "fixtures" / "rpc_golden"
+
+_ARTIFACT_CLIENT_OPTIONS: list[Any] = [
+    2,
+    None,
+    None,
+    [1, None, None, None, None, None, None, None, None, None, [1]],
+    [[1, 4, 8, 2, 3, 6]],
+]
 
 
 class _FixtureSchemaError(AssertionError):
@@ -247,7 +261,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 audio_length=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -274,7 +288,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 audio_length=AudioLength.SHORT,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -310,7 +324,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 style_prompt=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -341,7 +355,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 style_prompt="blueprint line art",
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -361,7 +375,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                             "Summarize visually",
                             None,
                             1,
-                            2,
+                            None,
                             "blueprint line art",
                         ],
                     ],
@@ -377,7 +391,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 instructions=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -393,6 +407,67 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
             ],
         ),
         (
+            # #1805: SHORT (code 4) rides the STANDARD builder — format_code at
+            # slot [4] == 4 with the style_code (AUTO_SELECT=1) still present,
+            # NOT the cinematic special shape (which drops the style slot).
+            "video_short_format",
+            build_video_artifact_params(
+                "nb_payload",
+                ["src_alpha"],
+                language="en",
+                instructions=None,
+                video_format=VideoFormat.SHORT,
+                video_style=None,
+                style_prompt=None,
+            ),
+            [
+                _ARTIFACT_CLIENT_OPTIONS,
+                "nb_payload",
+                [
+                    None,
+                    None,
+                    3,
+                    [[["src_alpha"]]],
+                    None,
+                    None,
+                    None,
+                    None,
+                    [None, None, [[["src_alpha"]], "en", None, None, 4, 1]],
+                ],
+            ],
+        ),
+        (
+            "video_non_contiguous_preset_style",
+            build_video_artifact_params(
+                "nb_payload",
+                ["src_alpha"],
+                language="en",
+                instructions="Make it playful",
+                video_format=VideoFormat.BRIEF,
+                video_style=VideoStyle.KAWAII,
+                style_prompt=None,
+            ),
+            [
+                _ARTIFACT_CLIENT_OPTIONS,
+                "nb_payload",
+                [
+                    None,
+                    None,
+                    3,
+                    [[["src_alpha"]]],
+                    None,
+                    None,
+                    None,
+                    None,
+                    [
+                        None,
+                        None,
+                        [[["src_alpha"]], "en", "Make it playful", None, 2, 9],
+                    ],
+                ],
+            ],
+        ),
+        (
             "briefing_report",
             build_report_artifact_params(
                 "nb_payload",
@@ -403,7 +478,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 extra_instructions=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -444,7 +519,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 extra_instructions="Ignored for custom reports.",
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -480,7 +555,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 difficulty=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -509,7 +584,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 difficulty=QuizDifficulty.HARD,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -538,7 +613,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 difficulty=QuizDifficulty.EASY,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -552,7 +627,8 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                     None,
                     [
                         None,
-                        [1, None, "Use short prompts", None, None, None, [1, 2]],
+                        # [quantity, difficulty] — asymmetric on purpose (#2116).
+                        [1, None, "Use short prompts", None, None, None, [2, 1]],
                     ],
                 ],
             ],
@@ -569,7 +645,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 style=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -602,7 +678,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 style=InfographicStyle.EDITORIAL,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -634,7 +710,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 slide_length=None,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -668,7 +744,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 slide_length=SlideDeckLength.SHORT,
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -700,7 +776,7 @@ def _expected_rpc_envelope(method: RPCMethod, params: list[Any]) -> list[Any]:
                 instructions="Extract product comparisons",
             ),
             [
-                [2],
+                _ARTIFACT_CLIENT_OPTIONS,
                 "nb_payload",
                 [
                     None,
@@ -756,6 +832,156 @@ def test_artifact_payload_builders_match_golden_rpc_envelopes(
     assert encode_rpc_request(method, params) == _expected_rpc_envelope(method, expected)
 
 
+def test_quiz_and_flashcards_agree_on_option_order() -> None:
+    """Both builders emit ``[quantity, difficulty]`` — they must not drift apart.
+
+    The two option pairs live at different slots (quiz ``[7]``, flashcards
+    ``[6]``) of otherwise near-identical payloads, which is exactly how the
+    flashcards builder came to be transposed (#2116) while the quiz one stayed
+    correct. Asserting them side by side with an asymmetric fixture makes any
+    future transposition of either builder fail.
+    """
+    kwargs: dict[str, Any] = {
+        "instructions": None,
+        "quantity": QuizQuantity.FEWER,
+        "difficulty": QuizDifficulty.HARD,
+    }
+    quiz = build_quiz_artifact_params("nb_payload", ["src_alpha"], **kwargs)
+    flashcards = build_flashcards_artifact_params("nb_payload", ["src_alpha"], **kwargs)
+
+    expected = [QuizQuantity.FEWER.value, QuizDifficulty.HARD.value]
+    assert expected == [1, 3]
+    assert quiz[2][9][1][7] == expected
+    assert flashcards[2][9][1][6] == expected
+
+
+def test_quiz_quantity_more_is_distinct_on_the_wire() -> None:
+    """``MORE`` emits 3, not the ``STANDARD`` value it used to alias (#2117)."""
+    assert QuizQuantity.MORE.value == 3
+    assert QuizQuantity.MORE is not QuizQuantity.STANDARD
+
+    quiz = build_quiz_artifact_params(
+        "nb_payload",
+        ["src_alpha"],
+        instructions=None,
+        quantity=QuizQuantity.MORE,
+        difficulty=QuizDifficulty.EASY,
+    )
+    flashcards = build_flashcards_artifact_params(
+        "nb_payload",
+        ["src_alpha"],
+        instructions=None,
+        quantity=QuizQuantity.MORE,
+        difficulty=QuizDifficulty.EASY,
+    )
+
+    assert quiz[2][9][1][7] == [3, 1]
+    assert flashcards[2][9][1][6] == [3, 1]
+
+
+def test_omitted_quiz_options_are_sent_as_explicit_client_defaults() -> None:
+    """``None`` means "this client's default", and that default goes on the wire.
+
+    The alternative — omitting the option message so the backend picks — is
+    accepted by the server (live-probed: generation completes normally), but
+    what it then chose is unobservable: the stored options echo back as
+    ``null``. #2196 resolves that trade in favour of a value we can name, echo
+    and assert, matching every sibling builder in ``payloads.py`` and the web
+    UI, which always sends an explicit pair.
+
+    Asserted against the named constants rather than the literals so the
+    documented default and the transmitted default cannot drift apart. (This
+    particular pair cannot detect a transposition — ``STANDARD`` and ``MEDIUM``
+    are both 2 — which is why the ordering is pinned by the asymmetric fixtures
+    above instead.)
+    """
+    quiz = build_quiz_artifact_params(
+        "nb_payload", ["src_alpha"], instructions=None, quantity=None, difficulty=None
+    )
+    flashcards = build_flashcards_artifact_params(
+        "nb_payload", ["src_alpha"], instructions=None, quantity=None, difficulty=None
+    )
+
+    for pair in (quiz[2][9][1][7], flashcards[2][9][1][6]):
+        assert isinstance(pair, list), "the option message must be sent, not omitted"
+        assert pair[0] == DEFAULT_QUIZ_QUANTITY.value
+        assert pair[1] == DEFAULT_QUIZ_DIFFICULTY.value
+
+    assert DEFAULT_QUIZ_QUANTITY is QuizQuantity.STANDARD
+    assert DEFAULT_QUIZ_DIFFICULTY is QuizDifficulty.MEDIUM
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [build_quiz_artifact_params, build_flashcards_artifact_params],
+    ids=["quiz", "flashcards"],
+)
+@pytest.mark.parametrize(
+    ("kwargs", "expected_message"),
+    [
+        ({"quantity": 2}, "quantity must be a QuizQuantity member or None"),
+        ({"difficulty": 2}, "difficulty must be a QuizDifficulty member or None"),
+        ({"quantity": "standard"}, "quantity must be a QuizQuantity member or None"),
+        # The cross-enum case is the interesting one: QuizDifficulty.HARD and
+        # QuizQuantity.MORE are both 3, so this used to encode silently as MORE.
+        ({"quantity": QuizDifficulty.HARD}, "quantity must be a QuizQuantity member or None"),
+        ({"difficulty": QuizQuantity.FEWER}, "difficulty must be a QuizDifficulty member or None"),
+    ],
+    ids=[
+        "int-quantity",
+        "int-difficulty",
+        "str-quantity",
+        "swapped-quantity",
+        "swapped-difficulty",
+    ],
+)
+def test_non_enum_quiz_options_raise_a_typed_error(
+    builder: Any, kwargs: dict[str, Any], expected_message: str
+) -> None:
+    """Bad option input fails as ``ValidationError``, not ``AttributeError``.
+
+    Before #2196 a bare ``int`` reached ``.value`` and produced
+    ``AttributeError: 'int' object has no attribute 'value'`` — an internal
+    error shape leaking through a public keyword argument.
+    """
+    call_kwargs: dict[str, Any] = {"instructions": None, "quantity": None, "difficulty": None}
+    call_kwargs.update(kwargs)
+    with pytest.raises(ValidationError, match=re.escape(expected_message)):
+        builder("nb_payload", ["src_alpha"], **call_kwargs)
+
+
+def test_video_style_values_match_live_web_ui() -> None:
+    """Guard against drift in the Web UI's Video Overview style radio values."""
+    assert {style: style.value for style in VideoStyle} == {
+        VideoStyle.AUTO_SELECT: 1,
+        VideoStyle.CUSTOM: 0,
+        VideoStyle.CLASSIC: 2,
+        VideoStyle.WHITEBOARD: 3,
+        VideoStyle.KAWAII: 9,
+        VideoStyle.ANIME: 7,
+        VideoStyle.WATERCOLOR: 6,
+        VideoStyle.RETRO_PRINT: 8,
+        VideoStyle.HERITAGE: 4,
+        VideoStyle.PAPER_CRAFT: 5,
+    }
+
+
+def test_video_style_prompt_slot_is_custom_only() -> None:
+    """Preset styles must not emit the Web UI's custom visual-style prompt slot."""
+    params = build_video_artifact_params(
+        "nb_payload",
+        ["src_alpha"],
+        language="en",
+        instructions="Make it playful",
+        video_format=VideoFormat.EXPLAINER,
+        video_style=VideoStyle.WHITEBOARD,
+        style_prompt="ignored outside custom style",
+    )
+
+    video_config = params[2][8][2]
+    assert video_config == [[["src_alpha"]], "en", "Make it playful", None, 1, 3]
+
+
 def test_revise_slide_payload_builder_matches_golden_envelope() -> None:
     params = build_revise_slide_params("artifact_payload", 2, "Tighten the summary")
 
@@ -769,17 +995,9 @@ def test_revise_slide_payload_builder_matches_golden_envelope() -> None:
 def test_retry_artifact_payload_builder_matches_golden_envelope() -> None:
     params = build_retry_artifact_params("artifact_payload")
 
-    # The type-agnostic retry_options literal is sent verbatim (issue #1319).
-    assert params == [
-        [
-            2,
-            None,
-            None,
-            [1, None, None, None, None, None, None, None, None, None, [1]],
-            [[1, 4, 8, 2, 3, 6]],
-        ],
-        "artifact_payload",
-    ]
+    # The type-agnostic client-options literal is sent verbatim (issue #1319;
+    # also confirmed for CREATE_ARTIFACT on 2026-06-15).
+    assert params == [_ARTIFACT_CLIENT_OPTIONS, "artifact_payload"]
     encoded = encode_rpc_request(RPCMethod.RETRY_ARTIFACT, params)
     assert encoded == _expected_rpc_envelope(RPCMethod.RETRY_ARTIFACT, params)
     # The encoded envelope must carry the confirmed wire ID.
@@ -800,11 +1018,11 @@ def test_source_upload_rpc_payload_builders_match_golden_envelopes() -> None:
     register_params = build_register_file_source_params("research.pdf", "nb_payload")
     rename_params = build_rename_source_params("src_payload", "Renamed source")
 
+    # Nested template block per the Gemini-3.5 wire migration (#1546).
     assert register_params == [
         [["research.pdf"]],
         "nb_payload",
-        [2],
-        [1, None, None, None, None, None, None, None, None, None, [1]],
+        [2, None, None, [1, None, None, None, None, None, None, None, None, None, [1]]],
     ]
     assert encode_rpc_request(RPCMethod.ADD_SOURCE_FILE, register_params) == _expected_rpc_envelope(
         RPCMethod.ADD_SOURCE_FILE,
@@ -824,7 +1042,6 @@ def test_resumable_upload_start_request_matches_golden_payload() -> None:
         file_size=4096,
         source_id="src_payload",
         content_type="application/pdf",
-        base_url="https://notebooklm.google.com",
         upload_url="https://notebooklm.google.com/_/upload",
         authuser_query="authuser=1",
         authuser_header="1",
@@ -1058,6 +1275,21 @@ def test_response_decoder_returns_expected_payload(method: RPCMethod) -> None:
     )
 
 
+def _mapper_item_repr(item: Any) -> Any:
+    """Project one mapped item into its fixture-comparable shape.
+
+    ``to_public_dict()`` wins when present (research-task models expose it);
+    otherwise a dataclass instance is run through the transport-neutral
+    :func:`to_jsonable` (the same serializer the public ``--json`` / MCP / HTTP
+    envelopes use), and anything else passes through unchanged.
+    """
+    if hasattr(item, "to_public_dict"):
+        return item.to_public_dict()
+    if dataclasses.is_dataclass(item) and not isinstance(item, type):
+        return to_jsonable(item)
+    return item
+
+
 @pytest.mark.parametrize("method", ALL_METHODS, ids=lambda m: m.name)
 def test_mapper_output_shape_when_documented(method: RPCMethod) -> None:
     """Methods that document a downstream mapper must also pin its output.
@@ -1087,17 +1319,77 @@ def test_mapper_output_shape_when_documented(method: RPCMethod) -> None:
     # Mappers commonly return dataclass instances or lists thereof; compare
     # via the fixture-recorded shape (typically the public dict form or a
     # list of public dicts). The fixture decides the representation.
-    if isinstance(mapped, list) and mapped and hasattr(mapped[0], "to_public_dict"):
-        mapped_repr: Any = [item.to_public_dict() for item in mapped]
-    elif hasattr(mapped, "to_public_dict"):
-        mapped_repr = mapped.to_public_dict()
+    #
+    # Resolution order, per item:
+    #   1. ``to_public_dict()`` when present (research-task models expose it);
+    #   2. otherwise the transport-neutral :func:`to_jsonable` projection for a
+    #      dataclass instance — the same serializer the CLI/MCP/HTTP adapters
+    #      use, so the golden shape matches the public ``--json`` envelope;
+    #   3. otherwise the raw return value (primitives / dicts / lists).
+    if isinstance(mapped, list) and mapped:
+        mapped_repr: Any = [_mapper_item_repr(item) for item in mapped]
     else:
-        mapped_repr = mapped
+        mapped_repr = _mapper_item_repr(mapped)
 
     assert mapped_repr == expected, (
         f"Mapper {mapper_ref!r} for {method.name} returned a shape that "
         f"does not match the fixture's mapper_expected.\n"
         f"Got: {mapped_repr!r}\nExpected: {expected!r}"
+    )
+
+
+# Methods whose fixtures are expected to carry a wired ``mapper`` /
+# ``mapper_expected`` pair so the decoder->dataclass seam is golden-pinned (not
+# merely skipped). The guard below fails loudly if any of them loses its mapper
+# wiring, converting the historical silent skip into a zero-cost ratchet.
+#
+# Only methods whose feature path has a CLEAN single-payload mapper are listed.
+# The remaining methods stay honestly skipped because their feature path either:
+#   * returns ``None`` on success (fire-and-forget mutations: CREATE_NOTE,
+#     DELETE_*, RENAME_*, SHARE_*, SET_USER_SETTINGS, REMOVE_RECENTLY_VIEWED,
+#     RETRY_ARTIFACT, REVISE_SLIDE, the *_RESEARCH starters, …);
+#   * extracts inline via ``safe_index`` with no centralised mapper
+#     (GET_SOURCE's field-by-field ``SourceFulltext`` build, GET_SOURCE_GUIDE,
+#     conversation/user-settings/tier reads, GET_INTERACTIVE_HTML, …);
+#   * has no decoded payload to map (UPDATE_SOURCE decodes to ``null``); or
+#   * reconciles the raw decode against client-side state rather than returning
+#     it directly (CREATE_NOTEBOOK feeds the payload to ``Notebook.from_api_response``
+#     but the feature return comes from a baseline-id-diff + ``_probe`` step, so
+#     the raw-decode shape is not the public return the fixture would pin).
+# Wiring those would require contorting the harness or adding production code
+# for tests, so they are deliberately exempt rather than forced.
+_MAPPER_COVERED_METHODS: tuple[RPCMethod, ...] = (
+    RPCMethod.POLL_RESEARCH,
+    RPCMethod.LIST_NOTEBOOKS,
+    RPCMethod.GET_NOTEBOOK,
+    RPCMethod.ADD_SOURCE,
+    RPCMethod.LIST_ARTIFACTS,
+    RPCMethod.LIST_LABELS,
+    RPCMethod.GET_SHARE_STATUS,
+    RPCMethod.GET_SUGGESTED_REPORTS,
+    RPCMethod.SUGGEST_PROMPTS,
+    RPCMethod.SUGGEST_NEXT_STEPS,
+    RPCMethod.GET_CUSTOMIZATION_CHOICES,
+)
+
+
+def test_mapper_covered_methods_have_mappers() -> None:
+    """Methods listed as mapper-covered must keep their wired mapper goldens.
+
+    Mirrors ``test_drift_prone_methods_have_drift_cases``: if a future edit
+    drops the ``mapper`` / ``mapper_expected`` pair from one of these fixtures,
+    the suite fails loudly here rather than silently degrading the
+    ``test_mapper_output_shape_when_documented`` row back into a skip.
+    """
+    missing = []
+    for method in _MAPPER_COVERED_METHODS:
+        fixture = _load_fixture(method)
+        if not fixture.get("mapper") or "mapper_expected" not in fixture:
+            missing.append(method.name)
+    assert not missing, (
+        f"Mapper-covered methods missing a 'mapper' / 'mapper_expected' pair: "
+        f"{missing}. Restore the decoder->dataclass golden for each (see "
+        f"tests/unit/_golden_mappers.py)."
     )
 
 
@@ -1427,9 +1719,7 @@ class TestSourceKindAndStatusGroundTruth:
         row = SourceRow.from_entry([["ID"], "TITLE_AT_1", meta])
         assert row.type_code == type_code
         # The kind enum is derived from the same metadata[4] slot.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            source = Source.from_row(row)
+        source = source_from_row(Source, row)
         assert source.kind is expected_kind
 
     @pytest.mark.parametrize(
@@ -1449,9 +1739,10 @@ class TestSourceKindAndStatusGroundTruth:
         row = SourceRow.from_entry([["ID"], "TITLE_AT_1", None, ["DECOY_AT_3_0", status_code]])
         assert row.status is expected_status
 
-    def test_unknown_status_code_falls_back_to_ready(self) -> None:
-        row = SourceRow.from_entry([["ID"], "TITLE_AT_1", None, [None, 99]])
-        assert row.status is SourceStatus.READY
+    @pytest.mark.parametrize("status_code", [0, 4, 99])
+    def test_unknown_status_code_falls_back_to_unknown(self, status_code: int) -> None:
+        row = SourceRow.from_entry([["ID"], "TITLE_AT_1", None, [None, status_code]])
+        assert row.status is SourceStatus.UNKNOWN
 
 
 # ---------------------------------------------------------------------------
@@ -1475,9 +1766,7 @@ class TestArtifactVariantGroundTruth:
     ) -> None:
         row = _make_artifact_row(type_code=ArtifactTypeCode.QUIZ.value, variant=variant)
         assert ArtifactRow(row).variant == variant
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            artifact = Artifact.from_api_response(row)
+        artifact = decode_artifact(Artifact, row)
         assert artifact.kind is expected_kind
 
 
@@ -1551,14 +1840,14 @@ class TestNoteShapeGroundTruth:
 
     def test_mind_map_current_shape_via_from_mind_map(self) -> None:
         inner = ["MM_ID", '{"nodes": []}', [1, "u", [1700000000, 0]], None, "MM_TITLE_AT_1_4"]
-        artifact = Artifact.from_mind_map(["MM_ID", inner])
+        artifact = decode_mind_map_artifact(Artifact, ["MM_ID", inner])
         assert artifact is not None
         assert artifact.id == "MM_ID"
         assert artifact.title == "MM_TITLE_AT_1_4"
         assert artifact.kind is ArtifactType.MIND_MAP
 
     def test_mind_map_deleted_shape_returns_none(self) -> None:
-        assert Artifact.from_mind_map(["MM_ID", None, 2]) is None
+        assert decode_mind_map_artifact(Artifact, ["MM_ID", None, 2]) is None
 
 
 # ===========================================================================
@@ -1622,9 +1911,9 @@ class TestSourceFieldConfusionHasTeeth:
         [
             # correct pairing
             (9, 1, SourceType.YOUTUBE, SourceStatus.PROCESSING),
-            # swapped: the YOUTUBE code now sits in the status slot and vice
-            # versa, so kind/status must change accordingly.
-            (1, 9, SourceType.GOOGLE_DOCS, SourceStatus.READY),
+            # swapped: the YOUTUBE type code now sits in the status slot and
+            # must fail closed rather than being asserted ready.
+            (1, 9, SourceType.GOOGLE_DOCS, SourceStatus.UNKNOWN),
         ],
     )
     def test_type_status_swap_flips_decoded_enums(
@@ -1636,9 +1925,7 @@ class TestSourceFieldConfusionHasTeeth:
     ) -> None:
         meta = _make_source_metadata(type_code=type_code)
         row = SourceRow.from_entry([["ID"], "T", meta, [None, status_code]])
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            source = Source.from_row(row)
+        source = source_from_row(Source, row)
         assert source.kind is expected_kind
         assert source.status is expected_status
 

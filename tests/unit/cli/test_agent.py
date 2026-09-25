@@ -58,13 +58,12 @@ class TestAgentTemplates:
 
     def test_codex_template_falls_back_to_package_data(self, tmp_path):
         """Test that codex content falls back to packaged data outside repo root."""
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "CODEX.md").write_text("# Repository Guidelines", encoding="utf-8")
+
         with (
             patch.object(agent_templates_module, "REPO_ROOT_AGENTS", tmp_path / "AGENTS.md"),
-            patch.object(
-                agent_templates_module,
-                "_read_package_data",
-                return_value="# Repository Guidelines",
-            ),
+            patch.object(agent_templates_module.resources, "files", return_value=tmp_path),
         ):
             content = agent_templates_module.get_agent_source_content("codex")
 
@@ -76,7 +75,7 @@ class TestAgentTemplates:
         content = agent_templates_module.get_agent_source_content("claude")
 
         assert content is not None
-        assert "NotebookLM Automation" in content
+        assert "Gemini Notebook Automation" in content
 
     def test_codex_reads_repo_root_agents_when_present(self, tmp_path):
         """Codex prefers the repo-root AGENTS.md when running from a checkout."""

@@ -7,7 +7,7 @@ on a per-cookie-name allowlist (:data:`SESSION_COOKIES` + the ``__Secure-*`` /
 ``__Host-*`` umbrellas). The Google **login** cookie ``LSID`` was missing from
 that allowlist, so its value — which embeds a raw ``g.a000-...`` SID token, the
 same credential family as ``SID`` — round-tripped into a committed cassette
-(``tests/cassettes/notebooks_share.yaml``) unscrubbed. That is a live-session
+(``tests/cassettes/web/notebooks_share.yaml``) unscrubbed. That is a live-session
 credential leak in a public repo.
 
 Two complementary hardenings closed the gap and are pinned here:
@@ -16,7 +16,8 @@ Two complementary hardenings closed the gap and are pinned here:
    :data:`SESSION_COOKIES`, so the cookie-header / storage_state scrubbers
    collapse their values to ``SCRUBBED`` like every other session cookie.
 2. **Catch-all token regexes (defense in depth).** ``scrub_string`` now scrubs
-   the raw Google credential shapes ``g.a000-...`` / ``sidts-...`` / ``ya29....``
+   the raw Google credential shapes ``aas_et/...`` / ``g.a000-...`` /
+   ``sidts-...`` / ``ya29....``
    wherever they appear — request/response BODIES, HEADERS, and cookie values
    carried by a name that is NOT on the allowlist. This backstop never depends
    on a cookie name being enumerated, so a future unknown login cookie cannot
@@ -36,10 +37,8 @@ from typing import Any
 
 import pytest
 
-# Load ``tests/cassette_patterns.py`` by file path — the ``tests`` directory is
-# not a package, so a plain ``from tests.cassette_patterns import ...`` is not
-# reliable under pytest's per-module import. This mirrors the loader idiom used
-# by ``tests/unit/test_cookie_redaction.py``.
+# Load ``tests/cassette_patterns.py`` by file path to keep the dependency
+# localized to this test module.
 _patterns_path = Path(__file__).resolve().parent.parent / "cassette_patterns.py"
 _spec = importlib.util.spec_from_file_location("tests_cassette_patterns_scrub", _patterns_path)
 assert _spec is not None and _spec.loader is not None, (
@@ -193,7 +192,7 @@ def test_committed_share_cassette_is_clean() -> None:
     hand-edited) and the ``g.a000`` token sneaks back in. Reads the on-disk
     file the leak originally lived in.
     """
-    cassette = Path(__file__).resolve().parent.parent / "cassettes" / "notebooks_share.yaml"
+    cassette = Path(__file__).resolve().parent.parent / "cassettes" / "web" / "notebooks_share.yaml"
     if not cassette.exists():  # pragma: no cover - cassette is committed
         return
     text = cassette.read_text(encoding="utf-8")
@@ -232,3 +231,32 @@ def test_scrub_response_helper_scrubs_set_cookie_token(
     joined = "".join(set_cookie) if isinstance(set_cookie, list) else set_cookie
     assert "g.a000" not in joined, f"Set-Cookie token leaked:\n{joined}"
     assert "LSID=SCRUBBED" in joined
+
+
+def test_scrub_response_scrubs_lowercase_set_cookie_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``scrub_response`` scrubs a lowercase ``set-cookie`` header (HTTP/2).
+
+    Google serves HTTP/2, whose header names are lowercase, so a fresh recording
+    carries ``set-cookie`` (not the title-case ``Set-Cookie`` older cassettes
+    have). A case-sensitive lookup would leave the live session token unscrubbed
+    — this pins the case-insensitive match.
+    """
+    monkeypatch.delenv("NOTEBOOKLM_VCR_RECORD_ERRORS", raising=False)
+    vcr_config_path = Path(__file__).resolve().parent.parent / "vcr_config.py"
+    spec = importlib.util.spec_from_file_location("tests_vcr_config_scrub_ci", vcr_config_path)
+    assert spec is not None and spec.loader is not None
+    vcr_config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vcr_config)
+
+    response: dict[str, Any] = {
+        "status": {"code": 200, "message": "OK"},
+        "headers": {"set-cookie": [f"SIDCC={_G_A000}; expires=Sun, 27-Jun-2027; path=/; Secure"]},
+        "body": {"string": b"[]"},
+    }
+    out = vcr_config.scrub_response(response)
+    set_cookie = out["headers"]["set-cookie"]
+    joined = "".join(set_cookie) if isinstance(set_cookie, list) else set_cookie
+    assert "g.a000" not in joined, f"lowercase set-cookie token leaked:\n{joined}"
+    assert "SIDCC=SCRUBBED" in joined

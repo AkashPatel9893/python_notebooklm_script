@@ -8,7 +8,7 @@ Notebook lifecycle:
 - Auto-created on first run if NOTEBOOKLM_GENERATION_NOTEBOOK_ID not set
 - Artifacts/notes cleaned BEFORE tests to ensure clean state
 - In CI (CI=true): notebook deleted after tests to avoid orphans
-- Locally: notebook persists for verification, ID stored in NOTEBOOKLM_HOME
+- Locally: notebook persists for verification, ID stored in the active profile cache
 """
 
 import pytest
@@ -26,7 +26,19 @@ from notebooklm import (
     VideoStyle,
 )
 
-from .conftest import assert_generation_started, requires_auth
+from ._generation_helpers import generate_note_mind_map
+from .conftest import (
+    assert_generation_started,
+    read_back_option_pair,
+    requires_auth,
+)
+
+# Live CREATE_ARTIFACT coverage — monitored by the nightly generation coverage
+# floor (tests/e2e/conftest.py, #1819): a fully-throttled run where every marked
+# generation test skipped and none passed reds the nightly instead of hollow-green.
+# INVARIANT: keep this module generation-only — a passing non-generation test here
+# would satisfy the floor and mask a genuinely throttled generation surface.
+pytestmark = pytest.mark.live_generation
 
 
 @requires_auth
@@ -169,11 +181,14 @@ class TestVideoGeneration:
 
 
 @requires_auth
+@pytest.mark.variants
 class TestCinematicVideoGeneration:
     """Cinematic video generation tests.
 
     Cinematic videos use Veo 3 AI for documentary-style footage.
     Requires Google AI Ultra subscription. Generation takes ~30-40 minutes.
+    The whole class is opt-in because each request is materially more expensive
+    than a standard video generation.
     """
 
     @pytest.mark.asyncio
@@ -183,7 +198,6 @@ class TestCinematicVideoGeneration:
         assert_generation_started(result)
 
     @pytest.mark.asyncio
-    @pytest.mark.variants
     async def test_generate_cinematic_video_with_instructions(self, client, generation_notebook_id):
         """Test cinematic video generation with custom instructions."""
         result = await client.artifacts.generate_cinematic_video(
@@ -193,7 +207,6 @@ class TestCinematicVideoGeneration:
         assert_generation_started(result)
 
     @pytest.mark.asyncio
-    @pytest.mark.variants
     async def test_generate_cinematic_video_with_language(self, client, generation_notebook_id):
         """Test cinematic video generation with explicit language."""
         result = await client.artifacts.generate_cinematic_video(
@@ -205,62 +218,117 @@ class TestCinematicVideoGeneration:
 
 @requires_auth
 class TestQuizGeneration:
-    """Quiz generation tests."""
+    """Quiz generation tests.
+
+    Every option pair here is **asymmetric** and read back off the wire (#2195).
+    Both rules are load-bearing:
+
+    * ``assert_generation_started`` alone cannot tell "the fewest, hardest
+      questions" from "the most, easiest" — which is why #2116 shipped a fully
+      transposed flashcards payload through a green e2e tier.
+    * a symmetric pair defeats the read-back too, and ``QuizQuantity.MORE`` and
+      ``QuizDifficulty.HARD`` are BOTH ``3``, so ``more`` + ``hard`` is exactly
+      as blind as ``standard`` + ``medium``.
+    """
 
     @pytest.mark.asyncio
-    async def test_generate_quiz_default(self, client, generation_notebook_id):
-        """Test quiz generation with non-default difficulty to verify param encoding."""
+    async def test_generate_quiz_fewer_hard(self, client, generation_notebook_id):
+        """Quiz options survive the round trip: what we send is what is stored."""
         result = await client.artifacts.generate_quiz(
             generation_notebook_id,
+            quantity=QuizQuantity.FEWER,
             difficulty=QuizDifficulty.HARD,
         )
         assert_generation_started(result)
+        options = await read_back_option_pair(
+            client, generation_notebook_id, result.task_id, family="quiz"
+        )
+        assert options.quantity == QuizQuantity.FEWER
+        assert options.difficulty == QuizDifficulty.HARD
 
     @pytest.mark.asyncio
     @pytest.mark.variants
     async def test_generate_quiz_with_options(self, client, generation_notebook_id):
+        """``MORE`` is a distinct wire value (3), not the alias #2117 claimed.
+
+        Paired with ``EASY`` rather than ``HARD``: ``MORE`` and ``HARD`` are
+        both 3, so that pairing could not detect a transposition.
+        """
         result = await client.artifacts.generate_quiz(
             generation_notebook_id,
             quantity=QuizQuantity.MORE,
-            difficulty=QuizDifficulty.HARD,
+            difficulty=QuizDifficulty.EASY,
             instructions="Focus on key concepts and definitions",
         )
         assert_generation_started(result)
+        options = await read_back_option_pair(
+            client, generation_notebook_id, result.task_id, family="quiz"
+        )
+        assert options.quantity == QuizQuantity.MORE
+        assert options.difficulty == QuizDifficulty.EASY
 
     @pytest.mark.asyncio
     @pytest.mark.variants
-    async def test_generate_quiz_fewer_easy(self, client, generation_notebook_id):
+    async def test_generate_quiz_fewer_medium(self, client, generation_notebook_id):
+        """A third pair, again asymmetric — ``FEWER`` + ``EASY`` are both 1."""
         result = await client.artifacts.generate_quiz(
             generation_notebook_id,
             quantity=QuizQuantity.FEWER,
-            difficulty=QuizDifficulty.EASY,
+            difficulty=QuizDifficulty.MEDIUM,
         )
         assert_generation_started(result)
+        options = await read_back_option_pair(
+            client, generation_notebook_id, result.task_id, family="quiz"
+        )
+        assert options.quantity == QuizQuantity.FEWER
+        assert options.difficulty == QuizDifficulty.MEDIUM
 
 
 @requires_auth
 class TestFlashcardsGeneration:
-    """Flashcards generation tests."""
+    """Flashcards generation tests.
+
+    Same asymmetry + read-back rules as :class:`TestQuizGeneration`, and they
+    matter most here: flashcards is the family that shipped transposed (#2116),
+    and its options live in a *different* slot from the quiz ones
+    (``data[9][1][6]`` vs ``[7]``), so a quiz-only check would not cover it.
+    """
 
     @pytest.mark.asyncio
     async def test_generate_flashcards_default(self, client, generation_notebook_id):
-        """Test flashcards generation with non-default quantity to verify param encoding."""
+        """An omitted ``difficulty`` reaches the wire as the documented default.
+
+        ``quantity=MORE(3)`` with ``difficulty`` left unset stores ``[3, 2]``:
+        asymmetric, and it pins the ``None`` → ``MEDIUM`` coercion the builders
+        apply (#2196) as an observable fact rather than a claim in a docstring.
+        """
         result = await client.artifacts.generate_flashcards(
             generation_notebook_id,
             quantity=QuizQuantity.MORE,
         )
         assert_generation_started(result)
+        options = await read_back_option_pair(
+            client, generation_notebook_id, result.task_id, family="flashcards"
+        )
+        assert options.quantity == QuizQuantity.MORE
+        assert options.difficulty == QuizDifficulty.MEDIUM
 
     @pytest.mark.asyncio
     @pytest.mark.variants
     async def test_generate_flashcards_with_options(self, client, generation_notebook_id):
+        """``STANDARD`` + ``HARD`` — asymmetric, unlike the ``MEDIUM`` it replaced."""
         result = await client.artifacts.generate_flashcards(
             generation_notebook_id,
             quantity=QuizQuantity.STANDARD,
-            difficulty=QuizDifficulty.MEDIUM,
+            difficulty=QuizDifficulty.HARD,
             instructions="Create cards for vocabulary terms",
         )
         assert_generation_started(result)
+        options = await read_back_option_pair(
+            client, generation_notebook_id, result.task_id, family="flashcards"
+        )
+        assert options.quantity == QuizQuantity.STANDARD
+        assert options.difficulty == QuizDifficulty.HARD
 
 
 @requires_auth
@@ -371,21 +439,43 @@ class TestMindMapGeneration:
     """Mind map generation tests."""
 
     @pytest.mark.asyncio
-    async def test_generate_mind_map(self, client, generation_notebook_id):
+    async def test_generate_mind_map(self, client, generation_notebook_id, generation_journal):
         """Mind map generation is fast (~5-10s), not slow."""
         # Clean up old mind maps to prevent accumulation from nightly runs
         existing_mind_maps = await client.notes.list_mind_maps(generation_notebook_id)
         for mm in existing_mind_maps:
+            recovery = generation_journal.recovery_operation(
+                resource_id=mm[0],
+                notebook_id=generation_notebook_id,
+                family="mind_map",
+                surface="client",
+                id_kind="note_mind_map",
+                reason="retry_preclean",
+            )
             await client.notes.delete_mind_map(generation_notebook_id, mm[0])
+            remaining = {
+                row[0] for row in await client.notes.list_mind_maps(generation_notebook_id)
+            }
+            assert mm[0] not in remaining
+            recovery.delete_confirmed(mm[0], reason="retry_preclean")
 
-        result = await client.artifacts.generate_mind_map(generation_notebook_id)
+        operation = generation_journal.operation(
+            notebook_id=generation_notebook_id,
+            family="mind_map",
+            surface="client",
+            id_kind="note_mind_map",
+            lifecycle="settle",
+        )
+        result = await generate_note_mind_map(client, generation_notebook_id, operation)
         assert result is not None
         assert result.note_id is not None
+        operation.persisted(result.note_id)
         # Verify mind map structure
         mind_map = result.mind_map
         assert isinstance(mind_map, dict)
         assert "name" in mind_map
         assert "children" in mind_map
+        operation.completed(result.note_id)
 
 
 @requires_auth

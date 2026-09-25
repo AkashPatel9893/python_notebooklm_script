@@ -7,7 +7,7 @@ download path uses).
 
 The classifier behaviour, CRUD wire payloads, and the audit §28
 cancel-shielded ``create_note`` are all exercised here; Phase 6
-(refactor-history.md Step 9, ADR-0013) retired the legacy
+(docs/refactor-history.md Step 9, ADR-0013) retired the legacy
 ``test_mind_map_service.py`` tests because the underlying
 ``MindMapService`` class is gone.
 """
@@ -16,15 +16,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
 
-from _fixtures.fake_core import FakeSession, make_fake_core
-from notebooklm._note_service import NoteRowKind, NoteService
+from notebooklm._client_metrics import ClientMetrics
+from notebooklm._runtime.call_supervisor import CallSupervisor
+from notebooklm._web.notes import NoteRowKind, NoteService
 from notebooklm.exceptions import DecodingError, RPCError
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import Note
+from tests._fixtures.fake_core import FakeSession, make_fake_core
 
 
 @pytest.fixture
@@ -37,7 +40,7 @@ def mock_session() -> FakeSession:
 
 @pytest.fixture
 def service(mock_session: FakeSession) -> NoteService:
-    return NoteService(mock_session)
+    return NoteService(mock_session, supervisor=mock_session)
 
 
 class TestFetchNoteRows:
@@ -142,7 +145,7 @@ class TestClassifyRow:
     def test_saved_chat_with_unrecognized_metadata_falls_back_to_note(
         self, service: NoteService
     ) -> None:
-        """Per refactor-history.md §Risks: when saved-chat metadata is not
+        """Per docs/refactor-history.md §Risks: when saved-chat metadata is not
         positively detectable, the classifier must default to NOTE so
         the row never silently drops out of ``NotesAPI.list()``.
         """
@@ -202,6 +205,7 @@ class TestCrud:
                 ["nb_123", "note_123", [[['{"children":[]}', "Mind Map", [], 0]]]],
                 source_path="/notebook/nb_123",
                 allow_null=True,
+                raise_on_null_status=True,
             ),
         ]
 
@@ -247,6 +251,7 @@ class TestCrud:
             ["nb_123", "note_123", [[["Body", "Title", [], 0]]]],
             source_path="/notebook/nb_123",
             allow_null=True,
+            raise_on_null_status=True,
         )
 
     @pytest.mark.asyncio
@@ -267,11 +272,98 @@ class TestCrud:
 class TestCreateNoteCancellation:
     """Audit item §28: cancel mid-UPDATE_NOTE must not leave an orphan row.
 
-    Moved to ``NoteService`` in Phase 6 (refactor-history.md Step 9, ADR-0013).
+    Moved to ``NoteService`` in Phase 6 (docs/refactor-history.md Step 9, ADR-0013).
     The legacy ``_mind_map.MindMapService.create_note`` path that
     previously owned the shield + best-effort cleanup contract was
     retired in the same phase; the contract itself lives here now.
     """
+
+    @pytest.mark.asyncio
+    async def test_finalize_child_is_root_accounted_until_settled(self) -> None:
+        supervisor = CallSupervisor(
+            metrics=ClientMetrics(),
+            max_concurrent_rpcs=None,
+        )
+        loop = asyncio.get_running_loop()
+        supervisor.set_bound_loop(loop)
+        supervisor.reset_after_open()
+        supervisor.prepare_generation(1)
+        supervisor.start_accepting(1)
+        update_started = asyncio.Event()
+        update_can_finish = asyncio.Event()
+
+        async def rpc_call(method: RPCMethod, *_args: object, **_kwargs: object) -> object:
+            if method is RPCMethod.CREATE_NOTE:
+                return [["note-root-accounted"]]
+            if method is RPCMethod.UPDATE_NOTE:
+                update_started.set()
+                await update_can_finish.wait()
+                return None
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        rpc = SimpleNamespace(rpc_call=rpc_call)
+        service = NoteService(rpc, supervisor=supervisor)
+        task = asyncio.create_task(service.create_note("nb-root", "Title", "Body"))
+        await asyncio.wait_for(update_started.wait(), timeout=1)
+
+        generation = supervisor._current
+        assert generation is not None
+        assert generation.in_flight == 2  # parent workflow + admitted finalize child
+        assert service._task_registry.active_tasks()
+        assert "notes.background" in supervisor._drain_hooks
+
+        update_can_finish.set()
+        note = await asyncio.wait_for(task, timeout=1)
+        assert note.id == "note-root-accounted"
+        await supervisor.wait_for_idle(1, timeout=1)
+        assert generation.in_flight == 0
+        assert service._task_registry.active_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_root_drain_leaves_registered_finalize_work_running(self) -> None:
+        supervisor = CallSupervisor(
+            metrics=ClientMetrics(),
+            max_concurrent_rpcs=None,
+        )
+        loop = asyncio.get_running_loop()
+        supervisor.set_bound_loop(loop)
+        supervisor.reset_after_open()
+        supervisor.prepare_generation(1)
+        supervisor.start_accepting(1)
+        update_started = asyncio.Event()
+        update_can_finish = asyncio.Event()
+        seen_methods: list[RPCMethod] = []
+
+        async def rpc_call(method: RPCMethod, *_args: object, **_kwargs: object) -> object:
+            seen_methods.append(method)
+            if method is RPCMethod.CREATE_NOTE:
+                return [["note-drained"]]
+            if method is RPCMethod.UPDATE_NOTE:
+                update_started.set()
+                await update_can_finish.wait()
+                return None
+            if method is RPCMethod.DELETE_NOTE:
+                return None
+            raise AssertionError(f"unexpected RPC: {method}")
+
+        service = NoteService(SimpleNamespace(rpc_call=rpc_call), supervisor=supervisor)
+        task = asyncio.create_task(service.create_note("nb-drain", "Title", "Body"))
+        await asyncio.wait_for(update_started.wait(), timeout=1)
+
+        await supervisor.stop_accepting(1)
+        await asyncio.wait_for(supervisor.run_drain_hooks(), timeout=1)
+        assert not task.done()
+        assert RPCMethod.DELETE_NOTE not in seen_methods
+
+        update_can_finish.set()
+        note = await asyncio.wait_for(task, timeout=1)
+        assert note.id == "note-drained"
+        await supervisor.wait_for_idle(1, timeout=1)
+
+        generation = supervisor._current
+        assert generation is not None
+        assert generation.in_flight == 0
+        assert service._task_registry.active_tasks() == []
 
     @pytest.mark.asyncio
     async def test_cancellation_schedules_best_effort_cleanup(
@@ -279,7 +371,7 @@ class TestCreateNoteCancellation:
         mock_session: FakeSession,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        service = NoteService(mock_session)
+        service = NoteService(mock_session, supervisor=mock_session)
         mock_session.rpc_executor.rpc_call.return_value = [["note_123"]]
         update_started = asyncio.Event()
         update_can_finish = asyncio.Event()
@@ -359,7 +451,7 @@ class TestCreateNoteCancellation:
         Without it, an update-side error would leave the orphan row
         the shield was supposed to protect against.
         """
-        service = NoteService(mock_session)
+        service = NoteService(mock_session, supervisor=mock_session)
         mock_session.rpc_executor.rpc_call.return_value = [["note_456"]]
         update_started = asyncio.Event()
         update_can_finish = asyncio.Event()

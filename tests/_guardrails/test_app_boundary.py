@@ -9,18 +9,20 @@ sideways/downward into a runtime-internal layer. This guardrail walks every
 
 * a forbidden *external* transport package — ``click`` / ``rich`` / ``fastmcp``
   (and any ``*.<submodule>``), or
-* a forbidden ``notebooklm`` *sibling* sub-target, via absolute
+* a forbidden ``notebooklm`` *adapter/runtime sibling* sub-target, via absolute
   (``import notebooklm.X...`` / ``from notebooklm.X... import``) or relative
   (``from ..X import`` / ``from ..X.y import`` / ``from .. import X``) forms,
   where ``X`` is:
 
   - ``cli`` — the transport adapter (``notebooklm.cli.*``),
+  - ``mcp`` — the FastMCP transport adapter (``notebooklm.mcp.*``),
+  - ``server`` — the FastAPI transport adapter (``notebooklm.server.*``),
   - ``rpc`` — the batchexecute runtime layer (``notebooklm.rpc.*``); ``_app``
     must consume RPC enums through their public ``notebooklm.types`` re-export,
     not by reaching into ``rpc.types`` directly, or
-  - any *private* sibling whose name starts with ``_`` (``notebooklm._kernel``,
-    ``notebooklm._runtime``, ``notebooklm._middleware``,
-    ``notebooklm._rpc_executor``, ``notebooklm._auth``, …) — the client
+  - any *private* sibling whose name starts with ``_`` (``notebooklm._web.transport.kernel``,
+    ``notebooklm._runtime``, ``notebooklm._web.transport.middleware``,
+    ``notebooklm._web.transport.executor``, ``notebooklm._auth``, …) — the client
     runtime internals. ``_app`` may only depend on the public facade.
 
 ``_app``'s *own* package is ``notebooklm._app``; intra-``_app`` imports are
@@ -45,14 +47,17 @@ import pytest
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[2] / "src" / "notebooklm" / "_app"
 
-# Forbidden top-level *external* package roots.
-FORBIDDEN_EXTERNAL_ROOTS = {"click", "rich", "fastmcp"}
+# Forbidden top-level *external* package roots. ``fastapi`` / ``uvicorn`` /
+# ``starlette`` are the REST adapter's framework — ``_app`` must never import
+# them (same posture as ``fastmcp`` for the MCP adapter).
+FORBIDDEN_EXTERNAL_ROOTS = {"click", "rich", "fastmcp", "fastapi", "uvicorn", "starlette"}
 
-# Forbidden non-private ``notebooklm`` siblings. ``cli`` is the transport
-# adapter; ``rpc`` is the batchexecute runtime layer (consume its enums via the
-# public ``notebooklm.types`` re-export instead). Private ``_*`` siblings are
-# caught separately by :func:`_is_forbidden_notebooklm_child`.
-FORBIDDEN_NOTEBOOKLM_CHILDREN = {"cli", "rpc"}
+# Forbidden non-private ``notebooklm`` siblings. ``cli`` / ``mcp`` / ``server``
+# are transport adapters; ``rpc`` is the batchexecute runtime layer (consume its
+# enums via the public ``notebooklm.types`` re-export instead). Private ``_*``
+# siblings are caught separately by
+# :func:`_is_forbidden_notebooklm_child`.
+FORBIDDEN_NOTEBOOKLM_CHILDREN = {"cli", "mcp", "server", "rpc"}
 
 
 def _is_forbidden_external(parts: list[str]) -> bool:
@@ -64,7 +69,8 @@ def _is_forbidden_notebooklm_child(child: str) -> bool:
     """True if ``child`` is a forbidden ``notebooklm`` sibling for ``_app``.
 
     Forbidden siblings are the explicit transport/runtime layers
-    (``cli`` / ``rpc``) plus every private ``_*`` runtime-internal module or
+    (``cli`` / ``mcp`` / ``server`` / ``rpc``) plus every private ``_*``
+    runtime-internal module or
     package (``_kernel``, ``_runtime``, ``_middleware``, ``_rpc_executor``,
     ``_auth``, …). ``_app`` is allowed to import only the *public* surface
     (``exceptions`` / ``types`` / ``client`` / ``urls`` / ``auth`` /
@@ -160,7 +166,8 @@ def test_app_has_no_transport_dependency_imports() -> None:
     assert not offenders, (
         "notebooklm._app must depend only on the public notebooklm surface "
         "(+ intra-_app): no imports of click, rich, fastmcp, notebooklm.cli.*, "
-        "notebooklm.rpc.*, or any private notebooklm._* runtime sibling (even "
+        "notebooklm.mcp.*, notebooklm.server.*, notebooklm.rpc.*, or any private "
+        "notebooklm._* runtime sibling (even "
         "under TYPE_CHECKING). Consume RPC enums via their notebooklm.types "
         "re-export; move transport-specific code into the adapter (cli/ or mcp/).\n"
         f"Offenders: {offenders}"
@@ -181,6 +188,17 @@ def test_app_has_no_transport_dependency_imports() -> None:
         "from rich.console import Console\n",
         "import fastmcp\n",
         "from fastmcp import FastMCP\n",
+        "import fastapi\n",
+        "from fastapi import FastAPI\n",
+        "import uvicorn\n",
+        "import starlette.responses\n",
+        "from starlette.responses import JSONResponse\n",
+        "import notebooklm.server\n",
+        "from notebooklm.server import create_app\n",
+        "from notebooklm import server\n",
+        "import notebooklm.mcp\n",
+        "from notebooklm.mcp.tools import x\n",
+        "from notebooklm import mcp\n",
         "import notebooklm.cli\n",
         "import notebooklm.cli.error_handler\n",
         "from notebooklm.cli import error_handler\n",
@@ -193,12 +211,12 @@ def test_app_has_no_transport_dependency_imports() -> None:
         "from notebooklm.rpc.types import ChatGoal\n",
         "from notebooklm import rpc\n",
         # private runtime-internal siblings.
-        "import notebooklm._kernel\n",
-        "from notebooklm._kernel import Kernel\n",
+        "import notebooklm._web.transport.kernel\n",
+        "from notebooklm._web.transport.kernel import Kernel\n",
         "from notebooklm._runtime.config import Config\n",
-        "from notebooklm._rpc_executor import execute\n",
-        "from notebooklm._middleware import retry\n",
-        "from notebooklm import _kernel\n",
+        "from notebooklm._web.transport.executor import execute\n",
+        "from notebooklm._web.transport.middleware import retry\n",
+        "from notebooklm._web import transport\n",
         "if False:\n    import click\n",  # block-nested still flagged
         "if False:\n    from notebooklm.rpc.types import ChatGoal\n",
     ],
@@ -213,6 +231,8 @@ def test_matcher_flags_forbidden_absolute_imports(source: str) -> None:
         ("from ..cli import error_handler\n", ("serialize.py",)),
         ("from ..cli.resolve import validate_id\n", ("serialize.py",)),
         ("from .. import cli\n", ("serialize.py",)),
+        ("from ..mcp import x\n", ("serialize.py",)),
+        ("from .. import mcp\n", ("serialize.py",)),
         # rpc runtime layer (the historical evadable seam, issue #1493).
         ("from ..rpc import RPCMethod\n", ("serialize.py",)),
         ("from ..rpc.types import ChatGoal, ChatResponseLength\n", ("serialize.py",)),

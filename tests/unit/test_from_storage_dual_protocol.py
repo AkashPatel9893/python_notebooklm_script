@@ -50,7 +50,7 @@ def _stub_homepage(httpx_mock: HTTPXMock) -> None:
     """Stub the notebooklm homepage GET used to seed the CSRF/session tokens."""
     html = '"SNlM0e":"dual_csrf" "FdrFJe":"dual_session"'
     httpx_mock.add_response(
-        url="https://notebooklm.google.com/",
+        url="https://notebook.google.com/",
         content=html.encode(),
     )
 
@@ -92,6 +92,24 @@ class TestCanonicalAsyncWith:
             f"Canonical `async with from_storage(...)` must not emit "
             f"DeprecationWarning; got: {[str(w.message) for w in deprecations]}"
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.filterwarnings(
+        "ignore:Non-default legacy NotebookLMClient.from_storage "
+        "tuning arguments are deprecated:DeprecationWarning"
+    )
+    async def test_async_with_forwards_chat_response_cap_override(
+        self, tmp_path: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        """Lazy from-storage build forwards chat response byte cap kwargs."""
+        storage_file = _write_storage_state(tmp_path)
+        _stub_homepage(httpx_mock)
+
+        async with NotebookLMClient.from_storage(
+            path=str(storage_file),
+            chat_response_max_bytes=123456,
+        ) as client:
+            assert client.chat._chat_response_max_bytes == 123456
 
 
 class TestLegacyAwaitForm:
@@ -166,8 +184,40 @@ class TestWrapperShape:
             path=str(tmp_path / "nonexistent.json"),
         )
         assert isinstance(wrapper, _FromStorageContext)
+        # ``allow_headless`` is keyword-only, so filling every positional slot
+        # and then passing one more value must raise. The literal argument list
+        # therefore tracks the positional arity of ``from_storage``: adding a
+        # positional-or-keyword parameter means adding one value here too
+        # (``import_research_timeout`` was the most recent, #2205).
+        with pytest.raises(TypeError):
+            NotebookLMClient.from_storage(
+                str(tmp_path / "nonexistent.json"),
+                30.0,
+                None,
+                None,
+                60.0,
+                3,
+                3,
+                None,
+                4,
+                16,
+                None,
+                None,
+                None,
+                None,
+                None,
+                True,  # type: ignore[misc]
+            )
         # No coroutine, so nothing to await — and importantly, the missing
         # storage file has NOT been read yet (no FileNotFoundError).
+
+    def test_allow_headless_is_a_lazy_keyword_only_factory_option(self, tmp_path: Path) -> None:
+        """Cold browser permission can be selected without triggering I/O."""
+        wrapper = NotebookLMClient.from_storage(
+            path=str(tmp_path / "nonexistent.json"),
+            allow_headless=True,
+        )
+        assert isinstance(wrapper, _FromStorageContext)
 
     @pytest.mark.asyncio
     async def test_yielded_value_is_notebooklmclient(

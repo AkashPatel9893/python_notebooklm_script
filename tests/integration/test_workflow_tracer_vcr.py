@@ -65,17 +65,17 @@ from pathlib import Path
 
 import pytest
 import yaml
-from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
-from tests.vcr_config import _is_vcr_record_mode, notebooklm_vcr
 
 from notebooklm import NotebookLMClient
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import ReportFormat
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import _is_vcr_record_mode, notebooklm_vcr
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
 
 CASSETTE_NAME = "workflow_tracer_bullet.yaml"
-CASSETTE_PATH = Path(__file__).parent.parent / "cassettes" / CASSETTE_NAME
+CASSETTE_PATH = Path(__file__).parent.parent / "cassettes" / "web" / CASSETTE_NAME
 
 # Wikipedia is stable, fast to process, and produces a short-but-non-trivial
 # source. Picked because the page is text-only (no PDFs/embeds) and the title
@@ -110,7 +110,13 @@ class TestWorkflowTracerBullet:
         # here keeps the per-cassette ``match_on`` self-contained.
         match_on=["method", "scheme", "host", "port", "path", "rpcids", "freq"],
     )
-    async def test_full_workflow(self, tmp_path: Path, fast_sleep: None) -> None:
+    async def test_full_workflow(
+        self,
+        tmp_path: Path,
+        fast_sleep: None,
+        legacy_vcr_follow_up_probe,
+        legacy_vcr_add_url_baseline,
+    ) -> None:
         """End-to-end user journey produces a downloadable report.
 
         Asserts each phase's intermediate output:
@@ -131,9 +137,8 @@ class TestWorkflowTracerBullet:
         "did not raise" since deletion semantics are exercised by other
         cassettes (``test_vcr_comprehensive``).
         """
-        # Use a UUID-suffixed title so a hypothetical retry in record mode
-        # cannot collide with a pre-existing notebook with the same title
-        # (the ``idempotent_create`` probe would otherwise be ambiguous).
+        # Use a UUID-suffixed title so repeated record-mode runs remain easy to
+        # identify and clean up if a response is lost after the create lands.
         # During replay, the cassette drives the response regardless of the
         # title we pass, so the UUID is purely a record-mode safety hatch.
         title = f"T8.E3 tracer-bullet {uuid.uuid4().hex[:8]}"

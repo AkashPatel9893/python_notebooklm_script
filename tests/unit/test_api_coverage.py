@@ -4,20 +4,20 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from _fixtures.fake_core import make_fake_core
-from notebooklm._artifacts import ArtifactsAPI
-from notebooklm._chat import ChatAPI
-from notebooklm._mind_map import NoteBackedMindMapService
-from notebooklm._note_service import NoteService
-from notebooklm._notebooks import NotebooksAPI
 from notebooklm._runtime.contracts import LoopGuard
-from notebooklm._sources import SourcesAPI
+from notebooklm._web.artifacts import WebArtifactsAPI
+from notebooklm._web.chat import WebChatAPI
+from notebooklm._web.mind_maps import NoteBackedMindMapService
+from notebooklm._web.notebooks import WebNotebooksAPI
+from notebooklm._web.notes import NoteService
+from notebooklm._web.sources import WebSourcesAPI
 from notebooklm.rpc.types import (
     ChatGoal,
     ChatResponseLength,
     DriveMimeType,
     RPCMethod,
 )
+from tests._fixtures.fake_core import make_fake_core
 
 
 class TestNewEnums:
@@ -48,7 +48,7 @@ class TestNewEnums:
 
 
 class TestConfigureChat:
-    """Tests for configure_chat method."""
+    """Tests for ChatAPI.configure."""
 
     @pytest.fixture
     def rpc_call(self):
@@ -66,16 +66,18 @@ class TestConfigureChat:
         constructor collaborators are inert ``MagicMock`` stand-ins.
         """
         core = make_fake_core(rpc_call=rpc_call)
-        return ChatAPI(
+        return WebChatAPI(
             rpc=core.rpc_executor,
+            supervisor=core,
             transport=MagicMock(),
             reqid=MagicMock(),
             loop_guard=MagicMock(spec=LoopGuard),
+            notebooks=MagicMock(),
         )
 
     @pytest.mark.asyncio
     async def test_configure_chat_default(self, chat, rpc_call):
-        """Test configure_chat with default settings."""
+        """Test configure with default settings."""
         await chat.configure("notebook_123")
 
         rpc_call.assert_called_once()
@@ -88,7 +90,7 @@ class TestConfigureChat:
 
     @pytest.mark.asyncio
     async def test_configure_chat_custom_prompt(self, chat, rpc_call):
-        """Test configure_chat with custom prompt."""
+        """Test configure with custom prompt."""
         await chat.configure(
             "notebook_123",
             goal=ChatGoal.CUSTOM,
@@ -103,7 +105,7 @@ class TestConfigureChat:
 
     @pytest.mark.asyncio
     async def test_configure_chat_custom_requires_prompt(self, chat):
-        """Test configure_chat raises error when CUSTOM goal without prompt."""
+        """Test configure raises when CUSTOM goal has no prompt."""
         from notebooklm.exceptions import ValidationError
 
         with pytest.raises(ValidationError, match="custom_prompt is required"):
@@ -114,7 +116,7 @@ class TestConfigureChat:
 
     @pytest.mark.asyncio
     async def test_configure_chat_learning_guide(self, chat, rpc_call):
-        """Test configure_chat with learning guide mode."""
+        """Test configure with learning-guide mode."""
         await chat.configure(
             "notebook_123",
             goal=ChatGoal.LEARNING_GUIDE,
@@ -128,7 +130,7 @@ class TestConfigureChat:
 
 
 class TestGetSourceGuide:
-    """Tests for get_source_guide method."""
+    """Tests for SourcesAPI.get_guide."""
 
     def _make_sources(self, return_value):
         """Build a ``SourcesAPI`` with the RPC seam injected at construction.
@@ -140,12 +142,12 @@ class TestGetSourceGuide:
         """
         rpc_call = AsyncMock(return_value=return_value)
         core = make_fake_core(rpc_call=rpc_call)
-        sources = SourcesAPI(core.rpc_executor, uploader=MagicMock())
+        sources = WebSourcesAPI(core.rpc_executor, supervisor=core, uploader=MagicMock())
         return sources, rpc_call
 
     @pytest.mark.asyncio
     async def test_get_source_guide_parses_response(self):
-        """Test get_source_guide correctly parses API response."""
+        """Test get_guide correctly parses API response."""
         # Real API returns 3 levels of nesting: [[[null, [summary], [[keywords]], []]]]
         mock_response = [
             [
@@ -167,7 +169,7 @@ class TestGetSourceGuide:
 
     @pytest.mark.asyncio
     async def test_get_source_guide_handles_empty(self):
-        """Test get_source_guide handles empty response."""
+        """Test get_guide handles an empty response."""
         sources, rpc_call = self._make_sources(None)
 
         result = await sources.get_guide("notebook_123", "source_456")
@@ -178,11 +180,11 @@ class TestGetSourceGuide:
 
 
 class TestGetSuggestedReportFormats:
-    """Tests for get_suggested_report_formats method."""
+    """Tests for ArtifactsAPI.suggest_reports."""
 
     @pytest.mark.asyncio
     async def test_get_suggested_report_formats_parses_response(self):
-        """Test get_suggested_report_formats correctly parses API response."""
+        """Test suggest_reports correctly parses API response."""
         # Response format: [[[title, description, null, null, prompt, audience_level], ...]]
         mock_response = [
             [
@@ -192,10 +194,9 @@ class TestGetSuggestedReportFormats:
         ]
         rpc_call = AsyncMock(return_value=mock_response)
         core = make_fake_core(rpc_call=rpc_call)
-        artifacts = ArtifactsAPI(
+        artifacts = WebArtifactsAPI(
             rpc=core.rpc_executor,
-            drain=core,
-            lifecycle=core,
+            supervisor=core,
             notebooks=MagicMock(),
             mind_maps=MagicMock(spec=NoteBackedMindMapService),
             note_service=MagicMock(spec=NoteService),
@@ -211,14 +212,22 @@ class TestGetSuggestedReportFormats:
 
 
 class TestAddSourceDrive:
-    """Tests for add_source_drive method."""
+    """Tests for SourcesAPI.add_drive."""
 
     @pytest.mark.asyncio
     async def test_add_source_drive_payload_structure(self):
-        """Test add_source_drive creates correct payload."""
-        rpc_call = AsyncMock(return_value=[["source_id_123"]])
+        """Test add_drive creates the expected payload."""
+        # Echo the requested title so the #1960 honor-title path is a no-op (the
+        # add already returned "My Document") and only the ADD_SOURCE call fires.
+        # First response is the pre-create baseline GET_NOTEBOOK (an empty
+        # notebook), second is the ADD_SOURCE echo.
+        rpc_call = AsyncMock(
+            side_effect=[
+                [[[["source_id_123"], "My Document", [None, 0], [None, 2]]]],
+            ]
+        )
         core = make_fake_core(rpc_call=rpc_call)
-        sources = SourcesAPI(core.rpc_executor, uploader=MagicMock())
+        sources = WebSourcesAPI(core.rpc_executor, supervisor=core, uploader=MagicMock())
 
         await sources.add_drive(
             "notebook_123",
@@ -227,9 +236,12 @@ class TestAddSourceDrive:
             mime_type=DriveMimeType.GOOGLE_DOC.value,
         )
 
-        rpc_call.assert_called_once()
-        call_args = rpc_call.call_args
-        params = call_args[0][1]
+        # Two calls: add_drive first snapshots the notebook's source ids so its
+        # idempotency probe can tell a fresh add from a pre-existing copy of the
+        # same Drive file (#2113), then issues the ADD_SOURCE.
+        methods = [call.args[0] for call in rpc_call.call_args_list]
+        assert methods == [RPCMethod.ADD_SOURCE]
+        params = rpc_call.call_args_list[-1].args[1]
 
         # Verify source data structure - params[0] is [source_data] (single wrap)
         source_data = params[0][0]
@@ -243,11 +255,11 @@ class TestAddSourceDrive:
 
 
 class TestGetNotebookDescription:
-    """Tests for get_notebook_description method."""
+    """Tests for NotebooksAPI.get_description."""
 
     @pytest.mark.asyncio
     async def test_get_notebook_description_parses_response(self):
-        """Test get_notebook_description parses full response."""
+        """Test get_description parses the full response."""
         mock_response = [
             [
                 ["This notebook explores **AI** and **machine learning**."],
@@ -261,7 +273,11 @@ class TestGetNotebookDescription:
         ]
         rpc_call = AsyncMock(return_value=mock_response)
         core = make_fake_core(rpc_call=rpc_call)
-        notebooks = NotebooksAPI(core.rpc_executor, sources_api=MagicMock())
+        notebooks = WebNotebooksAPI(
+            core.rpc_executor,
+            supervisor=core,
+            sources_api=MagicMock(),
+        )
 
         result = await notebooks.get_description("notebook_123")
 
@@ -284,7 +300,7 @@ class TestPayloadFixes:
         """
         rpc_call = AsyncMock(return_value=True)
         core = make_fake_core(rpc_call=rpc_call)
-        sources = SourcesAPI(core.rpc_executor, uploader=MagicMock())
+        sources = WebSourcesAPI(core.rpc_executor, supervisor=core, uploader=MagicMock())
         return sources, rpc_call
 
     @pytest.mark.asyncio

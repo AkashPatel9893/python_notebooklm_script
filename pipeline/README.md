@@ -11,6 +11,11 @@ any time; finished work is skipped, failures are retried.
 # from the repo root
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .            # installs the local notebooklm-py + httpx
+
+python3 -m pip install "notebooklm-py[browser]"
+
+python3 -m playwright install chromium
+
 notebooklm login           # one-time Google auth (already done if auth check passes)
 notebooklm auth check --test --json   # expect "status": "ok", "token_fetch": true
 ```

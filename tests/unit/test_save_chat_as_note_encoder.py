@@ -1,6 +1,6 @@
 """Unit tests for the saved-from-chat CREATE_NOTE encoder (issue #660).
 
-These tests exercise ``_chat.notes.build_save_chat_as_note_params`` and
+These tests exercise ``_web.params.chat_note.build_save_chat_as_note_params`` and
 pin its output against the wire-captured payload at
 ``tests/unit/fixtures/save_chat_as_note_create_note_request.json``.
 
@@ -10,9 +10,9 @@ produces the same payload Google's web UI sends when its "Save to note"
 button is clicked. Drift from that payload risks the server silently
 dropping citation anchors and reverting the note to plain text.
 
-The encoder moved from ``_mind_map.py`` to ``_chat/notes.py`` in
-Phase 6 (refactor-history.md Step 8, ADR-0013); the test imports were updated
-accordingly.
+The encoder moved from ``_mind_map.py`` into the chat domain in Phase 6
+(refactor-history.md Step 8, ADR-0013), then into the Web params layer when the
+chat base became transport-neutral.
 """
 
 from __future__ import annotations
@@ -22,14 +22,45 @@ from pathlib import Path
 
 import pytest
 
-from notebooklm._chat.notes import (
+from notebooklm._chat import (
     _CITATION_MARKER_RE,
+    _prepare_note_citations,
+    _resolve_reference,
     _strip_citation_markers,
-    build_save_chat_as_note_params,
+)
+from notebooklm._web.params.chat_note import (
+    build_save_chat_as_note_params as _build_save_chat_as_note_params,
 )
 from notebooklm.types import ChatReference
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def build_save_chat_as_note_params(
+    notebook_id: str,
+    answer_text: str,
+    references: list[ChatReference],
+    title: str,
+) -> list[object]:
+    """Exercise neutral preparation and the Web positional encoder together."""
+    if not references:
+        return _build_save_chat_as_note_params(
+            notebook_id,
+            answer_text,
+            references,
+            title,
+            clean_answer=answer_text,
+            citation_anchors=[],
+        )
+    clean_answer, citation_anchors = _prepare_note_citations(answer_text, references)
+    return _build_save_chat_as_note_params(
+        notebook_id,
+        answer_text,
+        references,
+        title,
+        clean_answer=clean_answer,
+        citation_anchors=citation_anchors,
+    )
 
 
 def _load_request_fixture() -> dict:
@@ -130,7 +161,7 @@ class TestBuildSaveChatAsNoteParamsGolden:
         assert actual_params == expected_params
 
         # Serialize both with the same separators the rpc encoder uses
-        # (rpc/encoder.py:39: separators=(",", ":")) and compare strings.
+        # (_web/wire/encoder.py: separators=(",", ":")) and compare strings.
         # This is the strict byte-exact check.
         actual_json = json.dumps(actual_params, separators=(",", ":"))
         expected_json = json.dumps(expected_params, separators=(",", ":"))
@@ -242,14 +273,19 @@ class TestBuildSaveChatAsNoteParamsBehavior:
         assert chunk_refs[1] == [["chunk-b"], [None, 0, 23]]
 
     def test_dedupes_source_passages_by_chunk_id(self):
-        # Same chunk_id referenced twice → only one source_passages entry,
-        # but each [N] marker still gets its own anchor.
-        ref = self._make_ref(1, "chunk-shared", "src-shared")
-        refs = [ref, ref]  # caller may legitimately repeat
+        # Same chunk_id under two distinct citation numbers (the realistic
+        # repeat: one chunk cited at two markers) → only one source_passages
+        # entry, but each [N] marker still gets its own anchor. (Previously
+        # this pinned the numbered-positional fallback — both refs numbered 1
+        # and [2] resolved via references[1]; that fallback is now gated to
+        # unnumbered candidates so a numbering hole can't mis-anchor.)
+        refs = [
+            self._make_ref(1, "chunk-shared", "src-shared"),
+            self._make_ref(2, "chunk-shared", "src-shared"),
+        ]
         params = build_save_chat_as_note_params("nb-id", "A [1] B [2]", refs, "Title")
         assert len(params[3]) == 1  # deduped
         # Two markers found in answer_text → two chunk_refs
-        # (the lookup of [2] falls back to references[1] = same ref)
         assert len(params[5][0][1]) == 2
 
     def test_marker_without_matching_reference_is_skipped(self, caplog):
@@ -261,6 +297,45 @@ class TestBuildSaveChatAsNoteParamsBehavior:
         # Only one anchor — the [99] marker is silently dropped with a warning
         assert len(chunk_refs) == 1
         assert any("[99]" in record.message or "99" in record.message for record in caplog.records)
+
+    def test_holed_numbering_skips_missing_marker_instead_of_mis_anchoring(self, caplog):
+        """Regression (codex review of the citation hardening): no wrong anchors.
+
+        The wire parser keeps RAW ordinals when it skips a malformed citation
+        row, so ``[good#1, skipped#2, good#3]`` reaches the encoder as refs
+        numbered ``{1, 3}``. Marker ``[2]`` must resolve to nothing — the old
+        positional fallback would have anchored ``references[1]`` = raw #3,
+        a silently WRONG anchor. Missing anchor (with a warning) is the only
+        acceptable outcome.
+        """
+        refs = [
+            self._make_ref(1, "chunk-1", "src-1"),
+            self._make_ref(3, "chunk-3", "src-3"),
+        ]
+        # Resolver level: exact matches work, the hole yields None.
+        resolved_1 = _resolve_reference(refs, 1)
+        assert resolved_1 is not None and resolved_1.chunk_id == "chunk-1"
+        assert _resolve_reference(refs, 2) is None
+        resolved_3 = _resolve_reference(refs, 3)
+        assert resolved_3 is not None and resolved_3.chunk_id == "chunk-3"
+
+        # Encoder level: [2]'s anchor is dropped with a warning; [1] and [3]
+        # anchor their own chunks.
+        with caplog.at_level("WARNING"):
+            params = build_save_chat_as_note_params("nb-id", "A [1] B [2] C [3]", refs, "Title")
+        chunk_refs = params[5][0][1]
+        assert [anchor[0] for anchor in chunk_refs] == [["chunk-1"], ["chunk-3"]]
+        assert any("[2]" in record.message for record in caplog.records)
+
+    def test_positional_fallback_still_serves_unnumbered_references(self):
+        """The legacy unset-number contract is preserved: positional lookup
+        applies when the positional candidate carries no citation_number."""
+        refs = [
+            ChatReference(source_id="src-a", chunk_id="chunk-a"),
+            ChatReference(source_id="src-b", chunk_id="chunk-b"),
+        ]
+        resolved = _resolve_reference(refs, 2)
+        assert resolved is not None and resolved.chunk_id == "chunk-b"
 
     def test_seven_element_params_shape(self):
         """Sanity: top-level params is always exactly 7 elements."""
@@ -312,6 +387,52 @@ class TestBuildSaveChatAsNoteParamsBehavior:
         inner_offsets = passage_group[0][2][0][0]
         assert inner_offsets[0] == 0
         assert inner_offsets[1] == 11
+
+    def test_local_offsets_count_utf16_units_not_python_characters(self):
+        """Regression (#2120): TailwindDoc offsets are UTF-16 code units.
+
+        Every range in this payload lives in the backend's coordinate space,
+        which counts UTF-16 units — so one emoji in the cited text is two
+        units and one Python character. Using ``len()`` here ends the local
+        wrapper a unit short per astral character, misaligning the saved
+        note's hover anchoring against text the server measured differently.
+
+        Latent before #2120 and newly reachable after it: ``cited_text`` now
+        spans the whole cited fragment rather than its first block, so it is
+        far likelier to contain one.
+        """
+        cited_text = "\U0001f52c hello"  # 7 Python chars, 8 UTF-16 units
+        ref = ChatReference(
+            source_id="src-1",
+            citation_number=1,
+            cited_text=cited_text,
+            start_char=0,
+            end_char=8,  # the server's own width, in UTF-16 units
+            chunk_id="chunk-1",
+        )
+        params = build_save_chat_as_note_params("nb-id", "X [1].", [ref], "Title")
+        passage_group = params[3][0][4][0]
+        assert len(cited_text) == 7
+        assert passage_group[0][1] == 8
+        assert passage_group[0][2][0][0][1] == 8
+
+    def test_marker_positions_count_utf16_units(self):
+        """The answer-side anchors share that coordinate space (#2120)."""
+        ref = ChatReference(
+            source_id="src-1",
+            citation_number=1,
+            cited_text="text",
+            start_char=0,
+            end_char=4,
+            chunk_id="chunk-1",
+        )
+        # Clean answer "AB<emoji>." is 4 Python characters and 5 UTF-16 units;
+        # the marker sits after "AB<emoji>", 3 characters but 4 units in.
+        params = build_save_chat_as_note_params("nb-id", "AB\U0001f52c [1].", [ref], "Title")
+        body = params[5][0]
+        answer_group, chunk_anchors = body[0], body[1]
+        assert answer_group[0][1] == 5
+        assert chunk_anchors[0][1] == [None, 0, 4]
 
     def test_empty_cited_text_collapses_span(self):
         """Regression: when ref.cited_text is empty, span must collapse to

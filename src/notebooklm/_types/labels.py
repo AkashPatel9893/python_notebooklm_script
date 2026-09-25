@@ -2,13 +2,15 @@
 
 Re-exported from ``notebooklm.types``. A source ``Label`` describes source
 membership only — **no ``kind``, no ``artifact_ids``** (a future artifact-label
-surface is a separate type; see docs/design/source-labels/ §10).
+surface is a separate type).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+
+from .._deprecation import warn_registered_deprecation
 
 
 @dataclass
@@ -17,7 +19,7 @@ class Label:
 
     Notebook-scoped. Membership is many-to-many: a source may belong to multiple
     labels, and a label owns a list of source IDs (the source carries no
-    back-reference). See docs/design/source-labels/rpc.md for the wire model.
+    back-reference).
     """
 
     id: str
@@ -35,14 +37,18 @@ class Label:
         notebook_id: str | None = None,
         method_id: str | None = None,
     ) -> Label:
-        """Parse one label 4-tuple ``[name, sources, label_id, emoji]``."""
-        from .._row_adapters.labels import LabelRow
+        """Parse one label 4-tuple ``[name, sources, label_id, emoji]``.
 
-        row = LabelRow.from_label_tuple(data, method_id=method_id)
-        return cls(
-            id=row.id,
-            name=row.name,
+        .. deprecated:: 0.9.0
+           Use ``client.labels`` typed APIs. Raw Web row decoding has no
+           supported public replacement.
+        """
+        warn_registered_deprecation("label_from_api_response")
+        from .._web.rows.labels import decode_label
+
+        return decode_label(
+            cls,
+            data,
             notebook_id=notebook_id,
-            emoji=row.emoji or None,
-            source_ids=list(row.source_ids),
+            method_id=method_id,
         )

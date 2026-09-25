@@ -33,7 +33,7 @@ tests now drive the canonical collaborator method directly):
 
 The chat-side error mapping that used to live on
 ``NotebookLMClient.query_post`` moved to
-:func:`notebooklm._chat.transport.chat_aware_authed_post` in the D2
+:func:`notebooklm._web.transport.chat.chat_aware_authed_post` in the D2
 cutover; equivalent coverage lives in ``tests/unit/test_chat_transport.py``.
 """
 
@@ -41,27 +41,29 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 import pytest
-from tests.unit.conftest import install_post_as_stream
 
 import notebooklm._backoff as _backoff
 import notebooklm._runtime.helpers as _runtime_helpers
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm._logging import get_request_id
-from notebooklm._middleware.core import RpcRequest, RpcResponse
-from notebooklm._request_types import AuthSnapshot
-from notebooklm._transport_errors import (
+from notebooklm._runtime.config import DEFAULT_TIMEOUT
+from notebooklm._web.transport.errors import (
     TransportAuthExpired,
     TransportRateLimited,
     TransportServerError,
 )
+from notebooklm._web.transport.middleware.context import RPC_CONTEXT_RESOURCE_EPOCH
+from notebooklm._web.transport.middleware.core import RpcRequest, RpcResponse
+from notebooklm._web.transport.request_types import AuthSnapshot
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
 from notebooklm.rpc import RPCMethod
+from tests._helpers.client_factory import build_client_shell_for_tests
+from tests.unit.conftest import install_post_as_stream
 
 
 @pytest.fixture(autouse=True)
@@ -80,9 +82,10 @@ def _no_backoff_jitter(monkeypatch):
 
 def _make_core(
     *,
-    refresh_callback: Callable[[], Any] | None = None,
+    refresh_callback: Callable[[int], Awaitable[AuthTokens]] | None = None,
     rate_limit_max_retries: int = 0,
     server_error_max_retries: int = 0,
+    timeout: float = DEFAULT_TIMEOUT,
 ) -> NotebookLMClient:
     auth = AuthTokens(
         csrf_token="CSRF_OLD",
@@ -95,6 +98,7 @@ def _make_core(
         refresh_retry_delay=0.0,
         rate_limit_max_retries=rate_limit_max_retries,
         server_error_max_retries=server_error_max_retries,
+        timeout=timeout,
     )
 
 
@@ -128,7 +132,7 @@ async def test_perform_authed_post_populates_request_envelope_for_chain() -> Non
         captured.append(request)
         return RpcResponse(response=_ok_response(), context=request.context)
 
-    core._composed.chain_host._authed_post_chain = fake_chain
+    core._web_runtime.composed.chain_host._authed_post_chain = fake_chain
 
     calls: list[AuthSnapshot] = []
 
@@ -142,7 +146,7 @@ async def test_perform_authed_post_populates_request_envelope_for_chain() -> Non
 
     await core.__aenter__()
     try:
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build,
             log_label="RPC LIST_NOTEBOOKS",
             disable_internal_retries=True,
@@ -175,7 +179,7 @@ async def test_chain_reads_live_retry_budget(monkeypatch):
     mutates the budget AFTER ``open()`` still takes effect — preserving
     the pre-PR-12.7 contract where the retry loop read the same attr live.
     Drives the chain via
-    ``core._composed.transport.perform_authed_post`` so the assertion exercises the
+    ``core._web_runtime.composed.transport.perform_authed_post`` so the assertion exercises the
     production seam ``RpcExecutor._execute_once`` uses.
     """
     core = _make_core(rate_limit_max_retries=0)
@@ -183,7 +187,7 @@ async def test_chain_reads_live_retry_budget(monkeypatch):
     try:
         # Mutate AFTER open() — middleware reads via lambda closure so this
         # bump from 0 → 1 grants a single retry on the next chain call.
-        core._composed.chain_host._rate_limit_max_retries = 1
+        core._web_runtime.composed.chain_host._rate_limit_max_retries = 1
         sleeps: list[float] = []
 
         async def fake_sleep(seconds: float) -> None:
@@ -205,9 +209,9 @@ async def test_chain_reads_live_retry_budget(monkeypatch):
                 raise _status_error(429, retry_after="1")
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -226,7 +230,117 @@ async def test_perform_authed_post_requires_open_client():
         return "https://example.test/x", "payload", {}
 
     with pytest.raises(RuntimeError, match="Client not initialized"):
-        await core._composed.transport.perform_authed_post(build_request=build, log_label="test")
+        await core._web_runtime.composed.transport.perform_authed_post(
+            build_request=build, log_label="test"
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_transport_expected_epoch_rejects_before_kernel_or_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained transport caller cannot inspect the next resource generation."""
+    core = _make_core()
+    await core.__aenter__()
+    try:
+        transport = core._web_runtime.composed.transport
+        supervisor = core._collaborators.call_supervisor
+        generation = supervisor._current
+        assert generation is not None
+        touched: list[str] = []
+
+        async def unexpected_snapshot(_expected_epoch: int) -> AuthSnapshot:
+            touched.append("auth")
+            raise AssertionError("stale request reached auth snapshot")
+
+        def unexpected_kernel_epoch(_expected_epoch: int) -> None:
+            touched.append("kernel")
+            raise AssertionError("stale request reached Kernel")
+
+        def unexpected_build(_snapshot: AuthSnapshot) -> tuple[str, str, dict[str, str]]:
+            touched.append("build")
+            raise AssertionError("stale request materialized an envelope")
+
+        async def unexpected_chain(_request: RpcRequest) -> RpcResponse:
+            touched.append("chain")
+            raise AssertionError("stale request entered middleware")
+
+        monkeypatch.setattr(transport, "_snapshot_provider", unexpected_snapshot)
+        monkeypatch.setattr(transport._kernel, "assert_epoch", unexpected_kernel_epoch)
+        core._web_runtime.composed.chain_host._authed_post_chain = unexpected_chain
+
+        with pytest.raises(
+            RuntimeError,
+            match=rf"expected={generation.epoch + 1}, active={generation.epoch}",
+        ):
+            await transport.perform_authed_post(
+                build_request=unexpected_build,
+                log_label="retired direct request",
+                expected_epoch=generation.epoch + 1,
+            )
+
+        assert touched == []
+        assert generation.in_flight == 0
+        assert generation.in_flight == 0
+    finally:
+        await core.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_chain_failures_are_admitted_but_not_terminal_accounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generation admission precedes auth while terminal metrics stay untouched."""
+    core = _make_core()
+    await core.__aenter__()
+    try:
+        transport = core._web_runtime.composed.transport
+        original_snapshot_provider = transport._snapshot_provider
+        before = core.metrics_snapshot()
+        queue_waits: list[float] = []
+        metrics = core._collaborators.metrics
+        original_record_queue_wait = metrics.record_rpc_queue_wait
+
+        def _record_queue_wait(wait_seconds: float) -> None:
+            queue_waits.append(wait_seconds)
+            original_record_queue_wait(wait_seconds)
+
+        monkeypatch.setattr(metrics, "record_rpc_queue_wait", _record_queue_wait)
+
+        async def _snapshot_failure(expected_epoch: int) -> AuthSnapshot:
+            assert expected_epoch == 1
+            raise LookupError("snapshot failed before chain entry")
+
+        monkeypatch.setattr(transport, "_snapshot_provider", _snapshot_failure)
+        with pytest.raises(LookupError, match="snapshot failed"):
+            await transport.perform_authed_post(
+                build_request=lambda _snapshot: ("https://example.test", "body", {}),
+                log_label="snapshot",
+                rpc_method="METHOD",
+            )
+
+        monkeypatch.setattr(transport, "_snapshot_provider", original_snapshot_provider)
+
+        def _build_failure(_snapshot: AuthSnapshot) -> tuple[str, str, dict[str, str]]:
+            raise ValueError("materialization failed before chain entry")
+
+        with pytest.raises(ValueError, match="materialization failed"):
+            await transport.perform_authed_post(
+                build_request=_build_failure,
+                log_label="materialize",
+                rpc_method="METHOD",
+            )
+
+        after = core.metrics_snapshot()
+        assert after.rpc_calls_succeeded == before.rpc_calls_succeeded
+        assert after.rpc_calls_failed == before.rpc_calls_failed
+        assert after.rpc_latency_seconds_total == before.rpc_latency_seconds_total
+        assert queue_waits == []
+        assert after.rpc_queue_wait_seconds_total == before.rpc_queue_wait_seconds_total
+        assert core._collaborators.call_supervisor._current is not None
+        assert core._collaborators.call_supervisor._current.in_flight == 0
+    finally:
+        await core.close()
 
 
 @pytest.mark.asyncio
@@ -235,7 +349,7 @@ async def test_auth_refresh_middleware_honors_injected_predicate() -> None:
     exactly once when the injected ``is_auth_error`` predicate returns
     ``True``, regardless of the actual HTTP status code.
 
-    This test avoids the legacy ``_core.is_auth_error`` string-target
+    This test avoids the retired ``_core`` auth-predicate string-target
     monkeypatch and instead constructs the middleware directly with an
     injected predicate. The
     production chain seeds ``AuthRefreshMiddleware`` with a live-binding
@@ -243,11 +357,12 @@ async def test_auth_refresh_middleware_honors_injected_predicate() -> None:
     separately. Here we pin the middleware-level contract: *whatever*
     predicate is injected drives the refresh-and-retry decision.
     """
-    from notebooklm._middleware.auth_refresh import AuthRefreshMiddleware
+    from notebooklm._web.transport.middleware.auth_refresh import AuthRefreshMiddleware
 
     refresh_calls: list[bool] = []
 
-    async def refresh() -> None:
+    async def refresh(expected_epoch: int) -> None:
+        assert expected_epoch == 11
         refresh_calls.append(True)
 
     # A 418 (I'm a teapot) — NOT recognised by the production
@@ -274,7 +389,7 @@ async def test_auth_refresh_middleware_honors_injected_predicate() -> None:
         url="https://example.test/x",
         headers={},
         body=b"payload",
-        context={"log_label": "test"},
+        context={"log_label": "test", RPC_CONTEXT_RESOURCE_EPOCH: 11},
     )
     response = await middleware(request, terminal)
 
@@ -300,17 +415,14 @@ async def test_production_chain_drives_refresh_on_real_401(monkeypatch):
        ``ClientSeams.is_auth_error``.
 
     Restored in Phase 2 PR 4 after the migration of
-    ``test_chain_uses_late_bound_is_auth_error`` (which string-target
-    monkeypatched ``_core.is_auth_error`` to a ``lambda exc: True`` to
-    force ANY exception to be treated as an auth error)
-    deleted the only end-to-end check of that wiring. This test re-adds the coverage
-    without depending on the soon-to-be-retired ``_core`` indirection
-    by using a real 401 that the canonical predicate already
-    recognises.
+    ``test_chain_uses_late_bound_is_auth_error`` deleted the only end-to-end
+    check of that wiring. This test avoids the retired ``_core`` indirection
+    and uses a real 401 recognized by the canonical predicate.
     """
     refresh_calls: list[bool] = []
 
-    async def refresh() -> AuthTokens:
+    async def refresh(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == 1
         refresh_calls.append(True)
         return core.auth
 
@@ -330,9 +442,9 @@ async def test_production_chain_drives_refresh_on_real_401(monkeypatch):
                 raise _status_error(401)
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -376,9 +488,9 @@ async def test_chain_uses_late_bound_sleep_and_shared_random_uniform(monkeypatch
                 raise _status_error(503)
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -410,10 +522,10 @@ async def test_perform_authed_post_disable_internal_retries_short_circuits(monke
             call_count["n"] += 1
             raise _status_error(503)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportServerError):
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build,
                 log_label="test",
                 disable_internal_retries=True,
@@ -445,9 +557,9 @@ async def test_build_request_rebuilt_at_terminal_on_happy_path(monkeypatch):
             assert content == b"payload"
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -481,7 +593,7 @@ async def test_first_terminal_attempt_rebuilds_when_snapshot_changed(monkeypatch
             ]
         )
 
-        async def fake_snapshot(*, auth: AuthTokens) -> AuthSnapshot:
+        async def fake_snapshot(*, auth: AuthTokens, expected_epoch: int) -> AuthSnapshot:
             # Tightened signature pins the explicit-collaborator contract:
             # the production caller MUST pass ``auth=<live AuthTokens>``,
             # not the legacy positional host. ``auth is core.auth`` proves
@@ -489,6 +601,7 @@ async def test_first_terminal_attempt_rebuilds_when_snapshot_changed(monkeypatch
             # holds (identity-stable per the live-reference contract in
             # ``wire_middleware_chain``).
             assert auth is core.auth
+            assert expected_epoch == 1
             try:
                 return next(snapshots)
             except StopIteration:
@@ -500,7 +613,7 @@ async def test_first_terminal_attempt_rebuilds_when_snapshot_changed(monkeypatch
         # in favor of an explicit ``auth: AuthTokens`` kwarg), so this
         # test swaps the canonical coordinator method instead of the
         # (now-deleted) NotebookLMClient delegate.
-        core._collaborators.auth_coord.snapshot = fake_snapshot  # type: ignore[method-assign]
+        core._web_runtime.auth_coord.snapshot = fake_snapshot  # type: ignore[method-assign]
         calls: list[AuthSnapshot] = []
 
         def build(snapshot: AuthSnapshot) -> tuple[str, str, dict[str, str]]:
@@ -511,9 +624,9 @@ async def test_first_terminal_attempt_rebuilds_when_snapshot_changed(monkeypatch
             assert content == b"payload-CSRF_NEW"
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -538,7 +651,8 @@ async def test_build_request_observes_fresh_snapshot_after_401_refresh(monkeypat
     """
     refresh_calls = []
 
-    async def refresh() -> AuthTokens:
+    async def refresh(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == 1
         refresh_calls.append(True)
         # Mutate auth state so the second snapshot picks up new values.
         core.auth.csrf_token = "CSRF_NEW"
@@ -564,9 +678,9 @@ async def test_build_request_observes_fresh_snapshot_after_401_refresh(monkeypat
             assert content == b"body-CSRF_NEW"
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -625,7 +739,8 @@ async def test_stale_envelope_rebuilt_after_refresh_then_retry(monkeypatch):
     """
     refresh_calls: list[bool] = []
 
-    async def refresh() -> AuthTokens:
+    async def refresh(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == 1
         refresh_calls.append(True)
         # Mutate auth state so a subsequent snapshot captures the new values.
         core.auth.csrf_token = "CSRF_NEW"
@@ -676,9 +791,9 @@ async def test_stale_envelope_rebuilt_after_refresh_then_retry(monkeypatch):
             # must carry the refreshed auth envelope, not the stale one.
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -716,7 +831,8 @@ async def test_stale_envelope_rebuilt_after_refresh_then_retry(monkeypatch):
 async def test_transport_auth_expired_when_refresh_fails(monkeypatch):
     refresh_error = RuntimeError("re-authenticate")
 
-    async def refresh() -> AuthTokens:
+    async def refresh(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == 1
         raise refresh_error
 
     core = _make_core(refresh_callback=refresh)
@@ -731,10 +847,10 @@ async def test_transport_auth_expired_when_refresh_fails(monkeypatch):
         async def fake_post(*args, **kwargs):
             raise original
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportAuthExpired) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -766,10 +882,10 @@ async def test_429_retries_exhaust_to_transport_rate_limited(monkeypatch):
             call_count["n"] += 1
             raise _status_error(429, retry_after="1")
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportRateLimited) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -793,10 +909,10 @@ async def test_429_without_retry_budget_raises_immediately(monkeypatch):
         async def fake_post(*args, **kwargs):
             raise _status_error(429, retry_after="60")
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportRateLimited) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -811,7 +927,8 @@ async def test_request_id_constant_across_retry_chain(monkeypatch):
     retry attempt — both pre- and post-refresh.
     """
 
-    async def refresh() -> AuthTokens:
+    async def refresh(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == 1
         core.auth.csrf_token = "CSRF_NEW"
         return core.auth
 
@@ -832,7 +949,7 @@ async def test_request_id_constant_across_retry_chain(monkeypatch):
                 raise _status_error(401)
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         # Use perform_authed_post directly inside set_request_id to verify
         # the helper itself doesn't reset the id. ``perform_authed_post``
@@ -847,7 +964,7 @@ async def test_request_id_constant_across_retry_chain(monkeypatch):
 
         token = set_request_id("REQ-stable-1234")
         try:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
         finally:
@@ -866,7 +983,7 @@ async def test_request_id_constant_across_retry_chain(monkeypatch):
 
 # NOTE: ``query_post`` (chat-side wrapper) tests were removed in
 # ``arch-d2-cutover`` — the chat-flavored error mapping moved to
-# :func:`notebooklm._chat.transport.chat_aware_authed_post`. Equivalent
+# :func:`notebooklm._web.transport.chat.chat_aware_authed_post`. Equivalent
 # coverage lives in ``tests/unit/test_chat_transport.py``.
 
 
@@ -894,9 +1011,9 @@ async def test_rpc_call_happy_path_url_and_body_unchanged(monkeypatch):
             text = f")]}}'\n{len(chunk)}\n{chunk}\n"
             return _ok_response(text)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
+        await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
 
         # The URL must carry the standard batchexecute query string.
         assert "rpcids=" + RPCMethod.LIST_NOTEBOOKS.value in captured["url"]
@@ -937,9 +1054,9 @@ async def test_5xx_retries_then_succeeds(monkeypatch):
                 raise _status_error(503)
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -973,10 +1090,10 @@ async def test_5xx_exhausts_budget_raises_transport_server_error(monkeypatch):
             call_count["n"] += 1
             raise _status_error(502)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportServerError) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -1014,9 +1131,9 @@ async def test_network_error_retries_then_succeeds(monkeypatch):
                 raise httpx.ReadTimeout("connection blip")
             return _ok_response()
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        response = await core._composed.transport.perform_authed_post(
+        response = await core._web_runtime.composed.transport.perform_authed_post(
             build_request=build, log_label="test"
         )
 
@@ -1047,10 +1164,10 @@ async def test_network_error_exhausts_budget_raises_transport_server_error(monke
         async def fake_post(*args, **kwargs):
             raise httpx.ConnectError("connection refused")
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportServerError) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -1085,10 +1202,10 @@ async def test_server_error_budget_zero_raises_immediately(monkeypatch):
             call_count["n"] += 1
             raise _status_error(500)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportServerError) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -1103,12 +1220,9 @@ async def test_server_error_budget_zero_raises_immediately(monkeypatch):
 @pytest.mark.asyncio
 async def test_exponential_backoff_caps_at_30_seconds(monkeypatch):
     """Backoff schedule: 1, 2, 4, 8, 16, 30 — caps at 30 for high attempt counts."""
-    core = _make_core(server_error_max_retries=8)
+    core = _make_core(server_error_max_retries=8, timeout=200.0)
     await core.__aenter__()
     try:
-        # This test isolates the exponential schedule itself. Keep the aggregate
-        # retry deadline high enough that it does not stop before the cap repeats.
-        core._collaborators.lifecycle._timeout = 200.0
         sleeps: list[float] = []
 
         async def fake_sleep(seconds: float) -> None:
@@ -1122,10 +1236,10 @@ async def test_exponential_backoff_caps_at_30_seconds(monkeypatch):
         async def fake_post(*args, **kwargs):
             raise _status_error(503)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportServerError):
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -1155,10 +1269,10 @@ async def test_5xx_path_does_not_touch_429_path(monkeypatch):
         async def fake_post(*args, **kwargs):
             raise _status_error(429, retry_after="5")
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportRateLimited) as exc_info:
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -1176,7 +1290,8 @@ async def test_5xx_path_does_not_trigger_auth_refresh(monkeypatch):
     refresh_calls: list[bool] = []
     captured_core: dict[str, NotebookLMClient] = {}
 
-    async def refresh() -> AuthTokens:
+    async def refresh(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == 1
         refresh_calls.append(True)
         return captured_core["c"].auth
 
@@ -1197,10 +1312,10 @@ async def test_5xx_path_does_not_trigger_auth_refresh(monkeypatch):
         async def fake_post(*args, **kwargs):
             raise _status_error(503)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(TransportServerError):
-            await core._composed.transport.perform_authed_post(
+            await core._web_runtime.composed.transport.perform_authed_post(
                 build_request=build, log_label="test"
             )
 
@@ -1231,10 +1346,10 @@ async def test_rpc_call_maps_transport_server_error_to_server_error(monkeypatch)
         async def fake_post(*args, **kwargs):
             raise _status_error(503)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(ServerError) as exc_info:
-            await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
+            await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
 
         assert exc_info.value.status_code == 503
     finally:
@@ -1258,10 +1373,10 @@ async def test_rpc_call_maps_transport_server_error_network_to_network_error(mon
         async def fake_post(*args, **kwargs):
             raise httpx.ConnectError("nope")
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with pytest.raises(NetworkError):
-            await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
+            await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [])
     finally:
         await core.close()
 
@@ -1297,7 +1412,7 @@ async def test_streamed_response_size_cap(monkeypatch):
     """
     from contextlib import asynccontextmanager
 
-    from notebooklm._streaming_post import stream_post_with_size_cap
+    from notebooklm._web.transport.streaming_post import stream_post_with_size_cap
     from notebooklm.exceptions import RPCResponseTooLargeError
 
     cap = 1024  # 1 KiB cap so the test stays fast and small.
@@ -1349,11 +1464,124 @@ async def test_streamed_response_size_cap(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_streaming_default_size_cap_reads_current_constant(monkeypatch):
+    """Omitted ``max_bytes`` resolves the module constant at call time."""
+    from contextlib import asynccontextmanager
+
+    import notebooklm._web.transport.streaming_post as _streaming_post
+    from notebooklm.exceptions import RPCResponseTooLargeError
+
+    cap = 8
+    monkeypatch.setattr(_streaming_post, "MAX_RPC_RESPONSE_BYTES", cap)
+
+    class _FakeResponse:
+        status_code = 200
+        headers: dict[str, str] = {}
+        request = httpx.Request("POST", "https://example.test/x")
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_bytes(self):
+            yield b"x" * (cap + 1)
+
+    @asynccontextmanager
+    async def fake_stream(method, url, **kwargs):
+        yield _FakeResponse()
+
+    client = httpx.AsyncClient()
+    try:
+        monkeypatch.setattr(client, "stream", fake_stream)
+
+        with pytest.raises(RPCResponseTooLargeError) as exc_info:
+            await _streaming_post.stream_post_with_size_cap(
+                client,
+                "https://example.test/x",
+                body=b"",
+                headers=None,
+            )
+
+        assert exc_info.value.limit_bytes == cap
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_perform_authed_post_enforces_explicit_max_response_bytes(monkeypatch):
+    """RuntimeTransport forwards a per-call response cap to the stream guard."""
+    from notebooklm.exceptions import RPCResponseTooLargeError
+
+    core = _make_core()
+    await core.__aenter__()
+    try:
+
+        def build(snapshot: AuthSnapshot) -> tuple[str, str, dict[str, str]]:
+            return "https://example.test/x", "payload", {}
+
+        async def fake_post(url, *, content, **kwargs):
+            return httpx.Response(
+                200,
+                content=b"x" * 9,
+                request=httpx.Request("POST", url),
+            )
+
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
+
+        with pytest.raises(RPCResponseTooLargeError) as exc_info:
+            await core._web_runtime.composed.transport.perform_authed_post(
+                build_request=build,
+                log_label="test",
+                max_response_bytes=8,
+            )
+
+        assert exc_info.value.limit_bytes == 8
+    finally:
+        await core.close()
+
+
+@pytest.mark.asyncio
+async def test_perform_authed_post_without_cap_uses_shared_stream_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitted runtime cap keeps ordinary RPCs on the shared stream default."""
+    import notebooklm._web.transport.streaming_post as _streaming_post
+    from notebooklm.exceptions import RPCResponseTooLargeError
+
+    cap = 8
+    monkeypatch.setattr(_streaming_post, "MAX_RPC_RESPONSE_BYTES", cap)
+    core = _make_core()
+    await core.__aenter__()
+    try:
+
+        def build(snapshot: AuthSnapshot) -> tuple[str, str, dict[str, str]]:
+            return "https://example.test/x", "payload", {}
+
+        async def fake_post(url, *, content, **kwargs):
+            return httpx.Response(
+                200,
+                content=b"x" * (cap + 1),
+                request=httpx.Request("POST", url),
+            )
+
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
+
+        with pytest.raises(RPCResponseTooLargeError) as exc_info:
+            await core._web_runtime.composed.transport.perform_authed_post(
+                build_request=build,
+                log_label="test",
+            )
+
+        assert exc_info.value.limit_bytes == cap
+    finally:
+        await core.close()
+
+
+@pytest.mark.asyncio
 async def test_normal_response_below_cap_works(monkeypatch):
     """A normal-sized response decodes through the streaming wrapper unchanged."""
     from contextlib import asynccontextmanager
 
-    from notebooklm._streaming_post import stream_post_with_size_cap
+    from notebooklm._web.transport.streaming_post import stream_post_with_size_cap
 
     payload = b"hello world" * 1000  # ~11 KB, well under the 50 MiB default
 
@@ -1400,7 +1628,7 @@ async def test_streaming_raise_for_status_propagates_before_size_check(monkeypat
     auth-refresh / 429 / 5xx branches see the same error they always did."""
     from contextlib import asynccontextmanager
 
-    from notebooklm._streaming_post import stream_post_with_size_cap
+    from notebooklm._web.transport.streaming_post import stream_post_with_size_cap
 
     chunk_reads = 0
 
@@ -1483,7 +1711,7 @@ async def test_streaming_strips_content_encoding_to_prevent_double_decode(monkey
         pytest.importorskip("zstandard")
     from contextlib import asynccontextmanager
 
-    from notebooklm._streaming_post import stream_post_with_size_cap
+    from notebooklm._web.transport.streaming_post import stream_post_with_size_cap
 
     # Realistic batchexecute prefix; only the bytes matter, not the framing.
     decoded_payload = b')]}\'\n\n[["wrb.fr",null,"[1]",null,null,null,"generic"]]'
@@ -1541,7 +1769,8 @@ async def test_streaming_strips_content_encoding_to_prevent_double_decode(monkey
 
 def test_transport_constants_live_in_owning_modules():
     """Transport constants live with the modules that enforce them."""
-    from notebooklm import _streaming_post, _transport_errors
+    from notebooklm._web.transport import errors as _transport_errors
+    from notebooklm._web.transport import streaming_post as _streaming_post
 
     assert _streaming_post.MAX_RPC_RESPONSE_BYTES == 50 * 1024 * 1024
     assert _transport_errors.MAX_RETRY_AFTER_SECONDS == 300

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from notebooklm._deadline import RuntimeDeadline
-from notebooklm._transport_errors import MAX_RETRY_AFTER_SECONDS, parse_retry_after
+from notebooklm._web.transport.errors import MAX_RETRY_AFTER_SECONDS, parse_retry_after
 
 
 def test_parse_retry_after_integer():
@@ -10,6 +10,7 @@ def test_parse_retry_after_integer():
     assert parse_retry_after("0") == 0
     assert parse_retry_after("-5") == 0
     assert parse_retry_after(str(MAX_RETRY_AFTER_SECONDS + 1)) == MAX_RETRY_AFTER_SECONDS
+    assert parse_retry_after("9" * 400) == MAX_RETRY_AFTER_SECONDS
 
 
 def test_parse_retry_after_http_date():

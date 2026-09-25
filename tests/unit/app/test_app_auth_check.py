@@ -17,6 +17,7 @@ parsing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,19 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import notebooklm.auth as auth_module
+from notebooklm._app import auth_check as auth_check_module
+from notebooklm._app import master_token as master_token_module
 from notebooklm._app.auth_check import (
     AuthCheckPlan,
     AuthCheckResult,
     run_auth_check,
 )
+from notebooklm._app.master_token import MasterTokenStatus
+
+
+class _Abort(BaseException):
+    pass
 
 
 def _plan(
@@ -38,7 +47,6 @@ def _plan(
     has_home_env: bool = False,
     profile: str | None = "default",
     test_fetch: bool = False,
-    json_output: bool = False,
 ) -> AuthCheckPlan:
     return AuthCheckPlan(
         storage_path=storage_path,
@@ -47,7 +55,6 @@ def _plan(
         has_home_env=has_home_env,
         auth_source_label="file (storage_state.json)",
         test_fetch=test_fetch,
-        json_output=json_output,
     )
 
 
@@ -203,23 +210,43 @@ async def test_missing_required_cookies_fails_cookie_check(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_token_fetch_success(tmp_path: Path) -> None:
+@pytest.mark.parametrize("local_state", ["valid", "healed", "still_missing"])
+async def test_token_fetch_success(tmp_path: Path, local_state: str) -> None:
     storage = tmp_path / "storage_state.json"
-    storage.write_text(json.dumps(_valid_storage_state("HSID")), encoding="utf-8")
+    initial = (
+        _valid_storage_state("HSID")
+        if local_state == "valid"
+        else _storage_state("SID", "APISID", "SAPISID", "LSID")
+    )
+    storage.write_text(json.dumps(initial), encoding="utf-8")
+    if local_state != "valid":
+        auth_module.write_master_token(
+            storage.with_name("master_token.json"),
+            email="owner@gmail.com",
+            master_token="aas_et/secret",
+            android_id="0123456789abcdef",
+        )
     plan = _plan(storage_path=storage, test_fetch=True)
 
-    fetch = AsyncMock(return_value=("csrf-token-value", "session-id-value"))
+    async def fetch_tokens(*_args):
+        if local_state == "healed":
+            storage.write_text(json.dumps(_valid_storage_state("APISID", "SAPISID", "LSID")))
+        return "csrf-token-value", "session-id-value"
+
+    fetch = AsyncMock(side_effect=fetch_tokens)
     # ``run_auth_check`` does ``from ..auth import fetch_tokens_with_domains``
-    # at call time, so patch the public facade name it resolves. ``notebooklm.auth``
-    # is public, so this string-target ``patch`` is allowed by ADR-0007's lint
-    # (which only bars ``monkeypatch.setattr(notebooklm…)`` + private ``patch``).
-    with patch("notebooklm.auth.fetch_tokens_with_domains", fetch):
+    # at call time, so patch the public facade name it resolves.
+    with patch.object(auth_module, "fetch_tokens_with_domains", fetch):
         result = await run_auth_check(plan, read_env_auth_json=_never_read_env)
 
     assert result.checks["token_fetch"] is True
     assert result.details["csrf_length"] == len("csrf-token-value")
     assert result.details["session_id_length"] == len("session-id-value")
-    assert result.all_passed is True
+    assert result.all_passed is (local_state != "still_missing")
+    # Guidance describes the latest sample: healing clears it; an unhealed
+    # reread emits one code rather than accumulating duplicate instructions.
+    assert result.guidance == (("master_token_psidts",) if local_state == "still_missing" else ())
+    assert (result.details["error"] is None) is (local_state != "still_missing")
     # File-based auth → the storage path is forwarded to the fetch.
     fetch.assert_awaited_once_with(storage, "default")
 
@@ -231,7 +258,7 @@ async def test_token_fetch_failure_sets_false(tmp_path: Path) -> None:
     plan = _plan(storage_path=storage, test_fetch=True)
 
     fetch = AsyncMock(side_effect=RuntimeError("network down"))
-    with patch("notebooklm.auth.fetch_tokens_with_domains", fetch):
+    with patch.object(auth_module, "fetch_tokens_with_domains", fetch):
         result = await run_auth_check(plan, read_env_auth_json=_never_read_env)
 
     assert result.checks["token_fetch"] is False
@@ -250,13 +277,13 @@ async def test_token_fetch_env_auth_passes_none_path(tmp_path: Path) -> None:
         test_fetch=True,
     )
     fetch = AsyncMock(return_value=("c", "s"))
-    with patch("notebooklm.auth.fetch_tokens_with_domains", fetch):
+    with patch.object(auth_module, "fetch_tokens_with_domains", fetch):
         result = await run_auth_check(
             plan, read_env_auth_json=lambda: json.dumps(_valid_storage_state())
         )
 
     assert result.checks["token_fetch"] is True
-    fetch.assert_awaited_once_with(None, "work")
+    fetch.assert_awaited_once_with(None, None)
 
 
 @pytest.mark.asyncio
@@ -271,6 +298,287 @@ async def test_token_fetch_not_run_when_test_fetch_false(tmp_path: Path) -> None
     assert result.checks["token_fetch"] is None
     # all_passed ignores the not-tested (None) token_fetch.
     assert result.all_passed is True
+
+
+# ---------------------------------------------------------------------------
+# Identity + location facts (issue #1640)
+# ---------------------------------------------------------------------------
+
+
+def _storage_with_account(
+    *cookie_names: str, email: str | None = None, authuser: int = 0
+) -> dict[str, Any]:
+    """A valid storage_state carrying the in-band account namespace."""
+    state = _valid_storage_state(*cookie_names)
+    if email is not None:
+        state["notebooklm"] = {"account": {"email": email, "authuser": authuser}}
+    return state
+
+
+@pytest.mark.asyncio
+async def test_identity_fields_populated_from_storage(tmp_path: Path) -> None:
+    storage = tmp_path / "storage_state.json"
+    storage.write_text(
+        json.dumps(_storage_with_account("APISID", "SAPISID", email="you@gmail.com", authuser=2)),
+        encoding="utf-8",
+    )
+    plan = _plan(storage_path=storage, profile="github")
+
+    result = await run_auth_check(plan, read_env_auth_json=_never_read_env)
+
+    assert result.details["account"] == {"email": "you@gmail.com", "authuser": 2}
+    assert result.details["profile"] == "github"
+    assert result.details["storage_path"] == str(storage)
+    assert result.details["psidts"]["present"] is True
+    # No sibling master_token.json → reported absent with the path it looked for.
+    assert result.details["master_token"]["present"] is False
+    assert result.details["master_token"]["path"] == str(storage.with_name("master_token.json"))
+
+
+@pytest.mark.asyncio
+async def test_psidts_expiry_surfaced(tmp_path: Path) -> None:
+    storage = tmp_path / "storage_state.json"
+    storage.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {"name": "SID", "value": "v", "domain": ".google.com", "path": "/"},
+                    {
+                        "name": "__Secure-1PSIDTS",
+                        "value": "v",
+                        "domain": ".google.com",
+                        "path": "/",
+                        "expires": 1_800_000_000,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = await run_auth_check(_plan(storage_path=storage), read_env_auth_json=_never_read_env)
+
+    psidts = result.details["psidts"]
+    assert psidts["present"] is True
+    # Epoch 1_800_000_000 → 2027-01-15T08:00:00+00:00 (UTC ISO).
+    assert psidts["expires_at"].startswith("2027-01-15T08:00:00")
+
+
+@pytest.mark.asyncio
+async def test_psidts_out_of_range_expiry_degrades_to_none(tmp_path: Path) -> None:
+    """A corrupt/out-of-range ``expires`` must not abort the check (auth check
+    has no error envelope); the field degrades to present + expires_at=None."""
+    storage = tmp_path / "storage_state.json"
+    storage.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {"name": "SID", "value": "v", "domain": ".google.com", "path": "/"},
+                    {
+                        "name": "__Secure-1PSIDTS",
+                        "value": "v",
+                        "domain": ".google.com",
+                        "path": "/",
+                        "expires": 1e20,  # OverflowError from datetime.fromtimestamp
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = await run_auth_check(_plan(storage_path=storage), read_env_auth_json=_never_read_env)
+
+    assert result.details["psidts"] == {"present": True, "expires_at": None}
+
+
+@pytest.mark.asyncio
+async def test_master_token_present_and_account_read(tmp_path: Path) -> None:
+    storage = tmp_path / "storage_state.json"
+    storage.write_text(json.dumps(_valid_storage_state("APISID", "SAPISID")), encoding="utf-8")
+    auth_module.write_master_token(
+        storage.with_name("master_token.json"),
+        email="owner@gmail.com",
+        master_token="aas_et/secret",
+        android_id="0123456789abcdef",
+    )
+    result = await run_auth_check(_plan(storage_path=storage), read_env_auth_json=_never_read_env)
+
+    mt = result.details["master_token"]
+    assert mt["present"] is True
+    assert mt["account"] == "owner@gmail.com"
+    assert mt["path"] == str(storage.with_name("master_token.json"))
+
+
+@pytest.mark.asyncio
+async def test_master_token_status_is_late_bound_once_and_projected_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    storage = tmp_path / "storage_state.json"
+    storage.write_text(json.dumps(_valid_storage_state()), encoding="utf-8")
+    account = {"permissive": object()}
+    calls: list[tuple[Path, bool]] = []
+
+    def inspect_status(path: Path, *, has_env_auth: bool) -> MasterTokenStatus:
+        calls.append((path, has_env_auth))
+        return MasterTokenStatus(
+            present=True,
+            path=tmp_path / "master_token.json",
+            account=account,
+            unreadable_error_type="UnicodeDecodeError",
+        )
+
+    monkeypatch.setattr(master_token_module, "inspect_master_token_status", inspect_status)
+    with caplog.at_level("DEBUG", logger=auth_check_module.__name__):
+        result = await run_auth_check(
+            _plan(storage_path=storage), read_env_auth_json=_never_read_env
+        )
+
+    assert calls == [(storage, False)]
+    assert result.details["master_token"] == {
+        "present": True,
+        "path": str(tmp_path / "master_token.json"),
+        "account": account,
+    }
+    assert "master_token.json present but unreadable: UnicodeDecodeError" in caplog.messages
+
+
+@pytest.mark.parametrize(
+    "error", [RuntimeError("ordinary"), asyncio.CancelledError(), _Abort("abort")]
+)
+def test_master_token_status_preserves_collaborator_error_and_scrubs_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    def fail(_path: Path, *, has_env_auth: bool) -> MasterTokenStatus:
+        assert has_env_auth is False
+        raise error
+
+    monkeypatch.setattr(master_token_module, "inspect_master_token_status", fail)
+    caught: BaseException | None = None
+    try:
+        auth_check_module._master_token_status(_plan(storage_path=tmp_path / "storage.json"))
+    except BaseException as exc:
+        caught = exc
+    assert caught is error
+    frames = []
+    traceback = caught.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_name == "_master_token_status":
+            frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert len(frames) == 1
+    assert "status" not in frames[0].f_locals
+
+
+@pytest.mark.asyncio
+async def test_master_token_status_resolves_through_symlinked_storage_dir(tmp_path: Path) -> None:
+    """#2103 PR-1 review: proves the CALL-SITE WIRING in ``_master_token_status``
+    (``_app/auth_check.py``), not just ``master_token_path_for`` in isolation
+    (already covered by ``test_paths.py``). ``AuthCheckPlan.storage_path`` is
+    documented as pre-resolved by ``AuthSource.from_click_context``
+    (``expanduser().resolve()``), so a wiring bug here — passing the wrong
+    field, or a future caller that stops pre-resolving — would be the one
+    place nothing else catches it: a symlinked profile directory must still
+    resolve to the SAME sibling as its real target."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    storage = real_dir / "storage_state.json"
+    storage.write_text(json.dumps(_valid_storage_state("APISID", "SAPISID")), encoding="utf-8")
+    auth_module.write_master_token(
+        real_dir / "master_token.json",
+        email="owner@gmail.com",
+        master_token="aas_et/secret",
+        android_id="0123456789abcdef",
+    )
+    alias_dir = tmp_path / "alias"
+    try:
+        alias_dir.symlink_to(real_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):  # pragma: no cover - Windows without privilege
+        pytest.skip("platform cannot create directory symlinks")
+    aliased_storage = alias_dir / "storage_state.json"
+
+    result = await run_auth_check(
+        _plan(storage_path=aliased_storage), read_env_auth_json=_never_read_env
+    )
+
+    mt = result.details["master_token"]
+    assert mt["present"] is True
+    assert mt["account"] == "owner@gmail.com"
+    # The reported path is the RESOLVED sibling (real_dir), not a sibling of
+    # the alias — proving master_token_path_for's resolve is actually applied
+    # through this call site's wiring, not just in the shared helper's tests.
+    assert mt["path"] == str(real_dir / "master_token.json")
+
+
+@pytest.mark.asyncio
+async def test_missing_psidts_with_master_token_uses_corrected_hint(tmp_path: Path) -> None:
+    """A master-token profile missing PSIDTS at rest gets master-token guidance,
+    not the (wrong) browser-extraction / App-Bound Encryption hint."""
+    storage = tmp_path / "storage_state.json"
+    # SID + secondary binding present, but no __Secure-1PSIDTS (the recoverable,
+    # self-healing case for a master-token profile).
+    storage.write_text(json.dumps(_storage_state("SID", "APISID", "SAPISID")), encoding="utf-8")
+    auth_module.write_master_token(
+        storage.with_name("master_token.json"),
+        email="owner@gmail.com",
+        master_token="aas_et/secret",
+        android_id="0123456789abcdef",
+    )
+    result = await run_auth_check(_plan(storage_path=storage), read_env_auth_json=_never_read_env)
+
+    assert result.checks["cookies_present"] is False
+    assert "master_token.json is present" in result.details["error"]
+    assert "App-Bound Encryption" not in result.details["error"]
+    assert result.details["master_token"]["present"] is True
+    assert result.guidance == ("master_token_psidts",)
+
+
+@pytest.mark.asyncio
+async def test_env_auth_reads_account_from_inline_json(tmp_path: Path) -> None:
+    plan = _plan(
+        storage_path=tmp_path / "ignored.json",
+        has_env_auth=True,
+        profile="work",
+    )
+    inline = json.dumps(_storage_with_account(email="ci@gmail.com", authuser=1))
+    result = await run_auth_check(plan, read_env_auth_json=lambda: inline)
+
+    assert result.details["account"] == {"email": "ci@gmail.com", "authuser": 1}
+    # Env-auth has no profile directory → master-token is N/A.
+    assert result.details["master_token"] == {"present": False, "path": None, "account": None}
+
+
+@pytest.mark.asyncio
+async def test_env_auth_account_normalizes_whitespace_and_rejects_bool(tmp_path: Path) -> None:
+    """Env-auth account mirrors the file path: whitespace-only email → None, and a
+    bool authuser (``bool`` is an ``int`` subclass) falls back to 0."""
+    plan = _plan(storage_path=tmp_path / "ignored.json", has_env_auth=True)
+    state = _valid_storage_state()
+    state["notebooklm"] = {"account": {"email": "   ", "authuser": True}}
+    result = await run_auth_check(plan, read_env_auth_json=lambda: json.dumps(state))
+
+    assert result.details["account"] == {"email": None, "authuser": 0}
+
+
+@pytest.mark.asyncio
+async def test_missing_sid_and_psidts_keeps_generic_hint(tmp_path: Path) -> None:
+    """When BOTH SID and PSIDTS are missing the session is unrecoverable, so the
+    master-token hint must NOT fire even with a sibling master_token.json."""
+    storage = tmp_path / "storage_state.json"
+    # Neither SID nor __Secure-1PSIDTS — only the secondary binding pair.
+    storage.write_text(json.dumps(_storage_state("APISID", "SAPISID")), encoding="utf-8")
+    auth_module.write_master_token(
+        storage.with_name("master_token.json"),
+        email="owner@gmail.com",
+        master_token="aas_et/secret",
+        android_id="0123456789abcdef",
+    )
+    result = await run_auth_check(_plan(storage_path=storage), read_env_auth_json=_never_read_env)
+
+    assert result.checks["cookies_present"] is False
+    assert "master_token.json is present" not in result.details["error"]
 
 
 # ---------------------------------------------------------------------------

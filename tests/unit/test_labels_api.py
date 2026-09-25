@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-from notebooklm._labels import LabelsAPI
+from notebooklm._web.labels import WebLabelsAPI
 from notebooklm.exceptions import LabelError, LabelNotFoundError, UnknownRPCMethodError
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.fake_core import make_fake_core
 
 
 def _label_tuple(
@@ -29,9 +31,14 @@ def _create_env(*tuples: list[Any]) -> list[Any]:
 
 
 class FakeRpc:
-    def __init__(self, responses: dict[RPCMethod, Any] | None = None) -> None:
+    def __init__(
+        self,
+        responses: dict[RPCMethod, Any] | None = None,
+        sequences: dict[RPCMethod, list[Any]] | None = None,
+    ) -> None:
         self.calls: list[SimpleNamespace] = []
         self.responses = responses or {}
+        self.sequences = {method: deque(values) for method, values in (sequences or {}).items()}
 
     async def rpc_call(
         self,
@@ -43,6 +50,7 @@ class FakeRpc:
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        raise_on_null_status: bool = False,
     ) -> Any:
         self.calls.append(
             SimpleNamespace(
@@ -51,18 +59,31 @@ class FakeRpc:
                 source_path=source_path,
                 allow_null=allow_null,
                 operation_variant=operation_variant,
+                raise_on_null_status=raise_on_null_status,
             )
         )
+        queue = self.sequences.get(method)
+        if queue:
+            return queue.popleft()
         return self.responses.get(method)
 
     def methods(self) -> list[RPCMethod]:
         return [c.method for c in self.calls]
 
 
-def _api(responses: dict[RPCMethod, Any] | None = None, sources: list[Any] | None = None):
-    rpc = FakeRpc(responses)
+def _api(
+    responses: dict[RPCMethod, Any] | None = None,
+    sources: list[Any] | None = None,
+    *,
+    sequences: dict[RPCMethod, list[Any]] | None = None,
+):
+    rpc = FakeRpc(responses, sequences)
     list_sources = AsyncMock(return_value=sources or [])
-    return LabelsAPI(rpc, list_sources=list_sources), rpc, list_sources
+    return (
+        WebLabelsAPI(rpc, supervisor=make_fake_core(), list_sources=list_sources),
+        rpc,
+        list_sources,
+    )
 
 
 # -- read --------------------------------------------------------------------
@@ -85,13 +106,13 @@ async def test_generate_decodes_create_envelope_and_default_scope() -> None:
     labels = await api.generate("nb")
     assert {label.id for label in labels} == {"l1", "l2"}
     assert rpc.methods() == [RPCMethod.CREATE_LABEL]
-    assert rpc.calls[0].params[4] == [0]  # default scope="unlabeled"
+    assert rpc.calls[0].params[4] == [False]  # default scope="unlabeled"
 
 
 async def test_generate_scope_all_is_destructive_slot() -> None:
     api, rpc, _ = _api({RPCMethod.CREATE_LABEL: _create_env()})
     await api.generate("nb", scope="all")
-    assert rpc.calls[0].params[4] == []
+    assert rpc.calls[0].params[4] == [True]
 
 
 async def test_generate_rejects_invalid_scope_before_any_rpc() -> None:
@@ -191,6 +212,24 @@ async def test_set_emoji_sends_null_name_slot_variant_none() -> None:
     upd = next(c for c in rpc.calls if c.method == RPCMethod.UPDATE_LABEL)
     assert upd.operation_variant is None
     assert upd.params[3] == [[[None, "\U0001f525"]]]
+
+
+async def test_update_readback_miss_keeps_web_list_method_id() -> None:
+    api, rpc, _ = _api(
+        {RPCMethod.UPDATE_LABEL: []},
+        sequences={
+            RPCMethod.LIST_LABELS: [
+                _list_env(_label_tuple("Old", "l1")),
+                _list_env(),
+            ]
+        },
+    )
+
+    with pytest.raises(LabelNotFoundError) as caught:
+        await api.update("nb", "l1", name="New")
+
+    assert caught.value.method_id == RPCMethod.LIST_LABELS.value
+    assert rpc.methods() == [RPCMethod.LIST_LABELS, RPCMethod.UPDATE_LABEL, RPCMethod.LIST_LABELS]
 
 
 async def test_add_sources_single_id_is_one_update_plus_refetch() -> None:
@@ -324,6 +363,14 @@ async def test_delete_empty_list_issues_no_rpc() -> None:
     assert rpc.calls == []
 
 
+async def test_delete_preserves_duplicate_ids_for_web_wire_compatibility() -> None:
+    api, rpc, _ = _api({RPCMethod.DELETE_LABEL: []})
+
+    await api.delete("nb", ["l1", "l1"])
+
+    assert rpc.calls[0].params[2] == ["l1", "l1"]
+
+
 # -- sources join ------------------------------------------------------------
 
 
@@ -361,6 +408,7 @@ async def test_add_sources_is_not_atomic_partial_failure_propagates() -> None:
             *,
             disable_internal_retries: bool = False,
             operation_variant: str | None = None,
+            raise_on_null_status: bool = False,
         ) -> Any:
             await super().rpc_call(
                 method,
@@ -370,13 +418,18 @@ async def test_add_sources_is_not_atomic_partial_failure_propagates() -> None:
                 _is_retry,
                 disable_internal_retries=disable_internal_retries,
                 operation_variant=operation_variant,
+                raise_on_null_status=raise_on_null_status,
             )
             if sum(c.method == RPCMethod.UPDATE_LABEL for c in self.calls) == 2:
                 raise RuntimeError("wire blip on the 2nd add")
             return None
 
     rpc = _RaiseOnSecondUpdate()
-    api = LabelsAPI(rpc, list_sources=AsyncMock(return_value=[]))
+    api = WebLabelsAPI(
+        rpc,
+        supervisor=make_fake_core(),
+        list_sources=AsyncMock(return_value=[]),
+    )
     with pytest.raises(RuntimeError):
         await api.add_sources("nb", "l1", ["s1", "s2", "s3"])
 

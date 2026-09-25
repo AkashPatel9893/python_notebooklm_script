@@ -29,17 +29,14 @@ from urllib.parse import quote
 
 import pytest
 
-from _helpers.client_factory import build_client_shell_for_tests
-from notebooklm._error_injection import (
+from notebooklm._web.transport.error_injection import (
     ERROR_INJECT_ENV_VAR,
     _get_error_injection_mode,
 )
+from tests._helpers.client_factory import build_client_shell_for_tests
 
-# Load ``tests/vcr_config.py`` via ``importlib`` rather than mutating
-# ``sys.path``. The ``tests`` directory is not a package (no ``__init__.py``),
-# so a plain ``from tests.vcr_config import _freq_body_matcher`` fails; a
-# ``sys.path`` insertion would work but is module-load-time side-effectful and
-# would silently shadow any future top-level module named ``vcr_config``.
+# Load ``tests/vcr_config.py`` via ``importlib`` by file path to keep the
+# dependency localized and avoid module-load-time ``sys.path`` mutation.
 # Loading by file path keeps the dependency localized to this test module
 # (mirrors the pattern used in ``tests/unit/test_cookie_redaction.py``).
 _TESTS_DIR = Path(__file__).resolve().parent.parent
@@ -61,6 +58,7 @@ _vcr_config = _load_by_path("tests_vcr_config", "vcr_config.py")
 _freq_body_matcher: Callable[[Any, Any], bool] = _vcr_config._freq_body_matcher
 recompute_chunk_prefix: Callable[[str], str] = _cassette_patterns.recompute_chunk_prefix
 scrub_response: Callable[[dict[str, Any]], dict[str, Any]] = _vcr_config.scrub_response
+ResourceIdCassetteScrubber = _vcr_config.ResourceIdCassetteScrubber
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +75,19 @@ class _StubRequest:
 
     def __init__(self, body: Any) -> None:
         self.body = body
+
+
+def test_resource_id_scrubber_replaces_uuid_inside_percent_encoded_request() -> None:
+    """Encoded delimiters must not defeat request-side UUID redaction."""
+
+    scrubber = ResourceIdCassetteScrubber()
+    resource_id = "e7626843-661e-4e4d-b0a9-2bc4692f8a7f"
+    encoded = f"f.req=%22{resource_id}%5C&source-path=%2Fnotebook%2F{resource_id}"
+
+    scrubbed = scrubber.scrub_text(encoded)
+
+    assert resource_id not in scrubbed
+    assert scrubbed.count("00000000-0000-4000-8000-000000000001") == 2
 
 
 def _build_freq_body(params: list[Any]) -> str:
@@ -249,8 +260,8 @@ def test_recompute_chunk_prefix_uses_utf8_byte_count():
 
     For non-ASCII payloads (emoji, accented characters) ``len(payload)`` differs
     from ``len(payload.encode("utf-8"))``. The on-wire protocol uses byte count,
-    so the helper must too — matching what the decoder computes at
-    ``decoder.py:228``.
+    so the helper must too — matching what ``parse_chunked_response`` computes
+    in the decoder.
     """
     # The emoji takes 4 UTF-8 bytes but is 1 Python char.
     payload = '["🚀"]'  # len() == 5, len(.encode()) == 8
@@ -375,11 +386,9 @@ def test_scrub_response_does_not_corrupt_non_chunked_html_body():
 # 2. The ``before_record_response`` hook in vcr_config.py performs a
 #    defense-in-depth substitution when the env var is set, and is a no-op
 #    when unset.
-# 3. The chain-layer ``ErrorInjectionMiddleware`` substitutes the synthetic
-#    response on every chain invocation (short-circuiting batchexecute
-#    POSTs) and is only wired into the chain when the env var resolves to
-#    a valid mode. PR 12.6 lifted this from a transport-layer wrapper
-#    (``_SyntheticErrorTransport``, deleted in PR 12.9) into the chain.
+# 3. The runtime chain includes ``ErrorInjectionMiddleware`` with
+#    ``builder=None``; substitution behavior is covered by direct middleware
+#    tests.
 
 build_synthetic_error_response = _cassette_patterns.build_synthetic_error_response
 synthetic_error_cassette_name = _cassette_patterns.synthetic_error_cassette_name
@@ -475,7 +484,7 @@ def test_vcr_get_error_injection_mode_typo_returns_none(monkeypatch):
 def test_scrub_response_substitutes_when_env_var_set(monkeypatch, mode):
     """When the env var resolves to a valid mode, ``scrub_response`` rewrites
     the response shape to the canonical synthetic body, regardless of what
-    came in. This is the defense-in-depth layer below the transport wrapper."""
+    came in. This is the VCR hook layer used while recording."""
     monkeypatch.setenv(ERROR_INJECT_ENV_VAR, mode)
     incoming = {
         "status": {"code": 200, "message": "OK"},
@@ -493,8 +502,7 @@ def test_scrub_response_substitutes_when_env_var_set(monkeypatch, mode):
 
 
 def test_scrub_response_noop_when_env_var_unset(monkeypatch):
-    """With the env var absent, ``scrub_response`` is byte-for-byte the same
-    as before the synthetic-error transport landed — only sensitive-data scrubbing runs."""
+    """With the env var absent, only normal sensitive-data scrubbing runs."""
     monkeypatch.delenv(ERROR_INJECT_ENV_VAR, raising=False)
     incoming = {
         "status": {"code": 200, "message": "OK"},
@@ -509,7 +517,19 @@ def test_scrub_response_noop_when_env_var_unset(monkeypatch):
     assert b"original wire response" in out["body"]["string"]
 
 
-# --- (3) _core.py transport wrapper -----------------------------------------
+# --- (3) _web/transport/error_injection.py mode resolver ----------------------------------
+
+
+def test_web_error_guard_path_reexports_neutral_owner_by_identity() -> None:
+    from notebooklm._runtime import error_injection as neutral
+    from notebooklm._web.transport import error_injection as legacy
+
+    assert legacy.ERROR_INJECT_ENV_VAR is neutral.ERROR_INJECT_ENV_VAR
+    assert legacy._get_error_injection_mode is neutral._get_error_injection_mode
+    assert (
+        legacy._refuse_synthetic_error_outside_test_context
+        is neutral._refuse_synthetic_error_outside_test_context
+    )
 
 
 def test_core_get_error_injection_mode_unset(monkeypatch):
@@ -536,40 +556,36 @@ def test_core_get_error_injection_mode_typo_returns_none(monkeypatch):
     assert _get_error_injection_mode() is None
 
 
-# --- Session wiring after PR 12.6/12.9 -----------------------------------
+# --- Client-runtime wiring after PR 12.6/12.9 -----------------------------
 #
-# Pre-Tier-12 these tests exercised a ``_SyntheticErrorTransport`` that
-# wrapped the ``httpx.AsyncClient`` BELOW VCR. PR 12.6 lifted the
-# substitution into ``ErrorInjectionMiddleware`` (chain layer, ABOVE VCR)
-# and PR 12.9 deleted the legacy transport class entirely. The only
-# end-to-end assertion left at this layer is "the chain seed contains
-# ``ErrorInjectionMiddleware`` when the env var is set" — substitution
-# behavior is covered exhaustively by
+# The runtime chain includes ``ErrorInjectionMiddleware`` with ``builder=None``;
+# substitution behavior is covered by direct middleware tests in
 # ``tests/unit/test_error_injection_middleware.py``.
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["429", "5xx", "expired_csrf"])
 async def test_error_injection_middleware_present_when_env_var_set_in_session(monkeypatch, mode):
-    """When ``NOTEBOOKLM_VCR_RECORD_ERRORS`` is set, ``Session`` wires
-    ``ErrorInjectionMiddleware`` into the chain so each chain invocation
-    short-circuits with the synthetic shape."""
+    """Client startup wires pass-through ``ErrorInjectionMiddleware`` into the chain."""
     monkeypatch.setenv(ERROR_INJECT_ENV_VAR, mode)
-    from notebooklm._middleware.error_injection import ErrorInjectionMiddleware
+    from notebooklm._web.transport.middleware.error_injection import ErrorInjectionMiddleware
     from notebooklm.auth import AuthTokens
 
     auth = AuthTokens(cookies={"SID": "t"}, csrf_token="c", session_id="s")
     core = build_client_shell_for_tests(auth)
     try:
         await core.__aenter__()
-        assert core._collaborators.kernel.http_client is not None
+        assert core._web_runtime.kernel.http_client is not None
         # The middleware reads the env var per call; env-var-to-mode
         # resolution is covered by the dedicated middleware tests in
         # ``test_error_injection_middleware.py``.
-        assert any(isinstance(mw, ErrorInjectionMiddleware) for mw in core._composed.middlewares)
+        assert any(
+            isinstance(mw, ErrorInjectionMiddleware)
+            for mw in core._web_runtime.composed.middlewares
+        )
     finally:
-        if core._collaborators.kernel.http_client is not None:
-            await core._collaborators.kernel.get_http_client().aclose()
+        if core._web_runtime.kernel.http_client is not None:
+            await core._web_runtime.kernel.get_http_client().aclose()
 
 
 # --- (5) marker plumbing in tests/conftest.py --------------------------------

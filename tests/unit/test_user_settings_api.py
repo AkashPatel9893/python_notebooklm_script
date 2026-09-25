@@ -4,17 +4,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from notebooklm._settings import (
-    SettingsAPI,
+from notebooklm._web.settings import (
+    WebSettingsAPI,
     _extract_language,
     build_get_user_settings_params,
-    build_get_user_tier_params,
     extract_account_limits,
-    extract_account_tier,
 )
 from notebooklm.exceptions import UnknownRPCMethodError
 from notebooklm.rpc import RPCMethod
-from notebooklm.types import AccountLimits, AccountTier
+from notebooklm.types import AccountLimits, UserSettings
 
 
 def test_build_get_user_settings_params_returns_fresh_params():
@@ -26,31 +24,6 @@ def test_build_get_user_settings_params_returns_fresh_params():
     assert first[1] is not second[1]
 
 
-def test_build_get_user_tier_params_returns_fresh_params():
-    first = build_get_user_tier_params()
-    second = build_get_user_tier_params()
-
-    assert first == [
-        [
-            [
-                [None, "1", 627],
-                [None, None, None, None, None, None, None, None, None, [None, None, 2]],
-                1,
-            ]
-        ]
-    ]
-    assert first is not second
-    assert first[0] is not second[0]
-
-
-def test_get_user_tier_params_match_captured_request_shape():
-    params = build_get_user_tier_params()
-
-    assert params[0][0][0] == [None, "1", 627]
-    assert params[0][0][1][9] == [None, None, 2]
-    assert params[0][0][2] == 1
-
-
 def test_extract_account_limits_from_user_settings_response():
     limits = extract_account_limits([[None, [6, 500, 300, 500000, 2]]])
 
@@ -58,6 +31,7 @@ def test_extract_account_limits_from_user_settings_response():
         notebook_limit=500,
         source_limit=300,
         raw_limits=(6, 500, 300, 500000, 2),
+        tier=2,
     )
 
 
@@ -67,6 +41,24 @@ def test_extract_account_limits_preserves_raw_limit_positions():
     assert limits.notebook_limit == 100
     assert limits.source_limit is None
     assert limits.raw_limits == (True, 100, "source-limit", None)
+
+
+@pytest.mark.parametrize(
+    "block, expected_tier",
+    [
+        ([6, 500, 300, 500000, 2], 2),  # Pro (live-confirmed)
+        ([1, 100, 50, 500000, 1], 1),  # Standard/Free (live-confirmed)
+        ([6, 500, 300, 500000], None),  # legacy 4-element block → no tier
+        ([6, 500, 300, 500000, 99], 99),  # unmapped enum surfaces verbatim
+        ([6, 500, 300, 500000, 0], None),  # non-positive → None
+    ],
+)
+def test_extract_account_limits_reads_tier_from_index_4(block, expected_tier):
+    limits = extract_account_limits([[None, block]])
+
+    assert limits.tier == expected_tier
+    # raw_limits always preserves the untouched block regardless of tier parsing.
+    assert limits.raw_limits == tuple(block)
 
 
 @pytest.mark.parametrize(
@@ -87,82 +79,12 @@ def test_extract_account_limits_returns_empty_for_malformed_response(response):
     assert limits.source_limit is None
 
 
-def test_extract_account_tier_from_nested_response():
-    response = [[[[None, "1", 627], [[1613, [None, "NOTEBOOKLM_TIER_PRO"]]], 0]]]
-
-    assert extract_account_tier(response) == AccountTier(
-        tier="NOTEBOOKLM_TIER_PRO",
-        plan_name="Google AI Pro",
-    )
-
-
-def test_extract_account_tier_returns_empty_for_malformed_response():
-    assert extract_account_tier([[["no tier here"]]]) == AccountTier()
-
-
-@pytest.mark.parametrize("response", [None, []])
-def test_extract_account_tier_handles_empty_response(response):
-    assert extract_account_tier(response) == AccountTier()
-
-
-def test_extract_account_tier_preserves_unknown_tier_string():
-    response = [[["NOTEBOOKLM_TIER_FUTURE"]]]
-
-    assert extract_account_tier(response) == AccountTier(
-        tier="NOTEBOOKLM_TIER_FUTURE",
-        plan_name=None,
-    )
-
-
-@pytest.mark.parametrize(
-    ("tier_string", "expected_plan"),
-    [
-        ("NOTEBOOKLM_TIER_STANDARD", "Standard"),
-        ("NOTEBOOKLM_TIER_PLUS", "Google AI Plus"),
-        ("NOTEBOOKLM_TIER_PRO", "Google AI Pro"),
-        ("NOTEBOOKLM_TIER_PRO_DASHER_END_USER", "Google Workspace Pro"),
-        ("NOTEBOOKLM_TIER_ULTRA", "Google AI Ultra"),
-    ],
-)
-def test_extract_account_tier_maps_all_known_plan_names(tier_string, expected_plan):
-    """Every tier in ``_TIER_PLAN_NAMES`` must round-trip through the parser.
-
-    Locks in the plan-name lookup table so future tier additions can't
-    silently drift between :func:`extract_account_tier` and the
-    :class:`AccountTier` ``plan_name`` mapping.
-    """
-    response = [[[[None, "1", 627], [[1613, [None, tier_string]]], 0]]]
-
-    assert extract_account_tier(response) == AccountTier(
-        tier=tier_string,
-        plan_name=expected_plan,
-    )
-
-
-def test_extract_account_tier_against_recorded_cassette_shape():
-    """Parser handles the real GET_USER_TIER envelope recorded against the live API.
-
-    Mirrors the deeply-nested response shape captured by the live API in
-    ``tests/cassettes/settings_get_user_tier.yaml`` so the unit test fails
-    fast if the parser drifts away from the live wire format — without
-    requiring the cassette to be present.
-    """
-    # Shape mirrors ``[[[[None, "1", 627], [[1613, [None, "<tier>"]]], 0]]]``
-    # which is what the wrb.fr envelope's inner JSON decodes to.
-    response = [[[[None, "1", 627], [[1613, [None, "NOTEBOOKLM_TIER_PRO"]]], 0]]]
-
-    result = extract_account_tier(response)
-
-    assert result.tier == "NOTEBOOKLM_TIER_PRO"
-    assert result.plan_name == "Google AI Pro"
-
-
 @pytest.mark.asyncio
 async def test_get_account_limits_calls_user_settings_rpc():
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock(return_value=[[None, [6, 200, 100, 500000, 1]]]))
-    api = SettingsAPI(core.rpc_executor)
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
     limits = await api.get_account_limits()
 
@@ -170,6 +92,7 @@ async def test_get_account_limits_calls_user_settings_rpc():
         notebook_limit=200,
         source_limit=100,
         raw_limits=(6, 200, 100, 500000, 1),
+        tier=1,
     )
     core.rpc_executor.rpc_call.assert_awaited_once_with(
         RPCMethod.GET_USER_SETTINGS,
@@ -179,34 +102,46 @@ async def test_get_account_limits_calls_user_settings_rpc():
 
 
 @pytest.mark.asyncio
-async def test_get_account_tier_calls_user_tier_rpc():
-    from _fixtures.fake_core import make_fake_core
+async def test_get_user_settings_fetches_once_returns_both():
+    from tests._fixtures.fake_core import make_fake_core
 
-    core = make_fake_core(rpc_call=AsyncMock(return_value=[[[[None, "NOTEBOOKLM_TIER_STANDARD"]]]]))
-    api = SettingsAPI(core.rpc_executor)
+    # Realistic full GET response: limits at [0][1], language flags at [0][2].
+    response = [[None, [6, 200, 100, 500000, 1], [True, None, None, True, ["fr"]]]]
+    core = make_fake_core(rpc_call=AsyncMock(return_value=response))
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
-    tier = await api.get_account_tier()
+    settings = await api.get_user_settings()
 
-    assert tier == AccountTier(tier="NOTEBOOKLM_TIER_STANDARD", plan_name="Standard")
-    core.rpc_executor.rpc_call.assert_awaited_once_with(
-        RPCMethod.GET_USER_TIER,
-        [
-            [
-                [
-                    [None, "1", 627],
-                    [None, None, None, None, None, None, None, None, None, [None, None, 2]],
-                    1,
-                ]
-            ]
-        ],
-        source_path="/",
+    assert settings == UserSettings(
+        limits=AccountLimits(
+            notebook_limit=200, source_limit=100, raw_limits=(6, 200, 100, 500000, 1), tier=1
+        ),
+        output_language="fr",
     )
+    core.rpc_executor.rpc_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_get_user_settings_preserves_getter_contracts():
+    """The combined method keeps each getter's semantics: limits stay tolerant of a
+    malformed response, while language envelope drift still raises."""
+    from tests._fixtures.fake_core import make_fake_core
+
+    # Junk inner: no [0][1] limits shape, no [0][2] flags block.
+    core = make_fake_core(rpc_call=AsyncMock(return_value=[["junk"]]))
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
+
+    with pytest.raises(UnknownRPCMethodError):
+        await api.get_user_settings()
+
+    # Same response through the tolerant getter never raises.
+    assert await api.get_account_limits() == AccountLimits()
 
 
 # ---------------------------------------------------------------------------
 # Language extraction: optional-slot (None) vs envelope drift (raise).
 #
-# Wire shapes recorded against the live API (tests/cassettes/settings_*):
+# Wire shapes recorded against the live API (tests/cassettes/web/settings_*):
 #   GET_USER_SETTINGS inner: [[null,[..limits..],[true,null,null,true,["fr"]],
 #                             [[1]],[true,1,3,2]]]   -> language at [0][2][4][0]
 #   SET_USER_SETTINGS inner: [null,[..limits..],[true,null,null,true,["en"]],
@@ -370,12 +305,12 @@ def test_extract_language_set_prefix_envelope_drift_raises(response):
 
 @pytest.mark.asyncio
 async def test_get_output_language_returns_code_from_wire_shape():
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(
         rpc_call=AsyncMock(return_value=_get_response([True, None, None, True, ["zh_Hans"]]))
     )
-    api = SettingsAPI(core.rpc_executor)
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
     assert await api.get_output_language() == "zh_Hans"
 
@@ -383,10 +318,10 @@ async def test_get_output_language_returns_code_from_wire_shape():
 @pytest.mark.asyncio
 async def test_get_output_language_absent_language_returns_none():
     """End-to-end: a user with no language set gets ``None`` (no raise)."""
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock(return_value=_get_response([True, None, None, True])))
-    api = SettingsAPI(core.rpc_executor)
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
     assert await api.get_output_language() is None
 
@@ -394,10 +329,10 @@ async def test_get_output_language_absent_language_returns_none():
 @pytest.mark.asyncio
 async def test_get_output_language_envelope_drift_raises():
     """End-to-end: mandatory-envelope drift surfaces as a typed error."""
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock(return_value=[None]))
-    api = SettingsAPI(core.rpc_executor)
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
     with pytest.raises(UnknownRPCMethodError):
         await api.get_output_language()
@@ -405,12 +340,12 @@ async def test_get_output_language_envelope_drift_raises():
 
 @pytest.mark.asyncio
 async def test_set_output_language_returns_confirmed_code():
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(
         rpc_call=AsyncMock(return_value=_set_response([True, None, None, True, ["en"]]))
     )
-    api = SettingsAPI(core.rpc_executor)
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
     assert await api.set_output_language("en") == "en"
 
@@ -418,9 +353,9 @@ async def test_set_output_language_returns_confirmed_code():
 @pytest.mark.asyncio
 async def test_set_output_language_absent_confirmation_returns_none():
     """If the SET response omits the language slot, return ``None`` (no raise)."""
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     core = make_fake_core(rpc_call=AsyncMock(return_value=_set_response([True, None, None, True])))
-    api = SettingsAPI(core.rpc_executor)
+    api = WebSettingsAPI(core.rpc_executor, supervisor=core)
 
     assert await api.set_output_language("en") is None

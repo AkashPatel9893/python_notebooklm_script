@@ -97,12 +97,6 @@ class TestCreateNotebook:
         httpx_mock: HTTPXMock,
         build_rpc_response,
     ):
-        # ``create`` snapshots the notebook list before issuing
-        # CREATE_NOTEBOOK so the probe-then-retry wrapper can detect a
-        # server-side commit on a transport failure. Stub the baseline
-        # list response first; then the create response.
-        baseline_list = build_rpc_response(RPCMethod.LIST_NOTEBOOKS, [[]])
-        httpx_mock.add_response(content=baseline_list.encode())
         response = build_rpc_response(
             RPCMethod.CREATE_NOTEBOOK,
             [
@@ -130,9 +124,6 @@ class TestCreateNotebook:
         httpx_mock: HTTPXMock,
         build_rpc_response,
     ):
-        # see ``test_create_notebook`` for baseline-list rationale.
-        baseline_list = build_rpc_response(RPCMethod.LIST_NOTEBOOKS, [[]])
-        httpx_mock.add_response(content=baseline_list.encode())
         response = build_rpc_response(
             RPCMethod.CREATE_NOTEBOOK,
             ["Test Title", [], "id", "📓", None, [None, None, None, None, None, [1704067200, 0]]],
@@ -142,8 +133,7 @@ class TestCreateNotebook:
         async with NotebookLMClient(auth_tokens) as client:
             await client.notebooks.create("Test Title")
 
-        # The create request is the second one; assert it carries the
-        # CREATE_NOTEBOOK rpcid AND the title we passed in.
+        # The one create request carries both the rpcid and requested title.
         requests = httpx_mock.get_requests()
         create_requests = [r for r in requests if RPCMethod.CREATE_NOTEBOOK.value in str(r.url)]
         assert len(create_requests) == 1
@@ -194,11 +184,11 @@ class TestGetNotebook:
     ):
         """Regression: ``Notebook.sources_count`` is derived from ``data[1]``.
 
-        Pinned to the shape captured in ``tests/cassettes/notebooks_get.yaml``
+        Pinned to the shape captured in ``tests/cassettes/web/notebooks_get.yaml``
         (a real GET_NOTEBOOK response) — two PDF source entries at index 1.
         If Google ever moves the source list, this test fails before any
         downstream code that depends on ``sources_count`` (notably the
-        divergence warning in ``_notebooks.py``) silently produces a wrong
+        divergence warning in ``_notebook_metadata.py``) silently produces a wrong
         count.
         """
         response = build_rpc_response(
@@ -513,7 +503,7 @@ class TestGetNotebookFailures:
         httpx_mock.add_response(content=raw)
 
         async with NotebookLMClient(auth_tokens) as client:
-            with pytest.raises(RPCError, match="returned null result data"):
+            with pytest.raises(RPCError, match="empty result"):
                 await client.notebooks.get("nb_123")
 
     @pytest.mark.asyncio
@@ -529,7 +519,7 @@ class TestGetNotebookFailures:
         httpx_mock.add_response(content=raw)
 
         async with NotebookLMClient(auth_tokens) as client:
-            with pytest.raises(RPCError, match="returned null result data"):
+            with pytest.raises(RPCError, match="empty result"):
                 await client.notebooks.get("nb_123")
 
 
@@ -764,7 +754,7 @@ class TestShareEdgeCases:
         async with NotebookLMClient(auth_tokens) as client:
             url = client.notebooks.get_share_url("nb_123")
 
-        assert url == "https://notebooklm.google.com/notebook/nb_123"
+        assert url == "https://notebook.google.com/notebook/nb_123"
 
     @pytest.mark.asyncio
     async def test_get_share_url_with_artifact(
@@ -776,4 +766,4 @@ class TestShareEdgeCases:
         async with NotebookLMClient(auth_tokens) as client:
             url = client.notebooks.get_share_url("nb_123", artifact_id="art_789")
 
-        assert url == "https://notebooklm.google.com/notebook/nb_123?artifactId=art_789"
+        assert url == "https://notebook.google.com/notebook/nb_123?artifactId=art_789"

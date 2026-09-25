@@ -1,60 +1,56 @@
-"""Private artifact download service implementation."""
+"""Backend-neutral artifact asset transfer helpers."""
 
 from __future__ import annotations
 
 import asyncio
-import csv
-import json
 import logging
 import os
 import queue
 import tempfile
 import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from urllib.parse import ParseResult, unquote, urlparse
+from typing import Any, BinaryIO
+from urllib.parse import urlparse
 
 import httpx
 
-from .._mind_maps_api import extract_interactive_tree_leaf
-from .._row_adapters.notes import NoteRow
-from ..auth import load_httpx_cookies
-from ..exceptions import UnknownRPCMethodError, ValidationError
-from ..rpc import ArtifactTypeCode, RPCMethod, safe_index
-from ..types import (
-    Artifact,
-    ArtifactDownloadError,
-    ArtifactNotFoundError,
-    ArtifactNotReadyError,
-    ArtifactParseError,
-    ArtifactType,
+from .._auth.cookies import load_httpx_cookies
+from .._curl_cffi_transport import resolve_transport_factory
+from .._hop_credentials import CredentialPolicy, HopCredentials
+from .._http_client_factory import HttpClientFactories
+from ..exceptions import ArtifactDownloadError, AuthError
+from ._download_client import (
+    _download_display_host,
+    _is_trusted_download_host,
+    _make_download_client,
 )
-from .formatters import _extract_app_data, _format_interactive_content, _parse_data_table
-
-if TYPE_CHECKING:
-    from .._mind_map import NoteBackedMindMapService
-    from .._row_adapters.artifacts import ArtifactRow
-    from .._runtime.contracts import RpcCaller
-    from .listing import ArtifactListingService
+from ._guarded_transfer import (
+    MAX_DOWNLOAD_REDIRECTS,
+    TransferFailure,
+    TransferPolicy,
+    guarded_transfer,
+)
+from ._publication import AssetPublication, write_staging
+from ._redirect_guard import redirect_revalidation_hooks
 
 logger = logging.getLogger(__name__)
-
-_TRUSTED_DOWNLOAD_DOMAINS = (".google.com", ".googleusercontent.com", ".googleapis.com")
-
-# Bounded queue between the async chunk producer and the single writer
-# thread. Small enough to provide back-pressure (the producer awaits when
-# the writer falls behind) but large enough to keep the writer hot across
-# a brief read stall. 8 slots × 64 KiB ≈ 512 KiB of in-flight buffering.
 _DOWNLOAD_WRITER_QUEUE_SIZE = 8
 
-# ``_PREFETCH_NOTE`` — referenced by the per-method docstrings below. Each
-# ``download_<x>`` accepts an optional pre-fetched list (``artifacts_data`` raw
-# studio rows / ``artifacts`` typed list / ``mind_maps`` note-backed rows). When
-# supplied — the ``_app`` executor lists once to select the target and threads
-# what it already fetched — the method skips its own otherwise-redundant second
-# ``LIST_ARTIFACTS`` / ``GET_NOTES_AND_MIND_MAPS`` RPC; ``None`` re-lists as before
-# (issue #1488).
+
+def _credential_policy(cookies: Any) -> CredentialPolicy:
+    """Return the web default: the jar on trusted hops, otherwise no credential."""
+    cookie_jar = cookies if isinstance(cookies, httpx.Cookies) else httpx.Cookies(cookies)
+
+    async def credential_for(url: str) -> HopCredentials | None:
+        parsed = urlparse(url)
+        if parsed.scheme == "https" and _is_trusted_download_host(parsed.hostname):
+            return HopCredentials(cookies=cookie_jar)
+        return None
+
+    return credential_for
 
 
 async def _await_writer_exit(
@@ -64,38 +60,19 @@ async def _await_writer_exit(
 ) -> None:
     """Wait for a download writer thread to actually exit.
 
-    Plain ``await asyncio.to_thread(thread.join)`` is unsafe under
-    cancellation: if our awaiting task is cancelled, the await raises
-    ``CancelledError`` and we unwind even though the underlying
-    ``thread.join`` is still blocked on the thread. The thread keeps
-    running, which means the outer cleanup (``temp_file.unlink``)
-    races with the writer's still-open file handle.
+    A plain ``await asyncio.to_thread(thread.join)`` is unsafe under cancellation:
+    the await raises ``CancelledError`` and we unwind while the underlying join is
+    still blocked, so outer cleanup (``temp_file.unlink``) races the writer's
+    still-open file handle. ``asyncio.shield`` alone doesn't help (the await still
+    raises). The fix is a shield-loop that re-awaits the same shielded join task
+    until it completes; repeated cancellations only delay our re-raise, never the
+    writer's exit.
 
-    ``asyncio.shield`` alone doesn't fix this: it keeps the *inner*
-    join task alive across cancellation, but the *await* still raises
-    ``CancelledError`` and we unwind anyway. The fix is a shield-loop
-    that keeps re-awaiting the same shielded join task until it
-    actually completes. Repeated cancellations only delay our
-    re-raise, never the writer's exit.
-
-    Cancellation handling:
-
-    * Only ``asyncio.CancelledError`` is caught inside the loop — any
-      other exception from the shielded join (currently none in
-      practice, since ``Thread.join`` doesn't raise) propagates
-      immediately so we don't accidentally hide a real bug.
-    * The most recent ``CancelledError`` (if any) is preserved.
-    * If ``re_raise_cancel=True``, the helper re-raises that
-      ``CancelledError`` after the writer has fully exited. Callers
-      on the success path want this so an in-flight cancellation
-      isn't lost when the writer happens to finish first. Callers on
-      a cleanup-path (the producer's ``except`` block, which already
-      has an exception to re-raise) leave it at the default
-      ``False`` so we don't mask the original error with a second
-      cancellation.
-
-    Handles both the original join-vs-unlink race AND the follow-up case
-    where an initial fix could silently absorb task cancellation.
+    Only ``CancelledError`` is caught (any other join exception propagates). The
+    most recent ``CancelledError`` is preserved and, when ``re_raise_cancel`` is
+    set, re-raised after the writer exits — success-path callers want this so an
+    in-flight cancellation isn't lost; cleanup-path callers leave it ``False`` so
+    the original error isn't masked by a second cancellation.
     """
     join_task = asyncio.ensure_future(asyncio.to_thread(writer_thread.join))
     cancelled_error: asyncio.CancelledError | None = None
@@ -121,7 +98,7 @@ class DownloadResult:
     from "partial" via the properties below.
 
     `succeeded`: paths that downloaded cleanly (matches existing list[str] shape).
-    `failed`: (url, exception) tuples for transient httpx / ValueError failures.
+    `failed`: (url, exception) tuples for transport, URL parsing, or download failures.
     """
 
     succeeded: list[str] = field(default_factory=list)
@@ -140,582 +117,96 @@ def _load_httpx_cookies(storage_path: Any) -> Any:
     return load_httpx_cookies(path=storage_path)
 
 
-def _is_trusted_download_host(hostname: str | None) -> bool:
-    if hostname is None:
-        return False
-    hostname = unquote(hostname).lower()
-    if "\\" in hostname or "/" in hostname:
-        return False
-    return any(
-        hostname == domain.lstrip(".") or hostname.endswith(domain)
-        for domain in _TRUSTED_DOWNLOAD_DOMAINS
+def _reject_html_download(response: httpx.Response) -> None:
+    """Reject an HTML body served where a media file was expected (usually expired auth).
+
+    Shared by both ``download_url`` transport branches (curl_cffi buffered + httpx
+    streaming), which detect this the same way and raise the same guidance.
+    """
+    if "text/html" in response.headers.get("content-type", ""):
+        raise ArtifactDownloadError(
+            "media",
+            details="Download failed: received HTML instead of media file. "
+            "Authentication may have expired. Run 'notebooklm login'.",
+        )
+
+
+def _reject_empty_download(total_bytes: int) -> None:
+    """Reject a zero-byte download (the remote file is missing or empty)."""
+    if total_bytes == 0:
+        raise ArtifactDownloadError(
+            "media",
+            details="Download produced 0 bytes -- the remote file may be missing or empty",
+        )
+
+
+def _scrubbed_http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    """Build a cause that preserves status semantics without retaining a signed URL."""
+    request = httpx.Request("GET", "https://download.invalid/")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"HTTP {status_code}",
+        request=request,
+        response=response,
     )
 
 
-def _download_display_host(parsed: ParseResult) -> str:
-    if parsed.hostname is not None:
-        return parsed.hostname
-    return parsed.netloc.rsplit("@", 1)[-1]
-
-
-class ArtifactDownloadService:
-    """Download operations extracted from :class:`ArtifactsAPI`."""
+class AssetDownloadService(AssetPublication):
+    """Shared streaming, rejection, staging, and atomic-replace asset plane."""
 
     def __init__(
         self,
         *,
-        rpc: RpcCaller,
-        listing: ArtifactListingService,
-        mind_maps: NoteBackedMindMapService,
         storage_path: Path | None = None,
+        cookie_loader: Callable[[Any], Any] = _load_httpx_cookies,
+        credential_policy_factory: Callable[[Any], CredentialPolicy] = _credential_policy,
+        trusted_host: Callable[[str | None], bool] = _is_trusted_download_host,
+        chain: bool = True,
+        on_auth_error: Callable[[str, AuthError], Awaitable[None]] | None = None,
+        http_client_factories: HttpClientFactories | None = None,
     ) -> None:
-        self._rpc = rpc
-        self._listing = listing
-        self._mind_maps = mind_maps
+        self._http_client_factories = http_client_factories
         self._storage_path = storage_path
+        self._cookie_loader = cookie_loader
+        self._credential_policy_factory = credential_policy_factory
+        self._trusted_host = trusted_host
+        self._chain = chain
+        self._on_auth_error = on_auth_error
 
-    async def _list_raw(self, notebook_id: str) -> list[Any]:
-        """List raw artifacts through the injected listing service."""
-        return await self._listing.list_raw(notebook_id, rpc=self._rpc)
+    async def _load_cookies(self) -> Any:
+        return await asyncio.to_thread(self._cookie_loader, self._storage_path)
 
-    async def _list_mind_maps(self, notebook_id: str) -> list[Any]:
-        """List mind-map artifacts through the injected mind-map service."""
-        return await self._mind_maps.list_mind_maps(notebook_id)
-
-    async def _list_artifacts(
+    async def download_urls_batch(
         self,
-        notebook_id: str,
-        artifact_type: ArtifactType,
-    ) -> list[Artifact]:
-        """List typed artifacts using the download service's patchable seams."""
-        return await self._listing.list_artifacts(
-            notebook_id,
-            artifact_type,
-            list_raw=self._list_raw,
-            list_mind_maps=self._list_mind_maps,
-        )
-
-    def _select_artifact(
-        self,
-        candidates: list[Any],
-        artifact_id: str | None,
-        type_name: str,
-        no_result_error_key: str,
+        urls_and_paths: list[tuple[str, str]],
         *,
-        type_code: ArtifactTypeCode,
-    ) -> ArtifactRow:
-        """Select one completed artifact candidate as an adapter row."""
-        return self._listing.select_completed_artifact_row(
-            candidates,
-            artifact_id,
-            type_name,
-            no_result_error_key,
-            type_code=type_code,
-        )
-
-    async def _get_artifact_content(self, notebook_id: str, artifact_id: str) -> str | None:
-        """Fetch interactive artifact HTML through the runtime RPC seam."""
-        result = await self._rpc.rpc_call(
-            RPCMethod.GET_INTERACTIVE_HTML,
-            [artifact_id],
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        if result is None:
-            return None
-        return safe_index(
-            result,
-            0,
-            9,
-            0,
-            method_id=RPCMethod.GET_INTERACTIVE_HTML.value,
-            source="_artifact_downloads._get_artifact_content",
-        )
-
-    async def _get_interactive_mind_map_tree(
-        self, notebook_id: str, artifact_id: str
-    ) -> str | None:
-        """Fetch the interactive mind-map JSON tree string.
-
-        The interactive (studio-artifact) mind map exposes its ``{"name",
-        "children"}`` node tree at ``[0][9][3]`` of the ``GET_INTERACTIVE_HTML``
-        response (vs the HTML body at ``[0][9][0]``). Returns the raw JSON
-        string, or ``None`` when the response is empty / not yet populated.
-        """
-        result = await self._rpc.rpc_call(
-            RPCMethod.GET_INTERACTIVE_HTML,
-            [artifact_id],
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        # ``extract_interactive_tree_leaf`` re-raises ``UnknownRPCMethodError``
-        # on genuine ``[0][9]`` shape drift (failing loud like the sibling HTML
-        # accessor ``_get_artifact_content``) while tolerating an absent ``[3]``
-        # leaf as the legitimate "tree not populated yet" window (issue #1270).
-        tree_json = extract_interactive_tree_leaf(
-            result, source="_artifact_downloads._get_interactive_mind_map_tree"
-        )
-        return tree_json if isinstance(tree_json, str) else None
-
-    async def download_audio(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        *,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download an Audio Overview to a file (``artifacts_data``: see ``_PREFETCH_NOTE``)."""
-        if artifacts_data is None:
-            artifacts_data = await self._list_raw(notebook_id)
-
-        audio_art = self._select_artifact(
-            artifacts_data,
-            artifact_id,
-            "Audio",
-            "audio",
-            type_code=ArtifactTypeCode.AUDIO,
-        )
-
-        try:
-            url = audio_art.audio_url
-        except UnknownRPCMethodError as e:
-            raise ArtifactParseError(
-                "audio",
-                artifact_id=artifact_id,
-                details=f"Failed to parse structure: {e}",
-                cause=e,
-            ) from e
-        if not url:
-            raise ArtifactParseError(
-                "audio",
-                artifact_id=artifact_id,
-                details="Could not extract download URL from artifact metadata",
-            )
-
-        return await self.download_url(url, output_path)
-
-    async def download_video(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        *,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download a Video Overview to a file (``artifacts_data``: see ``_PREFETCH_NOTE``)."""
-        if artifacts_data is None:
-            artifacts_data = await self._list_raw(notebook_id)
-
-        # Note: distinct error keys preserved — specific-ID miss raises
-        # "video" (from type_name="Video"); empty-list raises
-        # "video_overview" (from type_name_lower).
-        video_art = self._select_artifact(
-            artifacts_data,
-            artifact_id,
-            "Video",
-            "video_overview",
-            type_code=ArtifactTypeCode.VIDEO,
-        )
-
-        try:
-            url = video_art.video_url
-        except UnknownRPCMethodError as e:
-            raise ArtifactParseError(
-                "video_artifact",
-                artifact_id=artifact_id,
-                details=f"Failed to parse structure: {e}",
-                cause=e,
-            ) from e
-        if not url:
-            raise ArtifactParseError(
-                "video_artifact",
-                artifact_id=artifact_id,
-                details="Could not extract download URL from artifact metadata",
-            )
-
-        return await self.download_url(url, output_path)
-
-    async def download_infographic(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        *,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download an Infographic to a file (``artifacts_data``: see ``_PREFETCH_NOTE``)."""
-        if artifacts_data is None:
-            artifacts_data = await self._list_raw(notebook_id)
-
-        info_art = self._select_artifact(
-            artifacts_data,
-            artifact_id,
-            "Infographic",
-            "infographic",
-            type_code=ArtifactTypeCode.INFOGRAPHIC,
-        )
-
-        try:
-            url = info_art.infographic_url
-            if not url:
-                raise ArtifactParseError(
-                    "infographic",
-                    artifact_id=artifact_id,
-                    details="Could not find metadata",
-                )
-            return await self.download_url(url, output_path)
-
-        except (IndexError, TypeError, UnknownRPCMethodError) as e:
-            raise ArtifactParseError(
-                "infographic",
-                artifact_id=artifact_id,
-                details=f"Failed to parse structure: {e}",
-                cause=e,
-            ) from e
-
-    async def download_slide_deck(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        output_format: str = "pdf",
-        *,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download a slide deck as PDF or PPTX (``artifacts_data``: see ``_PREFETCH_NOTE``)."""
-        if output_format not in ("pdf", "pptx"):
-            raise ValidationError(f"Invalid format '{output_format}'. Must be 'pdf' or 'pptx'.")
-
-        if artifacts_data is None:
-            artifacts_data = await self._list_raw(notebook_id)
-
-        slide_art = self._select_artifact(
-            artifacts_data,
-            artifact_id,
-            "Slide deck",
-            "slide_deck",
-            type_code=ArtifactTypeCode.SLIDE_DECK,
-        )
-
-        try:
-            if output_format == "pptx":
-                url = slide_art.slide_deck_pptx_url
-                if not url:
-                    raise ArtifactDownloadError(
-                        "slide_deck", details="PPTX URL not available in artifact data"
-                    )
-            else:
-                url = slide_art.slide_deck_pdf_url
-                if not url:
-                    raise ArtifactDownloadError(
-                        "slide_deck",
-                        details=f"Could not find {output_format.upper()} download URL",
-                    )
-
-        except UnknownRPCMethodError as e:
-            raise ArtifactParseError(
-                "slide_deck",
-                artifact_id=artifact_id,
-                details=f"Failed to parse structure: {e}",
-                cause=e,
-            ) from e
-
-        return await self.download_url(url, output_path)
-
-    async def download_interactive_artifact(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None,
-        output_format: str,
-        artifact_type: str,
-        *,
-        artifacts: list[Artifact] | None = None,
-    ) -> str:
-        """Download quiz or flashcard artifact.
-
-        ``artifacts`` is the optional pre-fetched *typed* list of the matching
-        ``list_type`` (see ``_PREFETCH_NOTE``); this method still filters it to
-        completed entries and id-matches within it.
-        """
-        valid_formats = ("json", "markdown", "html")
-        if output_format not in valid_formats:
-            raise ValidationError(
-                f"Invalid output_format: {output_format!r}. Use one of: {', '.join(valid_formats)}"
-            )
-
-        is_quiz = artifact_type == "quiz"
-        default_title = "Untitled Quiz" if is_quiz else "Untitled Flashcards"
-        list_type = ArtifactType.QUIZ if is_quiz else ArtifactType.FLASHCARDS
-
-        if artifacts is None:
-            artifacts = await self._list_artifacts(notebook_id, list_type)
-        completed = [a for a in artifacts if a.is_completed]
-        if not completed:
-            raise ArtifactNotReadyError(artifact_type)
-
-        completed.sort(key=lambda a: a.created_at.timestamp() if a.created_at else 0, reverse=True)
-
-        if artifact_id:
-            artifact = next((a for a in completed if a.id == artifact_id), None)
-            if not artifact:
-                raise ArtifactNotFoundError(artifact_id, artifact_type=artifact_type)
-        else:
-            artifact = completed[0]
-
-        html_content = await self._get_artifact_content(notebook_id, artifact.id)
-        if not html_content:
-            raise ArtifactDownloadError(artifact_type, details="Failed to fetch content")
-
-        try:
-            app_data = _extract_app_data(html_content)
-        except json.JSONDecodeError as e:
-            raise ArtifactParseError(
-                artifact_type, details=f"Failed to parse content: {e}", cause=e
-            ) from e
-
-        title = artifact.title or default_title
-        content = _format_interactive_content(app_data, title, output_format, html_content, is_quiz)
-
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        def _write_file() -> None:
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-        await asyncio.to_thread(_write_file)
-        return output_path
-
-    async def download_report(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        *,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download a report artifact as markdown (``artifacts_data``: see ``_PREFETCH_NOTE``)."""
-        if artifacts_data is None:
-            artifacts_data = await self._list_raw(notebook_id)
-
-        report_art = self._select_artifact(
-            artifacts_data,
-            artifact_id,
-            "Report",
-            "report",
-            type_code=ArtifactTypeCode.REPORT,
-        )
-
-        try:
-            markdown_content = report_art.report_markdown
-
-            if not isinstance(markdown_content, str):
-                raise ArtifactParseError(
-                    "report_content",
-                    artifact_id=artifact_id,
-                    details="Invalid structure",
-                )
-
-            output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-            def _write_markdown() -> None:
-                output.write_text(markdown_content, encoding="utf-8")
-
-            await asyncio.to_thread(_write_markdown)
-            return str(output)
-
-        except (IndexError, TypeError, UnknownRPCMethodError) as e:
-            raise ArtifactParseError(
-                "report",
-                artifact_id=artifact_id,
-                details=f"Failed to parse structure: {e}",
-                cause=e,
-            ) from e
-
-    async def download_mind_map(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        *,
-        mind_maps: list[Any] | None = None,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download a mind map as JSON (note-backed or interactive kind).
-
-        ``mind_maps`` (note-backed rows) and ``artifacts_data`` (raw studio rows,
-        used only by the interactive-mind-map branch) are optional pre-fetched
-        lists; see ``_PREFETCH_NOTE``. Each is fetched on demand when ``None``.
-        """
-        mind_maps_service = self._mind_maps
-
-        # Fetch the note-backed list first: it is the primary backing for this
-        # method, so an explicit id that resolves here (the happy path) avoids
-        # the extra _list_raw artifact-collection network call entirely.
-        if mind_maps is None:
-            mind_maps = await mind_maps_service.list_mind_maps(notebook_id)
-
-        # The JSON tree string to write — sourced from the note content for
-        # note-backed maps, or from GET_INTERACTIVE_HTML for interactive ones.
-        json_string: str | None = None
-
-        if artifact_id:
-            # Read the row id through the ``NoteRow`` adapter seam rather than a
-            # raw ``mm[0]`` index so a numeric / non-str id is ``str``-coerced
-            # consistently with the rest of the mind-map path (issue #1270) and
-            # any future row-shape change is absorbed in one place.
-            mind_map = next((mm for mm in mind_maps if NoteRow(mm).id == artifact_id), None)
-            if mind_map is not None:
-                json_string = mind_maps_service.extract_content(mind_map)
-            else:
-                # The id is not a note-backed mind map. Interactive
-                # (studio-artifact) mind maps live in the artifact collection,
-                # not the note-backed list — fetch the tree there so both kinds
-                # download to the same JSON shape (issue #1256). Reuse the
-                # caller-provided ``artifacts_data`` when present to avoid a
-                # redundant second ``LIST_ARTIFACTS``.
-                if artifacts_data is None:
-                    artifacts_data = await self._list_raw(notebook_id)
-                interactive = False
-                for row in artifacts_data:
-                    if not isinstance(row, list):
-                        continue
-                    artifact = Artifact.from_api_response(row)
-                    if artifact.id == artifact_id and artifact.is_interactive_mind_map:
-                        interactive = True
-                        break
-                if interactive:
-                    json_string = await self._get_interactive_mind_map_tree(
-                        notebook_id, artifact_id
-                    )
-                    if json_string is None:
-                        # Found the interactive artifact but its tree is not yet
-                        # readable (generation still settling).
-                        raise ArtifactNotReadyError("mind_map")
-                elif not mind_maps:
-                    # Not interactive either: preserve the prior error precedence
-                    # — an empty note-backed list reads as "not ready", a
-                    # populated list with no matching id reads as "not found".
-                    raise ArtifactNotReadyError("mind_map")
-                else:
-                    raise ArtifactNotFoundError(artifact_id, artifact_type="mind_map")
-        else:
-            # No explicit id: the first note-backed mind map (if any) is used.
-            if not mind_maps:
-                raise ArtifactNotReadyError("mind_map")
-            json_string = mind_maps_service.extract_content(mind_maps[0])
-
-        try:
-            if json_string is None:
-                raise ArtifactParseError("mind_map_content", details="Invalid structure")
-
-            json_data = json.loads(json_string)
-
-            output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-            def _write_json() -> None:
-                with output.open("w", encoding="utf-8") as f:
-                    json.dump(json_data, f, indent=2, ensure_ascii=False)
-
-            await asyncio.to_thread(_write_json)
-            return str(output)
-
-        except (IndexError, TypeError, json.JSONDecodeError) as e:
-            raise ArtifactParseError(
-                "mind_map", details=f"Failed to parse structure: {e}", cause=e
-            ) from e
-
-    async def download_data_table(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        *,
-        artifacts_data: list[Any] | None = None,
-    ) -> str:
-        """Download a data table as CSV (``artifacts_data``: see ``_PREFETCH_NOTE``)."""
-        if artifacts_data is None:
-            artifacts_data = await self._list_raw(notebook_id)
-
-        table_art = self._select_artifact(
-            artifacts_data,
-            artifact_id,
-            "Data table",
-            # Unified to "data_table" so both empty-list and explicit-id-miss
-            # paths raise ArtifactNotReadyError with the same artifact_type key.
-            "data_table",
-            type_code=ArtifactTypeCode.DATA_TABLE,
-        )
-
-        try:
-            raw_data = table_art.data_table_raw_payload
-            headers, rows = _parse_data_table(raw_data)
-
-            output = Path(output_path)
-            output.parent.mkdir(parents=True, exist_ok=True)
-
-            def _write_csv() -> None:
-                with output.open("w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(headers)
-                    writer.writerows(rows)
-
-            await asyncio.to_thread(_write_csv)
-
-            return str(output)
-
-        except (IndexError, TypeError, ValueError, UnknownRPCMethodError) as e:
-            raise ArtifactParseError(
-                "data_table",
-                artifact_id=artifact_id,
-                details=f"Failed to parse structure: {e}",
-                cause=e,
-            ) from e
-
-    async def download_quiz(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        output_format: str = "json",
-        *,
-        artifacts: list[Artifact] | None = None,
-    ) -> str:
-        """Download quiz questions."""
-        return await self.download_interactive_artifact(
-            notebook_id, output_path, artifact_id, output_format, "quiz", artifacts=artifacts
-        )
-
-    async def download_flashcards(
-        self,
-        notebook_id: str,
-        output_path: str,
-        artifact_id: str | None = None,
-        output_format: str = "json",
-        *,
-        artifacts: list[Artifact] | None = None,
-    ) -> str:
-        """Download flashcard deck."""
-        return await self.download_interactive_artifact(
-            notebook_id, output_path, artifact_id, output_format, "flashcards", artifacts=artifacts
-        )
-
-    async def download_urls_batch(self, urls_and_paths: list[tuple[str, str]]) -> DownloadResult:
+        credential_policy_factory: Callable[[Any], CredentialPolicy] | None = None,
+        on_auth_error: Callable[[str, AuthError], Awaitable[None]] | None = None,
+    ) -> DownloadResult:
         """Download multiple files using httpx with proper cookie handling."""
         result = DownloadResult()
+        policy_factory = credential_policy_factory or self._credential_policy_factory
+        auth_error_hook = on_auth_error or self._on_auth_error
 
-        cookies = await asyncio.to_thread(_load_httpx_cookies, self._storage_path)
+        cookies = await self._load_cookies()
+        self._assert_active()
+        credential_for: CredentialPolicy | None = None
 
-        async with httpx.AsyncClient(
-            cookies=cookies,
-            follow_redirects=True,
+        async def selected_credential_for(url: str) -> HopCredentials | None:
+            assert credential_for is not None
+            return await credential_for(url)
+
+        client, _guarded_get = _make_download_client(
+            cookies,
             timeout=60.0,
-        ) as client:
+            credential_for=selected_credential_for,
+            trusted_host=self._trusted_host,
+            http_client_factories=self._http_client_factories,
+        )
+        first_auth_error: AuthError | None = None
+        async with self._client_scope(client):
             for url, output_path in urls_and_paths:
+                credential_for = self._guard_credentials(policy_factory(cookies))
                 display_host = ""
                 parsed_path = ""
                 try:
@@ -726,21 +217,21 @@ class ArtifactDownloadService:
                         raise ArtifactDownloadError(
                             "media", details=f"Download URL must use HTTPS: {url[:80]}"
                         )
-                    if not _is_trusted_download_host(parsed.hostname):
+                    if not self._trusted_host(parsed.hostname):
                         raise ArtifactDownloadError(
                             "media",
                             details=f"Untrusted download domain: {display_host}",
                         )
 
-                    response = await client.get(url)
+                    response = await _guarded_get(url)
                     if response.status_code in (401, 403):
-                        raise ArtifactDownloadError(
-                            "media",
-                            details=(
-                                f"Authentication failed (HTTP {response.status_code}) "
-                                f"on {display_host}{parsed.path}"
-                            ),
+                        auth_error = AuthError(
+                            f"Authentication failed (HTTP {response.status_code}) "
+                            f"on {display_host}{parsed.path}; run `notebooklm login`."
                         )
+                        if self._chain:
+                            raise auth_error from _scrubbed_http_status_error(response.status_code)
+                        raise auth_error from None
                     response.raise_for_status()
 
                     content_type = response.headers.get("content-type", "")
@@ -749,9 +240,10 @@ class ArtifactDownloadService:
                             "media", details="Received HTML instead of media file"
                         )
 
-                    output_file = Path(output_path)
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
-                    await asyncio.to_thread(output_file.write_bytes, response.content)
+                    await self.write_file(
+                        output_path,
+                        partial(Path.write_bytes, data=response.content),
+                    )
                     result.succeeded.append(output_path)
                     logger.debug(
                         "Downloaded %s%s (%d bytes)",
@@ -760,6 +252,12 @@ class ArtifactDownloadService:
                         len(response.content),
                     )
 
+                except AuthError as error:
+                    if auth_error_hook is not None:
+                        await auth_error_hook(url, error)
+                    if first_auth_error is None:
+                        first_auth_error = error
+                    result.failed.append((url, AuthError(str(error))))
                 except (httpx.HTTPError, ValueError, ArtifactDownloadError) as e:
                     # ``ArtifactDownloadError`` covers the policy violations
                     # raised earlier in this block (non-HTTPS scheme,
@@ -781,7 +279,74 @@ class ArtifactDownloadService:
                     )
                     result.failed.append((url, e))
 
+        if first_auth_error is not None:
+            raise first_auth_error
         return result
+
+    async def _download_guarded_urls_batch(
+        self,
+        client: Any,
+        urls_and_paths: list[tuple[str, str]],
+        *,
+        policy: TransferPolicy,
+        credential_policy_factory: Callable[[Any], CredentialPolicy],
+        on_auth_error: Callable[[str, AuthError], Awaitable[None]] | None,
+        prepare_url: Callable[[str, TransferPolicy], str | None],
+        validate_url: Callable[[str], str | None],
+        safe_host: Callable[[str], str],
+        assert_active: Callable[[], None],
+        failure_for: Callable[[TransferFailure], Exception],
+    ) -> DownloadResult:
+        """Run the neutral manual-transfer batch with fresh credentials per URL."""
+
+        result = DownloadResult()
+        first_auth_error: AuthError | None = None
+        for url, output_path in urls_and_paths:
+            credential_for = credential_policy_factory(None)
+            try:
+                prepared_url = prepare_url(url, policy)
+                outcome = (
+                    TransferFailure("url_policy", safe_host(url), 0)
+                    if prepared_url is None
+                    else await guarded_transfer(
+                        client,
+                        prepared_url,
+                        output_path,
+                        policy=policy,
+                        credential_for=credential_for,
+                        validate_url=validate_url,
+                        safe_host=safe_host,
+                        assert_active=assert_active,
+                        chain=self._chain,
+                    )
+                )
+                if isinstance(outcome, TransferFailure):
+                    result.failed.append((url, failure_for(outcome)))
+                else:
+                    result.succeeded.append(outcome.output_path)
+            except AuthError as error:
+                if on_auth_error is not None:
+                    await on_auth_error(url, error)
+                if first_auth_error is None:
+                    first_auth_error = error
+                # Receipts must not retain a raw response or a cause-bearing error.
+                result.failed.append((url, AuthError(str(error))))
+
+        if first_auth_error is not None:
+            if self._chain:
+                raise first_auth_error
+            raise first_auth_error from None
+        return result
+
+    def _create_download_staging(self, destination: Path) -> Path:
+        fd, name = tempfile.mkstemp(
+            dir=destination.parent, prefix=destination.name + ".", suffix=".tmp"
+        )
+        os.close(fd)
+        return Path(name)
+
+    def _open_download_staging(self, path: Path) -> BinaryIO:
+        return open(path, "wb")
 
     async def download_url(self, url: str, output_path: str) -> str:
         """Download a file from URL using streaming with proper cookie handling."""
@@ -789,7 +354,7 @@ class ArtifactDownloadService:
         display_host = _download_display_host(parsed)
         if parsed.scheme != "https":
             raise ArtifactDownloadError("media", details=f"Download URL must use HTTPS: {url[:80]}")
-        if not _is_trusted_download_host(parsed.hostname):
+        if not self._trusted_host(parsed.hostname):
             raise ArtifactDownloadError(
                 "media",
                 details=f"Untrusted download domain: {display_host}",
@@ -798,61 +363,79 @@ class ArtifactDownloadService:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        fd, temp_path_str = tempfile.mkstemp(
-            dir=output_file.parent,
-            prefix=output_file.name + ".",
-            suffix=".tmp",
-        )
-        os.close(fd)
-        temp_file = Path(temp_path_str)
+        temp_file = self._create_download_staging(output_file)
 
         try:
-            cookies = await asyncio.to_thread(_load_httpx_cookies, self._storage_path)
+            cookies = await self._load_cookies()
+            self._assert_active()
+            credential_for = self._guard_credentials(self._credential_policy_factory(cookies))
             timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=30.0)
+            auth_failure_status: int | None = None
 
             try:
-                async with httpx.AsyncClient(  # noqa: SIM117
-                    cookies=cookies,
-                    follow_redirects=True,
-                    timeout=timeout,
+                # Transport selection is inlined here (rather than via
+                # _make_download_client) because the httpx path below streams to
+                # disk via the producer/consumer writer queue; _make_download_client
+                # returns a buffering GET suited to download_urls_batch.
+                factory = resolve_transport_factory()
+                uses_httpx = factory is httpx.AsyncClient
+                if self._http_client_factories is not None:
+                    factory = self._http_client_factories.select(factory)
+                if not uses_httpx:
+                    # curl_cffi opt-in: libcurl's internal redirect loop can't host
+                    # the #1521 per-hop event hook, so use the manual guarded GET
+                    # (same trusted-host allowlist, re-checked per hop). It buffers
+                    # rather than streams — acceptable for the opt-in transport,
+                    # which already buffers RPC and upload bodies.
+                    async with self._client_scope(  # noqa: SIM117
+                        factory(cookies=None, follow_redirects=False, timeout=timeout)
+                    ) as client:
+                        response = await client.get_guarded(
+                            url,
+                            is_trusted_host=self._trusted_host,
+                            credential_for=credential_for,
+                            max_redirects=MAX_DOWNLOAD_REDIRECTS,
+                        )
+                        response.raise_for_status()
+                        _reject_html_download(response)
+                        _reject_empty_download(len(response.content))
+                        await write_staging(
+                            temp_file, lambda path: path.write_bytes(response.content)
+                        )
+                    self._assert_active()
+                    self._publish_download(temp_file, output_file)
+                    logger.debug(
+                        "Downloaded %s%s (%d bytes)",
+                        display_host,
+                        parsed.path,
+                        len(response.content),
+                    )
+                    return output_path
+                async with self._client_scope(  # noqa: SIM117
+                    factory(
+                        cookies=cookies,
+                        follow_redirects=True,
+                        max_redirects=MAX_DOWNLOAD_REDIRECTS,
+                        timeout=timeout,
+                        event_hooks=redirect_revalidation_hooks(
+                            self._trusted_host, credential_for
+                        ),  # #1521 + per-hop credentials
+                    )
                 ) as client:
                     async with client.stream("GET", url) as response:
                         response.raise_for_status()
+                        _reject_html_download(response)
 
-                        content_type = response.headers.get("content-type", "")
-                        if "text/html" in content_type:
-                            raise ArtifactDownloadError(
-                                "media",
-                                details="Download failed: received HTML instead of media file. "
-                                "Authentication may have expired. Run 'notebooklm login'.",
-                            )
-
-                        # Producer/consumer split: a single dedicated
-                        # writer thread drains a bounded queue and writes
-                        # to ``temp_file``. Compared to the legacy
-                        # per-chunk ``asyncio.to_thread(f.write, chunk)``,
-                        # this avoids thousands of thread-pool allocations
-                        # for multi-GB downloads.
-                        #
-                        # The writer runs on a dedicated ``threading.Thread``
-                        # rather than ``asyncio.to_thread`` so it does NOT
-                        # tie up a slot in asyncio's default executor pool.
-                        # With many concurrent downloads, default-executor
-                        # saturation by long-lived writers (each blocking
-                        # on ``chunk_q.get()``) could deadlock producers
-                        # trying to ``put`` via ``to_thread``.
-                        #
-                        # Producer puts use ``put_nowait`` first and only
-                        # fall back to ``to_thread(put, ...)`` when the
-                        # queue is full, minimizing default-executor
-                        # pressure during normal flow.
-                        #
-                        # End-of-stream is signalled with a ``None``
-                        # sentinel. Writer-side failures are surfaced via
-                        # ``writer_error`` and an early ``writer_failed``
-                        # ``threading.Event`` so the producer can short-
-                        # circuit BEFORE the writer's drain completes,
-                        # avoiding wasted network reads.
+                        # Producer/consumer split: one dedicated ``threading.Thread``
+                        # (not ``asyncio.to_thread``, which would tie up a default-
+                        # executor slot and risk deadlocking producers under many
+                        # concurrent downloads) drains a bounded queue to
+                        # ``temp_file``, avoiding per-chunk thread-pool churn on
+                        # multi-GB files. Producer puts use ``put_nowait`` first,
+                        # falling back to ``to_thread(put)`` only when full. EOF is a
+                        # ``None`` sentinel; writer failures surface via
+                        # ``writer_error`` + an early ``writer_failed`` Event so the
+                        # producer can short-circuit before the drain completes.
                         chunk_q: queue.Queue[bytes | None] = queue.Queue(
                             maxsize=_DOWNLOAD_WRITER_QUEUE_SIZE
                         )
@@ -860,25 +443,14 @@ class ArtifactDownloadService:
                         writer_error: list[BaseException] = []
 
                         def _writer_loop() -> None:
-                            # If the writer raises (e.g. OSError on
-                            # ``fh.write``), the bounded queue may have a
-                            # producer parked in ``q.put`` waiting for a
-                            # consumer. Without draining, that producer
-                            # hangs forever because we are the only
-                            # consumer. The ``finally`` drains pending
-                            # items via ``get_nowait`` so blocked puts
-                            # complete and the producer can observe the
-                            # failure signal on its next iteration.
-                            #
-                            # ``writer_failed`` is set in the ``except``
-                            # BEFORE the drain so the producer's
-                            # short-circuit check fires as early as
-                            # possible — the drain itself can run for a
-                            # few milliseconds clearing the queue, during
-                            # which the producer would otherwise read and
-                            # discard network bytes pointlessly.
+                            # On writer failure the bounded queue may have a producer
+                            # parked in ``q.put``; the ``finally`` drains via
+                            # ``get_nowait`` so those puts complete and the producer
+                            # can observe the failure. ``writer_failed`` is set in
+                            # ``except`` BEFORE the drain so the producer short-
+                            # circuits as early as possible.
                             try:
-                                with open(temp_file, "wb") as fh:
+                                with self._open_download_staging(temp_file) as fh:
                                     while True:
                                         item = chunk_q.get()
                                         if item is None:
@@ -911,20 +483,15 @@ class ArtifactDownloadService:
                         total_bytes = 0
                         try:
                             async for chunk in response.aiter_bytes(chunk_size=65536):
+                                self._assert_active()
                                 if writer_failed.is_set():
-                                    # Writer raised mid-stream. Stop
-                                    # reading — further network bytes
-                                    # would just be discarded by the
-                                    # drain. The original error is
-                                    # re-raised via ``writer_error[0]``
-                                    # below.
+                                    # Writer raised mid-stream: stop reading (further
+                                    # bytes would just be drained); error re-raised
+                                    # via ``writer_error`` below.
                                     break
-                                # ``put_nowait`` avoids a ``to_thread``
-                                # round-trip when the queue has space
-                                # (the common case under balanced flow);
-                                # fall back to ``to_thread`` only when
-                                # the queue is full so the loop suspends
-                                # cleanly under back-pressure.
+                                # ``put_nowait`` avoids a ``to_thread`` round-trip
+                                # when the queue has space; fall back only when full
+                                # so the loop suspends cleanly under back-pressure.
                                 try:
                                     chunk_q.put_nowait(chunk)
                                 except queue.Full:
@@ -935,30 +502,20 @@ class ArtifactDownloadService:
                                     chunk_q.put_nowait(None)
                                 except queue.Full:
                                     await asyncio.to_thread(chunk_q.put, None)
-                            # Join surfaces any exception the writer
-                            # captured. ``_await_writer_exit`` shield-
-                            # loops until the writer actually exits so
-                            # the outer cleanup never races with the
-                            # still-open file handle. ``re_raise_cancel
-                            # =True`` ensures a cancellation that
-                            # arrived while we were waiting for the
-                            # writer isn't lost when the writer happens
-                            # to finish first.
+                            # ``_await_writer_exit`` shield-loops until the writer
+                            # exits (so cleanup never races its file handle) and
+                            # surfaces any captured exception; ``re_raise_cancel``
+                            # preserves a cancellation that arrived mid-wait.
                             await _await_writer_exit(writer_thread, re_raise_cancel=True)
                             if writer_error:
-                                raise writer_error[0]
+                                raise next(iter(writer_error))  # one-slot exception box
                         except BaseException:
-                            # On producer-side failure (network error,
-                            # cancellation, HTML payload), make sure the
-                            # writer sees a sentinel and exits — even if
-                            # the queue is currently saturated. A bare
-                            # ``put_nowait(None)`` would raise
-                            # ``queue.Full`` and leave the writer parked
-                            # in ``q.get`` forever; instead drop one item
-                            # to make room, then put the sentinel. At
-                            # most two iterations are needed: the writer
-                            # is the only consumer, so once a slot opens
-                            # nothing else refills it.
+                            # On producer-side failure, ensure the writer sees a
+                            # sentinel and exits even if the queue is saturated: a
+                            # bare ``put_nowait(None)`` would raise ``queue.Full`` and
+                            # leave the writer parked forever, so drop one item to
+                            # make room then put the sentinel (≤2 iterations — the
+                            # writer is the only consumer).
                             while True:
                                 try:
                                     chunk_q.put_nowait(None)
@@ -968,36 +525,18 @@ class ArtifactDownloadService:
                                 try:
                                     chunk_q.get_nowait()
                                 except queue.Empty:
-                                    # Writer drained between our put and
-                                    # get — the next put attempt will
-                                    # succeed.
                                     pass
-                            # MUST wait for the writer to actually exit
-                            # before unwinding: the outer ``except``
-                            # unlinks ``temp_file``, which would race
-                            # with the writer's still-open file handle
-                            # otherwise. A plain
-                            # ``contextlib.suppress(BaseException) +
-                            # await to_thread(.join)`` does NOT suffice
-                            # — the await itself can be re-cancelled and
-                            # unwind before the writer finishes. The
-                            # shield-loop in ``_await_writer_exit``
-                            # keeps re-awaiting the same shielded join
-                            # task across repeated cancellations until
-                            # the writer thread is actually dead.
+                            # MUST wait for the writer to fully exit before
+                            # unwinding: the outer ``except`` unlinks ``temp_file``,
+                            # which would race the writer's open file handle. See
+                            # ``_await_writer_exit`` for why a plain join doesn't do.
                             await _await_writer_exit(writer_thread)
                             raise
 
-                        if total_bytes == 0:
-                            raise ArtifactDownloadError(
-                                "media",
-                                details=(
-                                    "Download produced 0 bytes -- the remote file may "
-                                    "be missing or empty"
-                                ),
-                            )
+                        _reject_empty_download(total_bytes)
 
-                        os.replace(temp_file, output_file)
+                        self._assert_active()
+                        self._publish_download(temp_file, output_file)
                         logger.debug(
                             "Downloaded %s%s (%d bytes)",
                             display_host,
@@ -1007,27 +546,35 @@ class ArtifactDownloadService:
                         return output_path
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in (401, 403):
+                    # Defer the public raise until after this handler exits so
+                    # Python cannot retain the signed-request exception as the
+                    # new AuthError's implicit ``__context__``.
+                    auth_failure_status = e.response.status_code
+                else:
                     raise ArtifactDownloadError(
                         "media",
-                        details=(
-                            f"Authentication required for {display_host}{parsed.path}"
-                            " -- try `notebooklm login`"
-                        ),
+                        details=f"HTTP error downloading {display_host}{parsed.path}",
                         cause=e,
                         status_code=e.response.status_code,
                     ) from e
-                raise ArtifactDownloadError(
-                    "media",
-                    details=f"HTTP error downloading {display_host}{parsed.path}",
-                    cause=e,
-                    status_code=e.response.status_code,
-                ) from e
             except httpx.RequestError as e:
                 raise ArtifactDownloadError(
                     "media",
                     details=f"Network error downloading {display_host}{parsed.path}",
                     cause=e,
                 ) from e
+
+            if auth_failure_status is not None:
+                auth_error = AuthError(
+                    f"Authentication failed (HTTP {auth_failure_status}) on "
+                    f"{display_host}{parsed.path}; run `notebooklm login`."
+                )
+                if self._chain:
+                    raise auth_error from _scrubbed_http_status_error(auth_failure_status)
+                raise auth_error from None
         except BaseException:
-            temp_file.unlink(missing_ok=True)
+            self._cleanup_download_staging(temp_file)
             raise
+
+
+__all__ = ["AssetDownloadService", "CredentialPolicy", "DownloadResult"]

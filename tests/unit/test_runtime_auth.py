@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`notebooklm._runtime.auth`.
+"""Unit tests for :mod:`notebooklm._web.transport.auth`.
 
 Covers the load-bearing behaviors of :class:`AuthRefreshCoordinator` directly,
 in addition to the existing ``Session``-shaped tests in
@@ -43,30 +43,39 @@ import httpx
 import pytest
 
 from notebooklm._client_metrics import ClientMetrics
-from notebooklm._kernel import Kernel
-from notebooklm._runtime.auth import AuthRefreshCoordinator
+from notebooklm._web.transport.auth import AuthRefreshCoordinator
+from notebooklm._web.transport.kernel import Kernel
 from notebooklm.auth import AuthTokens
 
 # Tight enough to fail fast if a regression hangs the suite, generous enough
 # not to flake on a slow CI runner. Mirrors ``test_refresh_state_machine.py``.
 EVENT_TIMEOUT_S = 5.0
+TEST_EPOCH = 1
 
 
 class _KernelStub:
-    """Minimal kernel-shaped stub exposing only :meth:`get_http_client`.
+    """Minimal kernel-shaped stub exposing the kernel-owned cookie jar.
 
-    The coordinator's :meth:`update_auth_headers` reads
-    ``kernel.get_http_client().cookies`` and nothing else; an
-    ``httpx.AsyncClient``-backed shim satisfies that surface without
-    pulling in the full :class:`Kernel`.
+    The coordinator's compatibility sync reads ``kernel.cookies``. An
+    ``httpx.AsyncClient``-backed shim satisfies that surface without pulling
+    in the full :class:`Kernel`.
     """
 
     def __init__(self, http_client: httpx.AsyncClient | None = None) -> None:
         self.http_client = http_client
 
-    def get_http_client(self) -> httpx.AsyncClient:
+    def assert_epoch(self, expected_epoch: int) -> None:
+        assert expected_epoch == TEST_EPOCH
+
+    def get_http_client(self, *, expected_epoch: int | None = None) -> httpx.AsyncClient:
+        if expected_epoch is not None:
+            self.assert_epoch(expected_epoch)
         assert self.http_client is not None, "Test forgot to wire an http client."
         return self.http_client
+
+    @property
+    def cookies(self) -> httpx.Cookies:
+        return self.get_http_client().cookies
 
 
 def _fresh_auth() -> AuthTokens:
@@ -102,8 +111,8 @@ def test_locks_unallocated_at_construction() -> None:
     """Both locks are ``None`` at construction.
 
     Lazy allocation is load-bearing: ``asyncio.Lock()`` binds to the running
-    loop in some Python versions, and a ``Session`` (which constructs a
-    coordinator) is routinely instantiated outside a running loop.
+    loop in some Python versions, and ``NotebookLMClient`` routinely constructs
+    the coordinator outside a running loop.
     """
     coord = AuthRefreshCoordinator()
     assert coord._refresh_lock is None
@@ -142,7 +151,7 @@ async def test_snapshot_and_refresh_locks_are_distinct() -> None:
 
     Mixing them would re-introduce the reentrancy ambiguity that the
     separate snapshot-side serialization was added to avoid — see the
-    module docstring for ``_runtime/auth.py``.
+    module docstring for ``_web/transport/auth.py``.
     """
     coord = AuthRefreshCoordinator()
     refresh_lock = coord.get_refresh_lock()
@@ -340,8 +349,9 @@ async def test_await_refresh_releases_lock_when_metric_raises() -> None:
     """
     call_count = 0
 
-    async def cb() -> AuthTokens:
+    async def cb(expected_epoch: int) -> AuthTokens:
         nonlocal call_count
+        assert expected_epoch == TEST_EPOCH
         call_count += 1
         return AuthTokens(
             csrf_token=f"R{call_count}",
@@ -354,9 +364,10 @@ async def test_await_refresh_releases_lock_when_metric_raises() -> None:
         refresh_callback=cb,
         metrics=cast(ClientMetrics, metrics),
     )
+    coord.activate_epoch(TEST_EPOCH)
 
     with pytest.raises(RuntimeError, match="metrics blew up"):
-        await coord.await_refresh()
+        await coord.await_refresh(TEST_EPOCH)
 
     # The refresh task is never created when the metric raises before
     # task-creation runs, so a leaked lock would not be masked by a joined
@@ -368,25 +379,24 @@ async def test_await_refresh_releases_lock_when_metric_raises() -> None:
     # hanging the suite.
     metrics2 = _RecordingMetrics()
     coord._metrics = cast(ClientMetrics, metrics2)
-    await asyncio.wait_for(coord.await_refresh(), timeout=EVENT_TIMEOUT_S)
+    await asyncio.wait_for(coord.await_refresh(TEST_EPOCH), timeout=EVENT_TIMEOUT_S)
     assert call_count == 1
     assert len(metrics2.lock_waits) == 1
 
 
 # ---------------------------------------------------------------------------
-# update_auth_headers — syncs auth.cookie_jar from get_http_client().cookies
+# update_auth_headers — compatibility-syncs shadows from kernel.cookies
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_update_auth_headers_syncs_cookie_jar_from_get_http_client(
+async def test_update_auth_headers_syncs_cookie_jar_from_kernel(
     auth_with_kernel: tuple[AuthTokens, _KernelStub],
 ) -> None:
-    """``update_auth_headers`` copies ``kernel.get_http_client().cookies`` onto auth.
+    """``update_auth_headers`` copies ``kernel.cookies`` onto auth.
 
     Pins:
-    * the read is via the ``kernel.get_http_client()`` METHOD on the
-      explicit ``kernel`` collaborator (not a host-shaped attribute);
+    * the read is via ``kernel.cookies`` on the explicit kernel collaborator;
     * the destination is ``auth.cookie_jar`` (the cookie jar reference,
       not a dict copy).
     """
@@ -395,10 +405,8 @@ async def test_update_auth_headers_syncs_cookie_jar_from_get_http_client(
     # Sanity: pre-call, auth.cookie_jar is whatever AuthTokens initialised.
     live_jar = kernel.get_http_client().cookies
 
-    # _KernelStub structurally satisfies the surface that
-    # ``update_auth_headers`` actually reads (``get_http_client()``) but is
-    # not the nominal :class:`Kernel`; ``cast`` is cheaper than introducing
-    # a Protocol just for one test seam.
+    # _KernelStub structurally satisfies the surface but is not the nominal
+    # Kernel; ``cast`` is cheaper than introducing a Protocol for one seam.
     coord.update_auth_headers(auth=auth, kernel=cast(Kernel, kernel))
 
     # The auth.cookie_jar attribute is now identically the live jar.
@@ -434,8 +442,9 @@ async def test_await_refresh_is_single_flight() -> None:
     release_refresh = asyncio.Event()
     call_count = 0
 
-    async def cb() -> AuthTokens:
+    async def cb(expected_epoch: int) -> AuthTokens:
         nonlocal call_count
+        assert expected_epoch == TEST_EPOCH
         call_count += 1
         callback_entered.set()
         await release_refresh.wait()
@@ -446,8 +455,9 @@ async def test_await_refresh_is_single_flight() -> None:
         )
 
     coord = AuthRefreshCoordinator(refresh_callback=cb)
+    coord.activate_epoch(TEST_EPOCH)
 
-    tasks = [asyncio.create_task(coord.await_refresh()) for _ in range(3)]
+    tasks = [asyncio.create_task(coord.await_refresh(TEST_EPOCH)) for _ in range(3)]
     await asyncio.wait_for(callback_entered.wait(), EVENT_TIMEOUT_S)
 
     # Yield enough times for waiters 2/3 to reach ``await shield(task)``.
@@ -469,8 +479,9 @@ async def test_await_refresh_creates_new_task_after_first_done() -> None:
     """A second refresh wave creates a *new* task once the first is done."""
     call_count = 0
 
-    async def cb() -> AuthTokens:
+    async def cb(expected_epoch: int) -> AuthTokens:
         nonlocal call_count
+        assert expected_epoch == TEST_EPOCH
         call_count += 1
         return AuthTokens(
             csrf_token=f"R{call_count}",
@@ -479,17 +490,61 @@ async def test_await_refresh_creates_new_task_after_first_done() -> None:
         )
 
     coord = AuthRefreshCoordinator(refresh_callback=cb)
+    coord.activate_epoch(TEST_EPOCH)
 
-    await coord.await_refresh()
+    await coord.await_refresh(TEST_EPOCH)
     first_task = coord._refresh_task
     assert first_task is not None and first_task.done()
 
-    await coord.await_refresh()
+    await coord.await_refresh(TEST_EPOCH)
     second_task = coord._refresh_task
     assert second_task is not None and second_task.done()
 
     assert first_task is not second_task, "Second wave reused completed task"
     assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_process_exit_is_captured_then_re_raised_to_waiter() -> None:
+    process_exit = KeyboardInterrupt("refresh shutdown")
+
+    async def cb(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == TEST_EPOCH
+        raise process_exit
+
+    coord = AuthRefreshCoordinator(refresh_callback=cb)
+    coord.activate_epoch(TEST_EPOCH)
+
+    with pytest.raises(KeyboardInterrupt, match="refresh shutdown") as raised:
+        await coord.await_refresh(TEST_EPOCH)
+
+    assert raised.value is process_exit
+    assert coord._refresh_task is not None
+    assert coord._refresh_task.done()
+    assert coord._refresh_task.result().error is process_exit
+
+
+@pytest.mark.asyncio
+async def test_eager_refresh_task_never_invokes_callback_under_refresh_lock() -> None:
+    coord: AuthRefreshCoordinator
+
+    async def cb(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == TEST_EPOCH
+        assert not coord.get_refresh_lock().locked()
+        return _fresh_auth()
+
+    coord = AuthRefreshCoordinator(refresh_callback=cb)
+    coord.activate_epoch(TEST_EPOCH)
+    loop = asyncio.get_running_loop()
+    eager_factory = getattr(asyncio, "eager_task_factory", None)
+    if eager_factory is None:
+        pytest.skip("asyncio eager task factory requires Python 3.12+")
+    prior_factory = loop.get_task_factory()
+    loop.set_task_factory(eager_factory)
+    try:
+        await coord.await_refresh(TEST_EPOCH)
+    finally:
+        loop.set_task_factory(prior_factory)
 
 
 @pytest.mark.asyncio
@@ -508,8 +563,9 @@ async def test_await_refresh_cancellation_preserves_task_slot() -> None:
     release = asyncio.Event()
     call_count = 0
 
-    async def cb() -> AuthTokens:
+    async def cb(expected_epoch: int) -> AuthTokens:
         nonlocal call_count
+        assert expected_epoch == TEST_EPOCH
         call_count += 1
         enter.set()
         await release.wait()
@@ -520,9 +576,10 @@ async def test_await_refresh_cancellation_preserves_task_slot() -> None:
         )
 
     coord = AuthRefreshCoordinator(refresh_callback=cb)
+    coord.activate_epoch(TEST_EPOCH)
 
-    waiter_a = asyncio.create_task(coord.await_refresh())
-    waiter_b = asyncio.create_task(coord.await_refresh())
+    waiter_a = asyncio.create_task(coord.await_refresh(TEST_EPOCH))
+    waiter_b = asyncio.create_task(coord.await_refresh(TEST_EPOCH))
     await asyncio.wait_for(enter.wait(), EVENT_TIMEOUT_S)
 
     # Yield so both waiters reach ``await shield(task)``.
@@ -675,3 +732,110 @@ async def test_auth_coord_cancel_inflight_refresh_cancels_and_joins_pending_task
         "concurrency invariant pinned by "
         "test_await_refresh_cancellation_preserves_task_slot."
     )
+
+
+# ---------------------------------------------------------------------------
+# set_bound_loop rebind hook + reset_after_open (#2106)
+# ---------------------------------------------------------------------------
+
+
+def test_set_bound_loop_different_loop_discards_stale_locks() -> None:
+    """A loop change via ``set_bound_loop`` alone discards both lazy locks.
+
+    Pins the clear-on-rebind self-consistency contract (#2106): even without
+    a matching ``reset_after_open`` call, rebinding to a different loop must
+    invalidate the locks allocated under the previous loop so they are never
+    reused. Latent-hazard hardening — no ``await`` currently runs under
+    either lock, so a stale lock cannot be contended (and thus cannot bind /
+    raise cross-loop today); the discard keeps the coordinator consistent
+    with ``ClientComposed`` / ``SourceUploadPipeline`` / ``ChatAPI``.
+    """
+    coord = AuthRefreshCoordinator()
+
+    async def _bind_and_build_under_loop_a() -> None:
+        coord.set_bound_loop(asyncio.get_running_loop())
+        coord.get_refresh_lock()
+        coord.get_auth_snapshot_lock()
+
+    asyncio.run(_bind_and_build_under_loop_a())
+    assert coord._refresh_lock is not None
+    assert coord._auth_snapshot_lock is not None
+
+    async def _rebind_under_loop_b() -> None:
+        # set_bound_loop to a genuinely different loop must drop both stale
+        # locks so the next accessor call rebuilds them on loop B.
+        coord.set_bound_loop(asyncio.get_running_loop())
+        assert coord._refresh_lock is None
+        assert coord._auth_snapshot_lock is None
+        # And the accessors rebuild fresh instances on the new loop.
+        assert isinstance(coord.get_refresh_lock(), asyncio.Lock)
+        assert isinstance(coord.get_auth_snapshot_lock(), asyncio.Lock)
+
+    asyncio.run(_rebind_under_loop_b())
+
+
+@pytest.mark.asyncio
+async def test_set_bound_loop_same_loop_keeps_cached_locks() -> None:
+    """Re-binding to the *same* loop must NOT discard the live locks.
+
+    Idempotent ``set_bound_loop`` calls with the unchanged loop are a no-op
+    on the cache — only a genuine loop change invalidates it (the
+    ``_on_loop_rebind`` hook fires only on a real change).
+    """
+    coord = AuthRefreshCoordinator()
+    loop = asyncio.get_running_loop()
+    coord.set_bound_loop(loop)
+    refresh_lock = coord.get_refresh_lock()
+    snapshot_lock = coord.get_auth_snapshot_lock()
+
+    # Same loop again — both cached locks survive.
+    coord.set_bound_loop(loop)
+    assert coord._refresh_lock is refresh_lock
+    assert coord._auth_snapshot_lock is snapshot_lock
+
+
+@pytest.mark.asyncio
+async def test_reset_after_open_discards_locks_preserves_task_and_callback() -> None:
+    """``reset_after_open`` drops both lazy locks and nothing else.
+
+    The locks are rebuilt lazily on the new loop by the accessors; the
+    ``_refresh_task`` slot (slot-preservation invariant — sibling waiters
+    identify the shared single-flight task through it) and the
+    ``_refresh_callback`` wiring MUST survive the reset.
+    """
+
+    async def _callback(expected_epoch: int) -> AuthTokens:
+        assert expected_epoch == TEST_EPOCH
+        return _fresh_auth()  # pragma: no cover — never awaited here
+
+    coord = AuthRefreshCoordinator(refresh_callback=_callback)
+    coord.set_bound_loop(asyncio.get_running_loop())
+    first_refresh_lock = coord.get_refresh_lock()
+    first_snapshot_lock = coord.get_auth_snapshot_lock()
+
+    async def _done_refresh() -> AuthTokens:
+        return _fresh_auth()
+
+    done_task: asyncio.Task[AuthTokens] = asyncio.create_task(_done_refresh())
+    await done_task
+    coord._refresh_task = done_task
+
+    coord.reset_after_open()
+
+    assert coord._refresh_lock is None
+    assert coord._auth_snapshot_lock is None
+    assert coord._refresh_task is done_task, (
+        "reset_after_open must NOT clear the _refresh_task slot — the "
+        "slot-preservation invariant (see cancel_inflight_refresh) lets "
+        "sibling waiters identify the shared single-flight task; the slot "
+        "is replaced only by the next refresh wave once the task is done()."
+    )
+    assert coord._refresh_callback is _callback, (
+        "reset_after_open must NOT drop the refresh callback — the "
+        "refresh-on-401 wiring is construction-time state, not loop-bound "
+        "state."
+    )
+
+    # The accessors rebuild fresh lock instances after the reset.
+    assert coord.get_refresh_lock() is not first_refresh_lock
+    assert coord.get_auth_snapshot_lock() is not first_snapshot_lock

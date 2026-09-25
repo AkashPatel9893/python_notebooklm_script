@@ -49,11 +49,11 @@ class SectionedGroup(click.Group):
     """Click group that displays commands organized in sections.
 
     Instead of a flat alphabetical list, commands are grouped by function:
-    - Session: login, use, status, clear, doctor, auth
-    - Notebooks: list, create, delete, rename, summary, metadata
-    - Chat: ask, configure, history
-    - Command Groups: source, artifact, note, share, research, profile, agent,
-      skill, language (show subcommands)
+    - Session: login, use, status, usage, clear, doctor, auth, completion
+    - Notebooks: list, create, copy, delete, rename, summary, metadata
+    - Chat: ask, suggest-prompts, suggest-next-steps, configure, history
+    - Command Groups: source, artifact, note, label, collection, share, research,
+      profile, agent, skill, language, mcp (show subcommands)
     - Artifact Actions: generate, download (show types)
     - Other: only commands explicitly tagged ``category="misc"``
     """
@@ -61,9 +61,12 @@ class SectionedGroup(click.Group):
     # Regular commands - show help text
     command_sections = OrderedDict(
         [
-            ("Session", ["login", "use", "status", "clear", "doctor", "auth", "completion"]),
-            ("Notebooks", ["list", "create", "delete", "rename", "summary", "metadata"]),
-            ("Chat", ["ask", "configure", "history"]),
+            (
+                "Session",
+                ["login", "use", "status", "usage", "clear", "doctor", "auth", "completion"],
+            ),
+            ("Notebooks", ["list", "create", "copy", "delete", "rename", "summary", "metadata"]),
+            ("Chat", ["ask", "suggest-prompts", "suggest-next-steps", "configure", "history"]),
         ]
     )
 
@@ -77,12 +80,14 @@ class SectionedGroup(click.Group):
                     "artifact",
                     "note",
                     "label",
+                    "collection",
                     "share",
                     "research",
                     "profile",
                     "agent",
                     "skill",
                     "language",
+                    "mcp",
                 ],
             ),
             ("Artifact Actions (use: notebooklm <action> <type>)", ["generate", "download"]),

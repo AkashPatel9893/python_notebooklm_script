@@ -6,18 +6,25 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Final
 
-from .._row_adapters.artifacts import ArtifactRow
-from ..rpc.types import (
+from .._deprecation import warn_registered_deprecation
+from .artifact_content import (
+    ArtifactInfographic,
+    ArtifactMedia,
+    ArtifactSlide,
+    ArtifactUserState,
+)
+from .common import UnknownTypeWarning
+from .enums import (
     FLASHCARDS_VARIANT,
     INTERACTIVE_MIND_MAP_VARIANT,
     QUIZ_VARIANT,
     ArtifactStatus,
     ArtifactTypeCode,
+    ReportFormat,
     artifact_status_to_str,
 )
-from .common import UnknownTypeWarning, _datetime_from_timestamp
 
 
 class ArtifactType(str, Enum):
@@ -41,7 +48,16 @@ class ArtifactType(str, Enum):
     INFOGRAPHIC = "infographic"
     SLIDE_DECK = "slide_deck"
     DATA_TABLE = "data_table"
+    FANTASY_MAP = "fantasy_map"
+    FILE = "file"
     UNKNOWN = "unknown"
+
+
+class ArtifactListingComponent(str, Enum):
+    """A backing read that contributes to the aggregate artifact namespace."""
+
+    STUDIO_ARTIFACTS = "studio_artifacts"
+    NOTE_BACKED_MIND_MAPS = "note_backed_mind_maps"
 
 
 _warned_artifact_types: set[tuple[int, int | None]] = set()
@@ -52,9 +68,20 @@ _ARTIFACT_TYPE_CODE_MAP: dict[int, ArtifactType] = {
     2: ArtifactType.REPORT,
     3: ArtifactType.VIDEO,
     5: ArtifactType.MIND_MAP,
+    6: ArtifactType.FANTASY_MAP,
     7: ArtifactType.INFOGRAPHIC,
     8: ArtifactType.SLIDE_DECK,
     9: ArtifactType.DATA_TABLE,
+    10: ArtifactType.FILE,
+}
+
+
+_REPORT_KIND_MAP: dict[str, ReportFormat] = {
+    "Briefing Doc": ReportFormat.BRIEFING_DOC,
+    "Study Guide": ReportFormat.STUDY_GUIDE,
+    "Blog Post": ReportFormat.BLOG_POST,
+    "Concept Explanation": ReportFormat.CONCEPT_EXPLANATION,
+    "Custom Report": ReportFormat.CUSTOM,
 }
 
 
@@ -62,7 +89,9 @@ def _map_artifact_kind(artifact_type: int, variant: int | None) -> ArtifactType:
     """Convert internal artifact type and variant to user-facing ArtifactType.
 
     Args:
-        artifact_type: ArtifactTypeCode integer value from API.
+        artifact_type: Raw ArtifactTypeCode integer from LIST_ARTIFACTS, or the
+            genuine backend mind-map code also used for adapted note-backed
+            mind maps.
         variant: Optional variant code (e.g., for quiz vs flashcards vs
             interactive mind map).
 
@@ -77,7 +106,7 @@ def _map_artifact_kind(artifact_type: int, variant: int | None) -> ArtifactType:
             return ArtifactType.QUIZ
         elif variant == INTERACTIVE_MIND_MAP_VARIANT:
             # Interactive mind map: a studio artifact in the type-4 family,
-            # distinct from the note-backed mind map (synthetic type 5).
+            # distinct from the note-backed mind map (adapted as type 5).
             return ArtifactType.MIND_MAP
         else:
             key = (artifact_type, variant)
@@ -112,20 +141,28 @@ def _is_valid_artifact_url(value: Any) -> bool:
 
 
 def _extract_audio_artifact_url(data: list[Any]) -> str | None:
+    from .._web.rows.artifacts import ArtifactRow
+
     return ArtifactRow(data).artifact_url(ArtifactTypeCode.AUDIO.value, suppress_drift=True)
 
 
 def _extract_video_artifact_url(data: list[Any]) -> str | None:
+    from .._web.rows.artifacts import ArtifactRow
+
     return ArtifactRow(data).artifact_url(ArtifactTypeCode.VIDEO.value, suppress_drift=True)
 
 
 def _extract_infographic_artifact_url(data: list[Any]) -> str | None:
+    from .._web.rows.artifacts import ArtifactRow
+
     return ArtifactRow(data).artifact_url(ArtifactTypeCode.INFOGRAPHIC.value, suppress_drift=True)
 
 
 def _extract_slide_deck_artifact_url(data: list[Any]) -> str | None:
     """Extract the slide-deck PDF URL. The PPTX URL at ``data[16][4]`` is not
     surfaced — callers wanting PPTX should use ``download_slide_deck(output_format="pptx")``."""
+    from .._web.rows.artifacts import ArtifactRow
+
     return ArtifactRow(data).artifact_url(ArtifactTypeCode.SLIDE_DECK.value, suppress_drift=True)
 
 
@@ -133,6 +170,8 @@ def _extract_artifact_url(data: list[Any], artifact_type: int | None) -> str | N
     """Extract a public download URL from known artifact response shapes."""
     if artifact_type is None:
         return None
+    from .._web.rows.artifacts import ArtifactRow
+
     return ArtifactRow(data).artifact_url(artifact_type, suppress_drift=True)
 
 
@@ -148,7 +187,9 @@ class Artifact:
         id: Unique artifact identifier.
         title: Artifact title.
         kind: Artifact type as ArtifactType enum (str enum, comparable to strings).
-        status: Processing status (1=processing, 2=pending, 3=completed, 4=failed).
+        status: Processing status code — see :class:`ArtifactStatus` for the
+            code-to-meaning table. Prefer :attr:`status_str` or the ``is_*``
+            predicates over comparing the raw integer.
         created_at: When the artifact was created.
         url: Download URL (if available). For slide decks this is the PDF URL
             only — PPTX is fetched separately via ``download_slide_deck(output_format="pptx")``.
@@ -162,12 +203,38 @@ class Artifact:
     id: str
     title: str
     _artifact_type: int = field(repr=False)  # ArtifactTypeCode enum value
-    status: int  # 1=processing, 2=pending, 3=completed, 4=failed
+    status: int  # ArtifactStatus code; read via .status_str / .is_*, not by integer
     created_at: datetime | None = None
     url: str | None = None
     _variant: int | None = field(
         default=None, repr=False
     )  # For type 4: 1=flashcards, 2=quiz, 4=interactive_mind_map
+    #: The free-text prompt this artifact was generated from, or ``None`` (e.g. a
+    #: note-backed mind map, or a type whose prompt slot is absent). Decoded from
+    #: the listing row so a listing surfaces it without a per-artifact fetch
+    #: (#1925). ``None`` on prompt-position drift — the read is guarded so a
+    #: reshaped payload never breaks ``artifacts.list``.
+    generation_prompt: str | None = None
+    #: Every streaming/download URL returned for an audio or video artifact.
+    #: The historical :attr:`url` remains the preferred single URL.
+    media_urls: tuple[ArtifactMedia, ...] = ()
+    #: Audio/video duration in seconds, including the nanosecond fraction.
+    duration_seconds: float | None = None
+    #: Rendered slides with image dimensions, alt text, and full text.
+    slides: tuple[ArtifactSlide, ...] = ()
+    #: Rendered infographics with image dimensions, alt text, and full text.
+    infographics: tuple[ArtifactInfographic, ...] = ()
+    #: Backend report-kind label (for example ``"Concept Explanation"``).
+    #: Unknown labels are retained verbatim rather than collapsed.
+    report_kind: str | None = None
+    #: Source IDs used to generate this artifact, in backend order.
+    source_ids: tuple[str, ...] = ()
+    #: Last server-side modification time, distinct from :attr:`created_at`.
+    last_modified_at: datetime | None = None
+    #: Artifact revision etag, when returned by the listing RPC.
+    etag: str | None = None
+    #: Per-user audio resume or flashcard study state.
+    user_state: ArtifactUserState | None = None
 
     @property
     def kind(self) -> ArtifactType:
@@ -183,9 +250,13 @@ class Artifact:
     def from_api_response(cls, data: list[Any]) -> Artifact:
         """Parse artifact from API response.
 
+        .. deprecated:: 0.9.0
+           Use ``client.artifacts`` typed APIs. Raw Web row decoding has no
+           supported public replacement.
+
         Position knowledge for ``id`` / ``title`` / ``type`` / ``status``
         / ``variant`` / ``timestamp`` lives in
-        :class:`notebooklm._row_adapters.artifacts.ArtifactRow`. This factory wraps
+        :class:`notebooklm._web.rows.artifacts.ArtifactRow`. This factory wraps
         the raw row in an adapter and reads through its typed properties,
         so any wire-shape change touches the adapter constants only.
 
@@ -193,27 +264,18 @@ class Artifact:
         ``_extract_artifact_url`` helper remains only as a compatibility
         shim for downstream private imports.
         """
-        row = ArtifactRow(data)
-        artifact_type = row.type_code
-        # ``row.type_code`` is statically typed ``int`` and normalises
-        # non-ints to ``0``; ``row.artifact_url`` then falls through to
-        # ``None`` for unrecognised codes — no separate ``isinstance``
-        # guard is needed here.
-        url = row.artifact_url(artifact_type, suppress_drift=True)
+        warn_registered_deprecation("artifact_from_api_response")
+        from .._web.rows.artifacts import decode_artifact
 
-        return cls(
-            id=row.id,
-            title=row.title,
-            _artifact_type=artifact_type,
-            status=row.status,
-            created_at=row.created_at,
-            url=url,
-            _variant=row.variant,
-        )
+        return decode_artifact(cls, data)
 
     @classmethod
     def from_mind_map(cls, data: list[Any]) -> Artifact | None:
         """Parse artifact from mind map data (stored in notes system).
+
+        .. deprecated:: 0.9.0
+           Use ``client.artifacts`` typed APIs. Raw Web row decoding has no
+           supported public replacement.
 
         Mind map structure:
         [
@@ -229,44 +291,23 @@ class Artifact:
 
         Deleted/cleared mind map: ["id", None, 2]
 
+        Mind-map rows ARE note-system rows (they come from
+        ``GET_NOTES_AND_MIND_MAPS``), so the id slot, the title, and the
+        deleted-tombstone predicate are read through
+        :class:`notebooklm._web.rows.notes.NoteRow` — position knowledge
+        lives in the adapter, not here. A ``None`` content slot *without* the
+        recognised ``[id, None, 2]`` tombstone is sentinel drift (a deleted
+        mind map would otherwise silently leak as live): it logs a WARNING and
+        conservatively keeps the historical treat-as-live fallthrough.
+
         Returns:
-            Artifact object, or None if deleted (status=2).
+            Artifact object, or None for the note-system delete tombstone
+            ``[id, None, 2]``.
         """
-        if not isinstance(data, list) or len(data) < 1:
-            return None
+        warn_registered_deprecation("artifact_from_mind_map")
+        from .._web.rows.artifacts import decode_mind_map_artifact
 
-        mind_map_id = data[0] if len(data) > 0 else ""
-
-        # Check for deleted status (item[1] is None with status=2)
-        if len(data) >= 3 and data[1] is None and data[2] == 2:
-            return None  # Deleted, don't include
-
-        # Extract title and timestamp from nested structure
-        title = ""
-        created_at = None
-
-        if len(data) > 1 and isinstance(data[1], list):
-            inner = data[1]
-            # Title is at position [4]
-            if len(inner) > 4 and isinstance(inner[4], str):
-                title = inner[4]
-            # Timestamp is at [2][2][0]. Bind the ``[2]`` metadata block first so
-            # the ``[2]`` descent into it is a single-level index, not a chained
-            # ``inner[2][2]`` (an absent block legitimately leaves created_at None).
-            metadata_block = inner[2] if len(inner) > 2 and isinstance(inner[2], list) else None
-            if metadata_block is not None and len(metadata_block) > 2:
-                ts_data = metadata_block[2]
-                if isinstance(ts_data, list) and len(ts_data) > 0:
-                    created_at = _datetime_from_timestamp(ts_data[0])
-
-        return cls(
-            id=str(mind_map_id),
-            title=title,
-            _artifact_type=ArtifactTypeCode.MIND_MAP.value,
-            status=3,  # Mind maps are always "completed" once created
-            created_at=created_at,
-            _variant=None,
-        )
+        return decode_mind_map_artifact(cls, data)
 
     @property
     def is_completed(self) -> bool:
@@ -275,12 +316,18 @@ class Artifact:
 
     @property
     def is_processing(self) -> bool:
-        """Check if artifact is being generated (status=PROCESSING)."""
+        """Check if artifact is actively being generated (status=PROCESSING, code 2).
+
+        Distinct from :attr:`is_pending`, which reports the earlier
+        "row created, worker not started" phase. Before issue #2127 the two
+        wire codes were transposed, so this answered ``False`` for an artifact
+        that was in fact mid-generation.
+        """
         return self.status == ArtifactStatus.PROCESSING
 
     @property
     def is_pending(self) -> bool:
-        """Check if artifact is queued/transitional (status=PENDING)."""
+        """Check if artifact is queued and not yet started (status=PENDING, code 1)."""
         return self.status == ArtifactStatus.PENDING
 
     @property
@@ -293,7 +340,9 @@ class Artifact:
         """Get human-readable status string.
 
         Returns:
-            "in_progress", "pending", "completed", "failed", or "unknown".
+            "pending", "in_progress", "completed", "failed", "suggested",
+            "pending_review", or "unknown". See :class:`ArtifactStatus` for the
+            code-to-string table.
         """
         return artifact_status_to_str(self.status)
 
@@ -316,8 +365,8 @@ class Artifact:
 
         Interactive mind maps are studio artifacts in the type-4 family
         (``type 4 / variant 4``), as opposed to note-backed mind maps which
-        the library surfaces with the synthetic type code 5. Both report
-        ``kind == ArtifactType.MIND_MAP``; this distinguishes the backing.
+        the library surfaces using the genuine backend mind-map code 5. Both
+        report ``kind == ArtifactType.MIND_MAP``; this distinguishes the backing.
         """
         return (
             self._artifact_type == ArtifactTypeCode.QUIZ.value
@@ -344,7 +393,8 @@ class Artifact:
         """Get the report subtype for type 2 artifacts.
 
         Returns:
-            'briefing_doc', 'study_guide', 'blog_post', or None if not a report.
+            'briefing_doc', 'study_guide', 'blog_post', 'report', or None if
+            not a report.
         """
         if self._artifact_type != ArtifactTypeCode.REPORT.value:
             return None
@@ -356,6 +406,78 @@ class Artifact:
         elif title_lower.startswith("blog post"):
             return "blog_post"
         return "report"
+
+    @property
+    def report_format(self) -> ReportFormat | None:
+        """Mapped :class:`ReportFormat` for a known backend report kind.
+
+        Unknown report-kind labels remain available on :attr:`report_kind` and
+        return ``None`` here, providing a graceful path for future backend
+        additions without pretending they are ``CUSTOM``.
+        """
+        if self._artifact_type != ArtifactTypeCode.REPORT.value or self.report_kind is None:
+            return None
+        return _REPORT_KIND_MAP.get(self.report_kind)
+
+
+@dataclass(frozen=True)
+class ArtifactListingFailure:
+    """Bounded diagnostic for one unavailable aggregate-listing component.
+
+    Backend producers retain only the component identifier, exception type,
+    and a fixed sanitized message. Raw exceptions, response bodies, and signed
+    URLs are deliberately excluded from this public result.
+    """
+
+    component: ArtifactListingComponent
+    error_type: str
+    message: str
+
+
+@dataclass(frozen=True)
+class ArtifactListing:
+    """Artifacts returned by an aggregate read plus its completeness evidence."""
+
+    items: tuple[Artifact, ...]
+    is_complete: bool
+    failures: tuple[ArtifactListingFailure, ...] = ()
+
+
+class ArtifactLookupStatus(str, Enum):
+    """Evidence-qualified result state for :meth:`ArtifactsAPI.lookup`."""
+
+    FOUND = "found"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ArtifactLookup:
+    """Authoritative exact artifact lookup result.
+
+    ``FOUND`` always carries :attr:`artifact`. ``MISSING`` means every relevant
+    backing was read successfully. ``UNKNOWN`` means absence could not be
+    established and carries the bounded component failures that prevented it.
+    """
+
+    status: ArtifactLookupStatus
+    artifact: Artifact | None = None
+    failures: tuple[ArtifactListingFailure, ...] = ()
+
+    @property
+    def is_found(self) -> bool:
+        """Whether an exact artifact was found."""
+        return self.status is ArtifactLookupStatus.FOUND
+
+    @property
+    def is_missing(self) -> bool:
+        """Whether complete reads established absence."""
+        return self.status is ArtifactLookupStatus.MISSING
+
+    @property
+    def is_unknown(self) -> bool:
+        """Whether an unavailable backing prevented an absence decision."""
+        return self.status is ArtifactLookupStatus.UNKNOWN
 
 
 class GenerationState(str, Enum):
@@ -374,8 +496,74 @@ class GenerationState(str, Enum):
     FAILED = "failed"
     NOT_FOUND = "not_found"
     UNKNOWN = "unknown"
-    # wait-only: emitted by wait_for_completion() on a sustained delisting
+    # Rare backend states, modeled so they stay distinguishable from UNKNOWN
+    # (issue #2127). Neither says generation finished, so :attr:`is_terminal` is
+    # False for both and every waiter keeps waiting — exactly as they behaved
+    # when both decoded to ``"unknown"``. That is a statement about how this
+    # library handles them, not a claim about what the backend means by code 6.
+    #
+    # SUGGESTED has no producer *today*: ``ArtifactListingService.list_raw``
+    # unconditionally sends the server-side ``NOT artifact.status =
+    # "ARTIFACT_STATUS_SUGGESTED"`` filter, and every row that reaches a poll
+    # comes from that one call, so code 5 cannot reach ``poll_status``. (The
+    # CREATE_ARTIFACT / RETRY_ARTIFACT kickoff parsers decode ``row[4]`` without
+    # going through ``list_raw``, but the backend does not answer those with a
+    # suggestion row.) It is modeled anyway as defence in depth: if the filter
+    # is ever dropped or the backend stops honouring it, a suggestion row
+    # surfaces as ``"suggested"`` rather than silently as ``"unknown"``. The
+    # filter's presence is itself pinned by
+    # ``tests/integration/test_artifacts_integration.py`` (exact LIST_ARTIFACTS
+    # params), so this member's premise cannot rot unnoticed.
+    SUGGESTED = "suggested"
+    # PENDING_REVIEW mirrors backend ``ARTIFACT_PENDING_REVIEW`` and is NOT
+    # related to PENDING above despite the shared prefix — that collision comes
+    # from the backend's own spelling, which we keep so the member stays
+    # greppable against the recovered enum dump. Semantics unconfirmed; see
+    # :class:`~notebooklm.rpc.types.ArtifactStatus`.
+    PENDING_REVIEW = "pending_review"
+    # Legacy client-synthesized outcome; retained for compatibility, no longer emitted.
     REMOVED = "removed"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether generation reached an end state and will not change again.
+
+        The reference definition of the terminal/still-running partition. The
+        REST poll route consults it via :attr:`GenerationStatus.is_terminal`,
+        and callers can use it instead of enumerating members themselves.
+        Anything *not* terminal means "keep waiting": that is why the rare
+        states added in #2127 (``SUGGESTED``, ``PENDING_REVIEW``) and the
+        long-standing ``UNKNOWN`` all answer ``False`` — none of them says
+        generation finished, so treating them as terminal would abandon a task
+        that is still running.
+
+        Two other sites classify terminality independently, both deliberately
+        and both pinned in agreement with this property by
+        ``tests/unit/test_generation_state.py``:
+
+        * the client-side poll loop stops on ``is_complete or is_failed``,
+          because legacy ``REMOVED`` is retained for compatibility but is never
+          emitted by ``poll_status`` or synthesized by the loop;
+        * ``_app.generate_retry.generation_outcome_from_status`` duck-types over
+          the ``is_*`` predicates so it can accept non-``GenerationStatus``
+          payloads, which rules out calling this property at all.
+
+        ``NOT_FOUND`` is deliberately non-terminal too, but it is *not*
+        interchangeable with the others: it is a transport-level absence (the
+        post-create lag, or a delisting) rather than a generation outcome, and
+        ``wait_for_completion`` keeps polling until completion, explicit failure,
+        or timeout. Consumers that must distinguish "absent" from "still
+        working" test :attr:`GenerationStatus.is_not_found` explicitly.
+
+        Defined so a member added later is non-terminal by default — the safe
+        side, since the cost of waiting on a finished task is a wasted poll
+        while the cost of finalizing a running one is a lost result.
+        """
+        return self in (
+            GenerationState.COMPLETED,
+            GenerationState.FAILED,
+            GenerationState.REMOVED,
+        )
 
     def __str__(self) -> str:
         # Keep str(member) == member.value (e.g. "completed", not
@@ -387,6 +575,22 @@ class GenerationState(str, Enum):
         # of a GenerationStatus dataclass renders identically to the old
         # plain-string field.
         return repr(self.value)
+
+
+#: The terminal members, derived from :attr:`GenerationState.is_terminal` so the
+#: partition is defined once.
+#:
+#: Lookup into this set is by *hash*, unlike every other ``is_*`` predicate on
+#: :class:`GenerationStatus` (which compare with ``==``). It still accepts a
+#: plain ``str`` status because ``str`` precedes ``Enum`` in ``GenerationState``'s
+#: MRO, so ``str.__hash__`` wins over ``Enum.__hash__`` — the latter hashes the
+#: member *name* (``"COMPLETED"``) and would break lookups by value. Reordering
+#: the bases would leave every ``==``-based predicate working and break only this
+#: one, so the mechanism is pinned directly in
+#: ``tests/unit/test_generation_state.py``, not just described here.
+_TERMINAL_GENERATION_STATES: Final[frozenset[GenerationState]] = frozenset(
+    state for state in GenerationState if state.is_terminal
+)
 
 
 def _status_from_code(
@@ -425,7 +629,7 @@ class GenerationStatus:
     """
 
     task_id: str  # Same as artifact_id - used for polling and becomes Artifact.id
-    # "pending", "in_progress", "completed", "failed", "not_found", "removed", "unknown".
+    # One of the :class:`GenerationState` values — see that enum for the full set.
     # Typed as GenerationState, but stays raw-string-permissive: instances built
     # with a plain str keep working (the .is_* predicates compare with ==).
     status: GenerationState
@@ -459,43 +663,48 @@ class GenerationStatus:
         """Check if the artifact was not found in the poll response.
 
         This status is set by ``poll_status()`` when the artifact ID is
-        absent from the artifact list.  It differs from ``is_pending``:
-        a ``pending`` artifact exists in the list and is queued, while a
-        ``not_found`` artifact has either not yet appeared (brief lag after
-        creation) or was silently removed by the server (e.g. after a
-        daily-quota rejection).
-
-        ``wait_for_completion`` treats a sustained run of ``not_found``
-        responses as a *removal* — see its ``max_not_found`` parameter and
-        :attr:`is_removed`.
+        absent from the artifact list. A ``pending`` artifact is listed and
+        queued; ``not_found`` is unresolved and can reflect delayed visibility
+        or deletion. It does not establish removal or a quota rejection.
+        ``wait_for_completion`` keeps polling the original ID until completion,
+        explicit failure, or timeout.
         """
         return self.status == "not_found"
 
     @property
     def is_removed(self) -> bool:
-        """Check if the artifact was delisted by the server.
+        """Check for the legacy client-synthesized removal status.
 
-        This status is set by ``wait_for_completion()`` when an artifact
-        disappears from the listing for a sustained run of polls (see its
-        ``max_not_found`` parameter). It is deliberately *distinct* from
-        :attr:`is_failed`: a ``failed`` artifact still exists in the listing
-        with a terminal FAILED status, whereas a ``removed`` artifact vanished
-        from the listing entirely — typically after a daily-quota rejection,
-        but possibly a transient list omission. Conflating the two would mask
-        a genuine terminal failure as a transient hiccup, or vice versa, so
-        callers that need to react differently can branch on this property.
+        Retained for compatibility with stored statuses and older callers.
+        ``wait_for_completion`` no longer infers this outcome from listing
+        absence; unresolved artifacts remain ``not_found`` until timeout.
         """
         return self.status == "removed"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether generation ended — ``completed``, ``failed``, or ``removed``.
+
+        The one predicate to branch on for "should I keep polling?". Everything
+        else means keep waiting, including ``not_found`` (a transport-level
+        absence, not an outcome) and the rare ``suggested`` / ``pending_review``
+        states added in #2127.
+
+        Delegates to :attr:`GenerationState.is_terminal`, so a state added to
+        that enum later is non-terminal here too — the safe default. Like its
+        sibling predicates this compares by value, so it works on an instance
+        built with a plain ``str`` status.
+        """
+        return self.status in _TERMINAL_GENERATION_STATES
 
     @property
     def is_rate_limited(self) -> bool:
         """Check if generation failed due to rate limiting or quota exceeded.
 
         Returns True when the API rejected the request, typically due to
-        too many requests or quota exhaustion. A ``removed`` status (the
-        artifact was delisted, often after a quota rejection) is treated the
-        same as a ``failed`` status here so that rate-limit retry policies
-        keep working when the server silently drops the artifact.
+        too many requests or quota exhaustion. Legacy ``removed`` statuses still
+        participate in error-code/message matching for compatibility. Current
+        polling never fabricates quota evidence from listing absence.
         """
         if not (self.is_failed or self.is_removed):
             return False
@@ -534,3 +743,102 @@ class ReportSuggestion:
             prompt=data.get("prompt", ""),
             audience_level=data.get("audience_level", 2),
         )
+
+
+@dataclass(frozen=True)
+class CopiedArtifact:
+    """One ``CopyArtifactsAsync`` outcome: an original artifact id and its copy.
+
+    Returned by :meth:`ArtifactsAPI.copy`. The backend answers with a mapping
+    from each requested artifact id to the full new :class:`Artifact` row in
+    the target notebook (title, type, sources, status and content all present),
+    so no follow-up listing is needed to learn the new id.
+
+    Attributes:
+        original_id: The id of the artifact that was copied.
+        artifact: The new artifact row in the target notebook.
+    """
+
+    original_id: str
+    artifact: Artifact
+
+    def __post_init__(self) -> None:
+        if not self.original_id:
+            raise ValueError("CopiedArtifact.original_id must not be empty")
+        if not self.artifact.id:
+            raise ValueError("CopiedArtifact.artifact must carry the new artifact id")
+
+
+@dataclass(frozen=True)
+class CustomizationChoice:
+    """One selectable format in a Studio "Customize" dialog.
+
+    ``code`` is the wire integer the corresponding generation option enum
+    carries (:class:`AudioFormat` for audio, :class:`VideoFormat` for video,
+    :class:`SlideDeckFormat` for slide decks); ``title`` / ``description`` are
+    the labels the web UI shows beside it.
+    """
+
+    code: int
+    title: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ReportPreset:
+    """One preset report format offered by the Studio report dialog.
+
+    Field names follow the recovered ``TailoredReportTypeOption`` message
+    (``reportType`` / ``reportDescription`` / ``reportDirective``) rather than
+    :class:`ReportSuggestion`'s ``title`` / ``prompt``: a preset is a fixed
+    server-side template, not a per-notebook AI suggestion, and keeping the wire
+    vocabulary lines the type up one-to-one with the proto and evidence docs.
+
+    Attributes:
+        report_type: The preset's display name (e.g. ``"Briefing Doc"``).
+        description: One-line description shown under the name.
+        directive: The full generation prompt the preset expands to — a
+            ready-to-send ``custom_prompt`` for :meth:`ArtifactsAPI.generate_report`.
+    """
+
+    report_type: str
+    description: str
+    directive: str
+
+
+@dataclass(frozen=True)
+class ArtifactCustomizationChoices:
+    """The Studio customization option tables served to this account.
+
+    Returned by :meth:`ArtifactsAPI.get_customization_choices`
+    (``GetArtifactCustomizationChoices``). The table is account-level: the
+    server ignores which notebook it is asked about. Each list is served in the
+    UI's display order. It is an availability table, not an exhaustive enum
+    manifest; dedicated options such as cinematic video may be omitted even
+    though their public wire format remains supported.
+
+    Attributes:
+        audio: Audio Overview formats (codes match :class:`AudioFormat`).
+        video: Video Overview formats (codes match :class:`VideoFormat`).
+        slide_deck: Slide-deck formats (codes match :class:`SlideDeckFormat`).
+        reports: Report presets with their full generation directives.
+    """
+
+    audio: tuple[CustomizationChoice, ...] = ()
+    video: tuple[CustomizationChoice, ...] = ()
+    slide_deck: tuple[CustomizationChoice, ...] = ()
+    reports: tuple[ReportPreset, ...] = ()
+
+
+@dataclass(frozen=True)
+class ArtifactCreationCapability:
+    """Read-only implementation support for one artifact creation family.
+
+    This describes client/backend encoding support, never account entitlement or
+    an upstream availability guarantee. ``limitations`` records intentional
+    backend differences without pretending that unsupported options are sent.
+    """
+
+    family: str
+    supported_options: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()

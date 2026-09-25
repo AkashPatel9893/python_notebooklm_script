@@ -16,32 +16,15 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pytest_httpx import HTTPXMock
 
-import notebooklm._sources as _sources_mod
+import notebooklm._sources as _sources_base_mod
+import notebooklm._web.sources as _sources_mod
 from notebooklm import NotebookLMClient, Source, SourceType
+from notebooklm._web.sources.add import SourceAddService
 from notebooklm.exceptions import DecodingError, RPCError
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import SourceAddError, SourceNotFoundError
 
 pytestmark = pytest.mark.allow_no_vcr
-
-
-def _add_register_file_source_baseline_mock(httpx_mock: HTTPXMock, build_rpc_response) -> None:
-    """Register an empty GET_NOTEBOOK baseline response for ``add_file`` paths.
-
-    The ``register_file_source`` wrapper captures a baseline of source IDs
-    before the create attempt (see ``_source/upload.py:register_file_source``
-    for the rationale — pre-existing same-named sources must NOT match a
-    retry probe). For tests that exercise ``add_file`` with a single
-    ``ADD_SOURCE_FILE`` batchexecute mock, this helper adds the baseline
-    GET_NOTEBOOK response (empty notebook) that the new code path requires.
-
-    Place this BEFORE the test's ``ADD_SOURCE_FILE`` mock so the registered
-    responses match the actual request order.
-    """
-    httpx_mock.add_response(
-        url=re.compile(r".*batchexecute.*rpcids=" + RPCMethod.GET_NOTEBOOK.value + r".*"),
-        content=build_rpc_response(RPCMethod.GET_NOTEBOOK, [["", []]]).encode(),
-    )
 
 
 class TestAddSource:
@@ -73,6 +56,9 @@ class TestAddSource:
         assert isinstance(source, Source)
         assert source.id == "source_id"
         assert source.url == "https://example.com"
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert RPCMethod.ADD_SOURCE in str(requests[0].url)
 
     @pytest.mark.asyncio
     async def test_add_source_text(
@@ -214,10 +200,10 @@ class TestGetSource:
         )
 
         async with NotebookLMClient(auth_tokens) as client:
-            client._rpc_executor.rpc_call = first_rpc
+            client._web_runtime.executor.rpc_call = first_rpc
             assert await client.sources.list("nb_123") == []
 
-            client._rpc_executor.rpc_call = second_rpc
+            client._web_runtime.executor.rpc_call = second_rpc
             sources = await client.sources.list("nb_123")
 
         first_rpc.assert_awaited_once()
@@ -527,8 +513,9 @@ class TestSourcesAPI:
             )
 
         assert source is not None
-        request = httpx_mock.get_request()
-        assert RPCMethod.ADD_SOURCE in str(request.url)
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert RPCMethod.ADD_SOURCE in str(requests[0].url)
 
     @pytest.mark.asyncio
     async def test_refresh_source(
@@ -773,7 +760,7 @@ class TestSourcesAPI:
         async with NotebookLMClient(auth_tokens) as client:
             # UPDATE_SOURCE echoes null, then the hydrate fetch blows up.
             rpc = AsyncMock(side_effect=[None, RPCError("boom during hydrate")])
-            client._rpc_executor.rpc_call = rpc
+            client._web_runtime.executor.rpc_call = rpc
             with pytest.raises(RPCError):
                 await client.sources.rename("nb_123", "src_001", "New Title")
 
@@ -787,7 +774,7 @@ class TestSourcesAPI:
         """
         async with NotebookLMClient(auth_tokens) as client:
             rpc = AsyncMock(return_value=None)
-            client._rpc_executor.rpc_call = rpc
+            client._web_runtime.executor.rpc_call = rpc
             # The existence preflight resolves the source as a genuine miss.
             client.sources._get_or_none = AsyncMock(return_value=None)
             with pytest.raises(SourceNotFoundError):
@@ -810,9 +797,6 @@ class TestAddFileSource:
         test_file = tmp_path / "test_document.txt"
         test_file.write_text("This is test content for upload.")
 
-        # Step 0: register_file_source captures a baseline GET_NOTEBOOK
-        # before the create — see the helper docstring for the rationale.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         # Step 1: Mock RPC registration response (o4cbdc)
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
@@ -822,7 +806,6 @@ class TestAddFileSource:
             url=re.compile(r".*batchexecute.*"),
             content=rpc_response.encode(),
         )
-
         # Step 2: Mock upload session start response
         httpx_mock.add_response(
             url=re.compile(r".*upload/_/\?authuser=0$"),
@@ -847,24 +830,20 @@ class TestAddFileSource:
         assert source.title == "test_document.txt"
         assert source.kind == "unknown"
 
-        # Verify all 4 requests were made: baseline GET_NOTEBOOK + 3-step
-        # upload protocol (register + start + finalize).
+        # Verify the 3-step upload protocol (register + start + finalize).
         requests = httpx_mock.get_requests()
-        assert len(requests) == 4
-
-        # Verify Step 0: baseline GET_NOTEBOOK
-        assert RPCMethod.GET_NOTEBOOK in str(requests[0].url)
+        assert len(requests) == 3
 
         # Verify Step 1: RPC call
-        assert RPCMethod.ADD_SOURCE_FILE in str(requests[1].url)
+        assert RPCMethod.ADD_SOURCE_FILE in str(requests[0].url)
 
         # Verify Step 2: Upload start
-        assert "x-goog-upload-command" in requests[2].headers
-        assert requests[2].headers["x-goog-upload-command"] == "start"
+        assert "x-goog-upload-command" in requests[1].headers
+        assert requests[1].headers["x-goog-upload-command"] == "start"
 
-        # Verify Step 3: Upload finalize (now requests[3] after baseline)
-        assert "x-goog-upload-command" in requests[3].headers
-        assert requests[3].headers["x-goog-upload-command"] == "upload, finalize"
+        # Verify Step 3: Upload finalize.
+        assert "x-goog-upload-command" in requests[2].headers
+        assert requests[2].headers["x-goog-upload-command"] == "upload, finalize"
 
     @pytest.mark.asyncio
     async def test_add_file_rpc_params_format(
@@ -878,8 +857,6 @@ class TestAddFileSource:
         test_file = tmp_path / "my_file.pdf"
         test_file.write_bytes(b"%PDF-1.4 fake pdf content")
 
-        # Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         # Mock all 3 responses
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
@@ -899,9 +876,7 @@ class TestAddFileSource:
         # params[0] should be [[filename]] (double-nested within the param)
         # In the full params array JSON: [[[filename]], nb_id, ...] (3 brackets total)
         # NOT [[[[filename]]], ...] (4 brackets - the old bug)
-        # Index [1] is the ADD_SOURCE_FILE request (index [0] is the
-        # baseline GET_NOTEBOOK from the probe-then-create wrapper).
-        rpc_request = httpx_mock.get_requests()[1]
+        rpc_request = httpx_mock.get_requests()[0]
         body = urllib.parse.unquote(rpc_request.content.decode())
         # The params are JSON-encoded inside the RPC wrapper, so quotes are escaped
         # Verify 3 brackets (correct) not 4 brackets (bug)
@@ -934,8 +909,6 @@ class TestAddFileSource:
         content = "Test content " * 100
         test_file.write_text(content)
 
-        # Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
             [[[["src_abc"], "document.txt", [None, None, None, None, 0]]]],
@@ -950,10 +923,8 @@ class TestAddFileSource:
         async with NotebookLMClient(auth_tokens) as client:
             await client.sources.add_file("nb_123", test_file)
 
-        # Check upload start request (Step 2). Request indices: [0]
-        # baseline GET_NOTEBOOK, [1] ADD_SOURCE_FILE register, [2] upload
-        # start, [3] upload finalize.
-        start_request = httpx_mock.get_requests()[2]
+        # Check upload start request (Step 2).
+        start_request = httpx_mock.get_requests()[1]
 
         # Verify headers
         assert start_request.headers["x-goog-upload-protocol"] == "resumable"
@@ -980,8 +951,6 @@ class TestAddFileSource:
         binary_content = b"\x00\x01\x02\x03\xff\xfe\xfd"
         test_file.write_bytes(binary_content)
 
-        # Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
             [[[["src_bin"], "binary_file.bin", [None, None, None, None, 0]]]],
@@ -996,10 +965,8 @@ class TestAddFileSource:
         async with NotebookLMClient(auth_tokens) as client:
             await client.sources.add_file("nb_123", test_file)
 
-        # Check upload content request (Step 3 — finalize POST). Request
-        # indices: [0] baseline GET_NOTEBOOK, [1] ADD_SOURCE_FILE register,
-        # [2] upload start, [3] upload finalize.
-        upload_request = httpx_mock.get_requests()[3]
+        # Check upload content request (Step 3 — finalize POST).
+        upload_request = httpx_mock.get_requests()[2]
 
         # Verify the actual content was sent
         assert upload_request.content == binary_content
@@ -1027,8 +994,6 @@ class TestAddEpubFileSource:
             zf.writestr("OEBPS/chapter1.xhtml", "<html><body><p>Test</p></body></html>")
         test_epub.write_bytes(buffer.getvalue())
 
-        # Step 0: Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         # Step 1: Mock RPC registration
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
@@ -1038,7 +1003,6 @@ class TestAddEpubFileSource:
             url=re.compile(r".*batchexecute.*"),
             content=rpc_response.encode(),
         )
-
         # Step 2: Mock upload session start
         httpx_mock.add_response(
             url=re.compile(r".*upload/_/\?authuser=0$"),
@@ -1066,14 +1030,12 @@ class TestAddEpubFileSource:
         assert source.id == "epub_source_123"
         assert source.title == "test_book.epub"
 
-        # Verify all 4 requests were made: baseline GET_NOTEBOOK +
-        # 3-step upload protocol (register + start + finalize).
+        # Verify the 3-step upload protocol (register + start + finalize).
         requests = httpx_mock.get_requests()
-        assert len(requests) == 4
+        assert len(requests) == 3
 
-        # Verify uploaded content is the EPUB ZIP bytes (now requests[3]
-        # after the baseline shifted indices).
-        upload_request = requests[3]
+        # Verify uploaded content is the EPUB ZIP bytes.
+        upload_request = requests[2]
         assert upload_request.content == test_epub.read_bytes()
 
 
@@ -1535,7 +1497,7 @@ class TestListSourcesParsingEdgeCases:
         httpx_mock: HTTPXMock,
         build_rpc_response,
     ):
-        """Test list() uses default READY when status_code is unknown (lines 125->137, 127->137)."""
+        """Test list() fails closed when the wire status code is unknown."""
         # status_code 999 is not in the SourceStatus enum values
         response = build_rpc_response(
             RPCMethod.GET_NOTEBOOK,
@@ -1562,7 +1524,8 @@ class TestListSourcesParsingEdgeCases:
         assert len(sources) == 1
         from notebooklm.rpc.types import SourceStatus
 
-        assert sources[0].status == SourceStatus.READY
+        assert sources[0].status == SourceStatus.UNKNOWN
+        assert sources[0].is_ready is False
 
     @pytest.mark.asyncio
     async def test_list_sources_type_code_not_int(
@@ -1638,77 +1601,91 @@ class TestAddUrlErrorPaths:
         self,
         auth_tokens,
     ):
-        """Test add_url() wraps RPCError from _add_url_source in SourceAddError (lines 327-329)."""
-        async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources,
-                "_add_url_source",
-                side_effect=RPCError("RPC call failed"),
-            ):
-                with pytest.raises(SourceAddError):
-                    await client.sources.add_url("nb_123", "https://example.com")
+        """Test add_url() wraps RPCError from the regular URL adder in SourceAddError."""
+        service = SourceAddService()
+
+        with pytest.raises(SourceAddError):
+            await service.add_url(
+                "nb_123",
+                "https://example.com",
+                add_youtube_source=AsyncMock(),
+                add_url_source=AsyncMock(side_effect=RPCError("RPC call failed")),
+                list_sources=AsyncMock(return_value=[]),
+                wait_until_ready=AsyncMock(),
+                extract_youtube_video_id=lambda _url: None,
+                is_youtube_url=lambda _url: False,
+                logger=_sources_mod.logger,
+            )
 
     @pytest.mark.asyncio
     async def test_add_url_youtube_rpc_error_raises_source_add_error(
         self,
         auth_tokens,
     ):
-        """Test add_url() wraps RPCError from _add_youtube_source in SourceAddError (lines 327-329)."""
-        async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources,
-                "_add_youtube_source",
-                side_effect=RPCError("YouTube RPC failed"),
-            ):
-                with pytest.raises(SourceAddError):
-                    await client.sources.add_url(
-                        "nb_123", "https://youtube.com/watch?v=dQw4w9WgXcQ"
-                    )
+        """Test add_url() wraps RPCError from the YouTube adder in SourceAddError."""
+        service = SourceAddService()
+
+        with pytest.raises(SourceAddError):
+            await service.add_url(
+                "nb_123",
+                "https://youtube.com/watch?v=dQw4w9WgXcQ",
+                add_youtube_source=AsyncMock(side_effect=RPCError("YouTube RPC failed")),
+                add_url_source=AsyncMock(),
+                list_sources=AsyncMock(return_value=[]),
+                wait_until_ready=AsyncMock(),
+                extract_youtube_video_id=lambda _url: "dQw4w9WgXcQ",
+                is_youtube_url=lambda _url: True,
+                logger=_sources_mod.logger,
+            )
 
     @pytest.mark.asyncio
     async def test_add_url_none_result_raises_source_add_error(
         self,
         auth_tokens,
     ):
-        """Test add_url() raises SourceAddError when API returns None (line 332)."""
-        async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources,
-                "_add_url_source",
-                new_callable=AsyncMock,
-                return_value=None,
-            ):
-                with pytest.raises(SourceAddError, match="API returned no data"):
-                    await client.sources.add_url("nb_123", "https://example.com")
+        """Test add_url() raises SourceAddError when API returns None."""
+        service = SourceAddService()
+
+        with pytest.raises(SourceAddError, match="API returned no data"):
+            await service.add_url(
+                "nb_123",
+                "https://example.com",
+                add_youtube_source=AsyncMock(),
+                add_url_source=AsyncMock(return_value=None),
+                list_sources=AsyncMock(return_value=[]),
+                wait_until_ready=AsyncMock(),
+                extract_youtube_video_id=lambda _url: None,
+                is_youtube_url=lambda _url: False,
+                logger=_sources_mod.logger,
+            )
 
     @pytest.mark.asyncio
     async def test_add_url_wait_true(
         self,
         auth_tokens,
+        httpx_mock: HTTPXMock,
+        build_rpc_response,
     ):
         """Test add_url() with wait=True calls wait_until_ready (lines 335-336)."""
         source_data = [[[["src_wait_url"], "Example", [None, 11], [None, 2]]]]
         ready_source = Source(id="src_wait_url", title="Example")
+        response = build_rpc_response(RPCMethod.ADD_SOURCE, source_data)
+        httpx_mock.add_response(content=response.encode())
 
         async with NotebookLMClient(auth_tokens) as client:
             with patch.object(
                 client.sources,
-                "_add_url_source",
+                "wait_until_ready",
                 new_callable=AsyncMock,
-                return_value=source_data,
-            ):
-                with patch.object(
-                    client.sources,
-                    "wait_until_ready",
-                    new_callable=AsyncMock,
-                    return_value=ready_source,
-                ) as mock_wait:
-                    result = await client.sources.add_url(
-                        "nb_123", "https://example.com", wait=True
-                    )
+                return_value=ready_source,
+            ) as mock_wait:
+                result = await client.sources.add_url("nb_123", "https://example.com", wait=True)
 
         mock_wait.assert_called_once()
         assert result.id == "src_wait_url"
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert RPCMethod.ADD_SOURCE in str(requests[0].url)
 
     @pytest.mark.asyncio
     async def test_add_url_youtube_like_no_id_warning(
@@ -1726,17 +1703,15 @@ class TestAddUrlErrorPaths:
 
         async with NotebookLMClient(auth_tokens) as client:
             with patch.object(_sources_mod, "is_youtube_url", return_value=True) as mock_is_yt:
-                with patch.object(
-                    client.sources,
-                    "_extract_youtube_video_id",
-                    return_value=None,
-                ):
-                    source = await client.sources.add_url(
-                        "nb_123", "https://youtube.com/channel/UCxxxxxxx"
-                    )
+                source = await client.sources.add_url(
+                    "nb_123", "https://youtube.com/channel/UCxxxxxxx"
+                )
 
         assert source is not None
         mock_is_yt.assert_called_once()
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert RPCMethod.ADD_SOURCE in str(requests[0].url)
 
 
 class TestAddTextErrorPaths:
@@ -1749,13 +1724,15 @@ class TestAddTextErrorPaths:
     ):
         """Test add_text() wraps RPCError in SourceAddError (lines 374-375)."""
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources._rpc,
-                "rpc_call",
-                side_effect=RPCError("Text RPC failed"),
+            with (
+                patch.object(
+                    client.sources._rpc,
+                    "rpc_call",
+                    side_effect=RPCError("Text RPC failed"),
+                ),
+                pytest.raises(SourceAddError, match="Failed to add text source"),
             ):
-                with pytest.raises(SourceAddError, match="Failed to add text source"):
-                    await client.sources.add_text("nb_123", "My Title", "content")
+                await client.sources.add_text("nb_123", "My Title", "content")
 
     @pytest.mark.asyncio
     async def test_add_text_none_result_raises_source_add_error(
@@ -1764,14 +1741,16 @@ class TestAddTextErrorPaths:
     ):
         """Test add_text() raises SourceAddError when API returns None (line 382)."""
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources._rpc,
-                "rpc_call",
-                new_callable=AsyncMock,
-                return_value=None,
+            with (
+                patch.object(
+                    client.sources._rpc,
+                    "rpc_call",
+                    new_callable=AsyncMock,
+                    return_value=None,
+                ),
+                pytest.raises(SourceAddError, match="API returned no data"),
             ):
-                with pytest.raises(SourceAddError, match="API returned no data"):
-                    await client.sources.add_text("nb_123", "My Title", "content")
+                await client.sources.add_text("nb_123", "My Title", "content")
 
     @pytest.mark.asyncio
     async def test_add_text_wait_true(
@@ -1783,21 +1762,21 @@ class TestAddTextErrorPaths:
         ready_source = Source(id="src_wait_text", title="My Title")
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources._rpc,
-                "rpc_call",
-                new_callable=AsyncMock,
-                return_value=source_data,
-            ):
-                with patch.object(
+            with (
+                patch.object(
+                    client.sources._rpc,
+                    "rpc_call",
+                    new_callable=AsyncMock,
+                    return_value=source_data,
+                ),
+                patch.object(
                     client.sources,
                     "wait_until_ready",
                     new_callable=AsyncMock,
                     return_value=ready_source,
-                ) as mock_wait:
-                    result = await client.sources.add_text(
-                        "nb_123", "My Title", "content", wait=True
-                    )
+                ) as mock_wait,
+            ):
+                result = await client.sources.add_text("nb_123", "My Title", "content", wait=True)
 
         mock_wait.assert_called_once()
         assert result.id == "src_wait_text"
@@ -1819,30 +1798,32 @@ class TestAddFileWait:
         ready_source = Source(id="file_src_001", title="test.pdf")
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources._uploader,
-                "register_file_source",
-                new_callable=AsyncMock,
-                return_value="file_src_001",
-            ):
-                with patch.object(
+            with (
+                patch.object(
+                    client.sources._uploader,
+                    "register_file_source",
+                    new_callable=AsyncMock,
+                    return_value="file_src_001",
+                ),
+                patch.object(
                     client.sources._uploader,
                     "start_resumable_upload",
                     new_callable=AsyncMock,
                     return_value="https://notebooklm.google.com/upload/_/?upload_id=abc",
-                ):
-                    with patch.object(
-                        client.sources._uploader,
-                        "upload_file_streaming",
-                        new_callable=AsyncMock,
-                    ):
-                        with patch.object(
-                            client.sources._uploader,
-                            "wait_until_ready",
-                            new_callable=AsyncMock,
-                            return_value=ready_source,
-                        ) as mock_wait:
-                            result = await client.sources.add_file("nb_123", test_file, wait=True)
+                ),
+                patch.object(
+                    client.sources._uploader,
+                    "upload_file_streaming",
+                    new_callable=AsyncMock,
+                ),
+                patch.object(
+                    client.sources._uploader,
+                    "wait_until_ready",
+                    new_callable=AsyncMock,
+                    return_value=ready_source,
+                ) as mock_wait,
+            ):
+                result = await client.sources.add_file("nb_123", test_file, wait=True)
 
         mock_wait.assert_called_once_with(
             "nb_123", "file_src_001", timeout=120.0, transient_error_types=()
@@ -2353,7 +2334,7 @@ class TestListSourcesSkippedEntries:
         httpx_mock: HTTPXMock,
         build_rpc_response,
     ):
-        """Test list() defaults to READY when src has no index 3 (line 125->137 false branch)."""
+        """Test list() fails closed when the source row has no status block."""
         from notebooklm.rpc.types import SourceStatus
 
         # Source with only 2 elements - no status data at index 3
@@ -2375,7 +2356,8 @@ class TestListSourcesSkippedEntries:
             sources = await client.sources.list("nb_123")
 
         assert len(sources) == 1
-        assert sources[0].status == SourceStatus.READY
+        assert sources[0].status == SourceStatus.UNKNOWN
+        assert sources[0].is_ready is False
 
 
 class TestWaitUntilReady:
@@ -2695,6 +2677,9 @@ class TestAddYoutubeSourceDirect:
 
         assert source.id == "yt_src_001"
         assert source.kind == "youtube"
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert RPCMethod.ADD_SOURCE in str(requests[0].url)
 
 
 class TestRegisterFileSourceError:
@@ -2712,8 +2697,6 @@ class TestRegisterFileSourceError:
         test_file = tmp_path / "test.pdf"
         test_file.write_bytes(b"%PDF-1.4 fake")
 
-        # Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         # Return a response where extract_id returns None - nested empty list
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
@@ -2724,11 +2707,11 @@ class TestRegisterFileSourceError:
             url=re.compile(r".*batchexecute.*"),
             content=rpc_response.encode(),
         )
-        # register_file_source now runs the probe BEFORE raising on a
-        # source-less response (CodeRabbit fix), so a second baseline-shape
-        # response is needed for the probe lookup.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
-
+        # A malformed post-send response triggers one read-only candidate inspection.
+        httpx_mock.add_response(
+            url=re.compile(r".*batchexecute.*rpcids=" + RPCMethod.GET_NOTEBOOK.value + r".*"),
+            content=build_rpc_response(RPCMethod.GET_NOTEBOOK, [["", []]]).encode(),
+        )
         async with NotebookLMClient(auth_tokens) as client:
             with pytest.raises(SourceAddError, match="Failed to get SOURCE_ID"):
                 await client.sources.add_file("nb_123", test_file)
@@ -2745,8 +2728,6 @@ class TestRegisterFileSourceError:
         test_file = tmp_path / "empty_nested.pdf"
         test_file.write_bytes(b"%PDF-1.4 content")
 
-        # Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         # Result is [[[]]] - extract_id([[]]) -> extract_id([]) -> returns None
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
@@ -2756,11 +2737,11 @@ class TestRegisterFileSourceError:
             url=re.compile(r".*batchexecute.*"),
             content=rpc_response.encode(),
         )
-        # register_file_source now runs the probe BEFORE raising on a
-        # source-less response (CodeRabbit fix), so a second baseline-shape
-        # response is needed for the probe lookup.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
-
+        # A malformed post-send response triggers one read-only candidate inspection.
+        httpx_mock.add_response(
+            url=re.compile(r".*batchexecute.*rpcids=" + RPCMethod.GET_NOTEBOOK.value + r".*"),
+            content=build_rpc_response(RPCMethod.GET_NOTEBOOK, [["", []]]).encode(),
+        )
         async with NotebookLMClient(auth_tokens) as client:
             with pytest.raises(SourceAddError):
                 await client.sources.add_file("nb_123", test_file)
@@ -2781,8 +2762,6 @@ class TestStartResumableUploadError:
         test_file = tmp_path / "no_url.pdf"
         test_file.write_bytes(b"%PDF-1.4 content")
 
-        # Step 0: Baseline GET_NOTEBOOK for the register_file_source probe wrapper.
-        _add_register_file_source_baseline_mock(httpx_mock, build_rpc_response)
         # Step 1: Successful RPC registration
         rpc_response = build_rpc_response(
             RPCMethod.ADD_SOURCE_FILE,
@@ -2801,8 +2780,15 @@ class TestStartResumableUploadError:
         )
 
         async with NotebookLMClient(auth_tokens) as client:
-            with pytest.raises(SourceAddError, match="Failed to get upload URL"):
+            with pytest.raises(SourceAddError) as exc_info:
                 await client.sources.add_file("nb_123", test_file)
+
+        # The real failure propagates unwrapped; the retained-source recovery
+        # context rides along as attributes rather than a wrapper type.
+        error = exc_info.value
+        assert error.source_id == "file_src_001"
+        assert error.stage == "start_session"
+        assert "Failed to get upload URL" in str(error)
 
 
 class TestWaitUntilReadyPolling:
@@ -2931,19 +2917,21 @@ class TestWaitUntilReadyErrorPaths:
         processing_source = Source(id="src_slow", title="Slow Source", status=1)
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources,
-                "_get_or_none",
-                new_callable=AsyncMock,
-                return_value=processing_source,
+            with (
+                patch.object(
+                    client.sources,
+                    "get_or_none",
+                    new_callable=AsyncMock,
+                    return_value=processing_source,
+                ),
+                pytest.raises(SourceTimeoutError),
             ):
-                with pytest.raises(SourceTimeoutError):
-                    await client.sources.wait_until_ready(
-                        "nb_123",
-                        "src_slow",
-                        timeout=0.05,  # Very short timeout so polling loop hits elapsed > timeout
-                        initial_interval=0.001,
-                    )
+                await client.sources.wait_until_ready(
+                    "nb_123",
+                    "src_slow",
+                    timeout=0.05,  # Very short timeout so polling loop hits elapsed > timeout
+                    initial_interval=0.001,
+                )
 
 
 class TestWaitUntilReadyMidLoopTimeout:
@@ -2977,18 +2965,18 @@ class TestWaitUntilReadyMidLoopTimeout:
             return val
 
         async with NotebookLMClient(auth_tokens) as client:
-            with patch.object(
-                client.sources,
-                "_get_or_none",
-                new_callable=AsyncMock,
-                return_value=processing_source,
+            with (
+                patch.object(
+                    client.sources,
+                    "get_or_none",
+                    new_callable=AsyncMock,
+                    return_value=processing_source,
+                ),
+                patch.object(
+                    _sources_base_mod, "monotonic", side_effect=fake_monotonic
+                ) as mock_monotonic,
+                pytest.raises(SourceTimeoutError),
             ):
-                with patch.object(
-                    _sources_mod, "monotonic", side_effect=fake_monotonic
-                ) as mock_monotonic:
-                    with pytest.raises(SourceTimeoutError):
-                        await client.sources.wait_until_ready(
-                            "nb_123", "src_race", timeout=timeout_val
-                        )
+                await client.sources.wait_until_ready("nb_123", "src_race", timeout=timeout_val)
 
         mock_monotonic.assert_called()

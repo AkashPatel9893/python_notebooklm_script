@@ -14,7 +14,8 @@ Covers the three Click-free workflows that back ``use`` / ``status`` /
   callable must NOT abort logout before the storage/browser steps run).
 
 Direct ``_app`` calls only — a ``MagicMock`` client + injected collaborators,
-no Click / CliRunner (mirrors ``tests/unit/cli/test_label_listing.py``).
+no Click / CliRunner; CLI adapter tests own command rendering and exit-code
+behavior.
 """
 
 from __future__ import annotations
@@ -57,30 +58,27 @@ async def test_verify_and_set_notebook_resolves_then_gets() -> None:
     result = await verify_and_set_notebook(
         client,
         "nb_full",
-        json_output=False,
         resolve_notebook_id=resolver,
     )
 
     assert isinstance(result, UseNotebookResult)
     assert result.notebook is notebook
     assert result.resolved_id == "nb_full_123"
-    # Resolver is called with the partial id + json-output forwarding.
-    resolver.assert_awaited_once_with(client, "nb_full", json_output=False)
+    resolver.assert_awaited_once_with(client, "nb_full")
     # The resolved (not partial) id is what's verified against the server.
     client.notebooks.get.assert_awaited_once_with("nb_full_123")
 
 
 @pytest.mark.asyncio
-async def test_verify_and_set_notebook_forwards_json_output_flag() -> None:
-    """``json_output`` is forwarded so the resolver routes diagnostics to stderr."""
+async def test_verify_and_set_notebook_calls_neutral_resolver_without_presentation_flags() -> None:
     client = MagicMock()
     client.notebooks = MagicMock()
     client.notebooks.get = AsyncMock(return_value=Notebook(id="nb_1", title="t"))
     resolver = AsyncMock(return_value="nb_1")
 
-    await verify_and_set_notebook(client, "nb", json_output=True, resolve_notebook_id=resolver)
+    await verify_and_set_notebook(client, "nb", resolve_notebook_id=resolver)
 
-    resolver.assert_awaited_once_with(client, "nb", json_output=True)
+    resolver.assert_awaited_once_with(client, "nb")
 
 
 @pytest.mark.asyncio
@@ -92,7 +90,7 @@ async def test_verify_and_set_notebook_propagates_resolver_error() -> None:
     resolver = AsyncMock(side_effect=ValueError("ambiguous"))
 
     with pytest.raises(ValueError, match="ambiguous"):
-        await verify_and_set_notebook(client, "nb", json_output=False, resolve_notebook_id=resolver)
+        await verify_and_set_notebook(client, "nb", resolve_notebook_id=resolver)
     # The server is never hit when resolution fails.
     client.notebooks.get.assert_not_awaited()
 
@@ -106,7 +104,7 @@ async def test_verify_and_set_notebook_propagates_get_error() -> None:
     resolver = AsyncMock(return_value="nb_1")
 
     with pytest.raises(RuntimeError, match="not found"):
-        await verify_and_set_notebook(client, "nb", json_output=False, resolve_notebook_id=resolver)
+        await verify_and_set_notebook(client, "nb", resolve_notebook_id=resolver)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +244,7 @@ def _logout_inputs(
     context_path: Callable[[], Path],
     env_auth_remains: bool = False,
     rmtree: Callable[[Path], Any],
+    remove_browser_profile: bool = True,
 ) -> LogoutInputs:
     return LogoutInputs(
         storage_path=storage_path,
@@ -254,6 +253,7 @@ def _logout_inputs(
         context_path=context_path,
         env_auth_remains=env_auth_remains,
         rmtree=rmtree,
+        remove_browser_profile=remove_browser_profile,
     )
 
 
@@ -313,6 +313,27 @@ def test_logout_no_artifacts_removed_any_false(tmp_path: Path) -> None:
     assert outcome.env_auth_remains is True
     # rmtree never runs when the browser dir is absent.
     inputs.rmtree.assert_not_called()  # type: ignore[attr-defined]
+
+
+def test_logout_reports_existing_browser_profile_preserved_by_policy(tmp_path: Path) -> None:
+    """A skipped unowned browser dir is carried through the typed outcome."""
+    browser_dir = tmp_path / "browser"
+    browser_dir.mkdir()
+    rmtree = MagicMock()
+    inputs = _logout_inputs(
+        storage_path=tmp_path / "missing_storage.json",
+        browser_profile_dir=browser_dir,
+        clear_context=lambda: False,
+        context_path=lambda: tmp_path / "ctx.json",
+        rmtree=rmtree,
+        remove_browser_profile=False,
+    )
+
+    outcome = execute_logout(inputs)
+
+    assert outcome.browser_profile_preserved == browser_dir
+    assert outcome.removed_any is False
+    rmtree.assert_not_called()
 
 
 def test_logout_storage_unlink_oserror_short_circuits(tmp_path: Path) -> None:
@@ -455,3 +476,20 @@ def test_logout_failure_is_frozen_and_typed() -> None:
     # Frozen dataclass: assignment is rejected.
     with pytest.raises(FrozenInstanceError):
         failure.kind = "context"  # type: ignore[misc]
+
+
+def test_status_rejects_unknown_role_label_from_context_file(tmp_path, monkeypatch):
+    """The context file is user-editable, so an unknown role label is dropped.
+
+    Without validation a hand-edited ``"role": "wizard"`` would be title-cased
+    straight onto the ``status`` table (#2125).
+    """
+    from notebooklm._app.session import _valid_role_label
+
+    assert _valid_role_label("owner") == "owner"
+    assert _valid_role_label("editor") == "editor"
+    assert _valid_role_label("viewer") == "viewer"
+    assert _valid_role_label("wizard") is None
+    assert _valid_role_label("Owner") is None
+    assert _valid_role_label(1) is None
+    assert _valid_role_label(None) is None

@@ -21,8 +21,10 @@ PKG_PATH = Path("src/notebooklm/cli/services/login")
 # ``ALLOWED_EDGES`` is an UPPER BOUND, not an equality check — the DAG test
 # verifies ``actual_edges ⊆ allowed_edges``. Edges marked "allowed but
 # currently unused" below are pre-declared room for likely future imports
-# (per the phase-3.md DAG diagram); the implementation modules don't take
-# them today. If you remove an "unused" entry, the test will still pass —
+# (per the leaf-ward DAG documented in
+# ``src/notebooklm/cli/services/login/__init__.py`` and encoded below); the
+# implementation modules don't take them today. If you remove an "unused"
+# entry, the test will still pass —
 # but you also remove the documented design intent that says "this edge is
 # legitimate when needed". Keep the entry; add a comment when you start
 # using it.
@@ -34,19 +36,22 @@ ALLOWED_EDGES: dict[str, set[str]] = {
     "exceptions": set(),
     "outcomes": set(),
     "cookie_domains": set(),
-    "rookiepy_errors": set(),
+    "rookie_cookies_errors": set(),
+    # master_token: bootstrap/refresh service; its auth, client, and browser-capture
+    # imports live outside this package, so it remains a login-package leaf.
+    "master_token": set(),
     "io_seam": set(),
     "cookie_jar": {
         "outcomes",
         # allowed but currently unused — _enumerate_one_jar formats its own
-        # rookiepy error messages and does not call _handle_rookiepy_error.
-        "rookiepy_errors",
+        # rookie-cookies error messages and does not call _handle_rookie_cookies_error.
+        "rookie_cookies_errors",
         # io_seam: _enumerate_one_jar drives the account probe via io.run_async.
         "io_seam",
     },
     "chromium_accounts": {
         "cookie_jar",
-        "rookiepy_errors",
+        "rookie_cookies_errors",
         "cookie_domains",
         "outcomes",
         # io_seam: the chromium readers emit verbose progress via io.emit.
@@ -57,7 +62,7 @@ ALLOWED_EDGES: dict[str, set[str]] = {
         # (a BrowserCookieOutcome) on every extractor failure instead of
         # console.print + exit_with_code, so the command layer renders + exits.
         "outcomes",
-        "rookiepy_errors",
+        "rookie_cookies_errors",
         "cookie_domains",
         # allowed but currently unused — the firefox helpers hand raw cookies
         # back to the caller (browser_accounts) which then routes through
@@ -71,10 +76,10 @@ ALLOWED_EDGES: dict[str, set[str]] = {
         "firefox_accounts",
         "cookie_jar",
         "outcomes",
-        "rookiepy_errors",
-        # The phase-3 DAG diagram routes cookie_domains via chromium/firefox
+        "rookie_cookies_errors",
+        # The documented leaf-ward DAG routes cookie_domains via chromium/firefox
         # subordinates, but ``_read_browser_cookies``'s "auto" + named-alias
-        # branch (the legacy ``rookiepy.load`` path) constructs its own domain
+        # branch (the legacy ``rookie_cookies.load`` path) constructs its own domain
         # list — that call site lives in browser_accounts, not in the
         # browser-family subordinates. Adding the edge here keeps the dispatch
         # logic colocated; the DAG stays acyclic (cookie_domains is a leaf).
@@ -172,7 +177,9 @@ def test_login_package_dag() -> None:
     assert actual_modules == expected_modules, (
         f"Module set mismatch.\n  expected: {sorted(expected_modules)}\n"
         f"  actual:   {sorted(actual_modules)}\n"
-        f"Update ALLOWED_EDGES (and phase-3.md DAG) if the layout intentionally changed."
+        "Update ALLOWED_EDGES and the leaf-ward DAG notes in "
+        "src/notebooklm/cli/services/login/__init__.py if the layout "
+        "intentionally changed."
     )
 
     actual_edges: dict[str, set[str]] = {}

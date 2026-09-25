@@ -36,18 +36,18 @@ import json
 import httpx
 import pytest
 
-from _fixtures.kernel_test_helpers import install_http_client_for_test
 from notebooklm import NotebookLMClient, ServerError
-from notebooklm._idempotency import IDEMPOTENCY_REGISTRY, IdempotencyPolicy
+from notebooklm._web.policy import IDEMPOTENCY_REGISTRY, IdempotencyPolicy
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import AskResult, ChatReference
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
 
 # Mock-transport tests; no HTTP / no cassette.
 pytestmark = pytest.mark.allow_no_vcr
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirror the pattern from test_idempotency_create.py)
+# Helpers shared with the other full-transport containment tests
 # ---------------------------------------------------------------------------
 
 
@@ -58,19 +58,22 @@ def _wrb_response(rpc_id: str, payload) -> str:
     return f")]}}'\n{len(chunk)}\n{chunk}\n"
 
 
-def _make_client_with_transport(
+async def _make_client_with_transport(
     transport: httpx.AsyncBaseTransport,
     auth_tokens,
     *,
     server_error_max_retries: int = 3,
 ) -> NotebookLMClient:
-    """Construct a ``NotebookLMClient`` wired to a mock httpx transport."""
+    """Open a real lifecycle generation, then install the mock transport."""
     client = NotebookLMClient(
         auth_tokens,
         server_error_max_retries=server_error_max_retries,
     )
+    await client.__aenter__()
+    kernel = client._web_runtime.kernel
+    await kernel.get_http_client(expected_epoch=1).aclose()
     install_http_client_for_test(
-        client._collaborators.kernel,
+        kernel,
         httpx.AsyncClient(
             transport=transport,
             headers={
@@ -125,7 +128,7 @@ def test_create_note_plain_variant_classified_non_idempotent() -> None:
 def test_create_note_saved_from_chat_variant_classified_non_idempotent() -> None:
     """The ``"saved_from_chat"`` variant is NON_IDEMPOTENT_NO_RETRY.
 
-    Used by ``_chat.notes.save_chat_answer_as_note`` (issue #660). The
+    Used by ``_web.chat.save_chat_answer_as_note`` (issue #660). The
     7-element params carry rich content; title-based probes break under
     server-side smart-title generation, and chat-answer fingerprints are
     not unique enough for safe dedupe.
@@ -168,12 +171,12 @@ async def test_create_note_plain_no_inner_retry_on_5xx(auth_tokens) -> None:
         return httpx.Response(404, text="unexpected")
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=3)
+    client = await _make_client_with_transport(transport, auth_tokens, server_error_max_retries=3)
     try:
         with pytest.raises(ServerError):
             await client.notes.create(notebook_id, title="My Note", content="hello")
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
     assert create_count == 1, (
         f"expected exactly 1 CREATE_NOTE (NON_IDEMPOTENT_NO_RETRY), got {create_count}"
@@ -203,7 +206,7 @@ async def test_save_answer_as_note_no_inner_retry_on_5xx(auth_tokens) -> None:
         return httpx.Response(404, text="unexpected")
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens, server_error_max_retries=3)
+    client = await _make_client_with_transport(transport, auth_tokens, server_error_max_retries=3)
     ask_result = AskResult(
         answer="The sky is blue [1].",
         conversation_id="conv_test",
@@ -225,7 +228,7 @@ async def test_save_answer_as_note_no_inner_retry_on_5xx(auth_tokens) -> None:
         with pytest.raises(ServerError):
             await client.chat.save_answer_as_note(notebook_id, ask_result, title="Chat note")
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
     assert create_count == 1, (
         f"expected exactly 1 CREATE_NOTE (saved_from_chat variant, "
@@ -266,11 +269,11 @@ async def test_create_note_happy_path_one_post(auth_tokens) -> None:
         return httpx.Response(404, text="unexpected")
 
     transport = httpx.MockTransport(handler)
-    client = _make_client_with_transport(transport, auth_tokens)
+    client = await _make_client_with_transport(transport, auth_tokens)
     try:
         note = await client.notes.create(notebook_id, title="Happy", content="body")
     finally:
-        await client._collaborators.kernel.get_http_client().aclose()
+        await client.close()
 
     assert note.id == "note_xyz"
     assert create_count == 1

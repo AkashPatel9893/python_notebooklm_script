@@ -1,8 +1,8 @@
 """Regression guard for the ``CookiePersistence.save_lock`` contract.
 
-Contract (documented at ``_cookie_persistence.py`` next to the lock definition):
-``save_lock`` is acquired ONLY inside ``CookiePersistence.save``'s ``_save()``
-closure, which runs on a worker thread via ``asyncio.to_thread``. It is never
+Contract (documented at ``_web/transport/cookie_persistence.py`` next to the lock definition):
+``save_lock`` is acquired ONLY inside the collaborator's ``_save()`` and
+``_adopt()`` worker closures, which run via ``asyncio.to_thread``. It is never
 held by an async context — a
 blocking ``threading.Lock`` taken on the event-loop thread would stall every
 other coroutine (keepalive, RPCs, cancellation) while a sibling worker thread
@@ -26,10 +26,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from _helpers.client_factory import build_client_shell_for_tests
-from notebooklm._cookie_persistence import CookiePersistence
+from notebooklm._web.transport.cookie_persistence import CookiePersistence
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 def _make_core(tmp_path: Path, *, cookie_saver=None) -> NotebookLMClient:
@@ -46,11 +46,15 @@ def _make_core(tmp_path: Path, *, cookie_saver=None) -> NotebookLMClient:
     the legacy ``notebooklm._core.save_cookies_to_storage`` monkeypatch.
     """
     storage_path = tmp_path / "storage_state.json"
+    jar = httpx.Cookies()
+    jar.set("SID", "x", domain=".google.com", path="/")
+    jar.set("__Secure-1PSIDTS", "y", domain=".google.com", path="/")
     auth = AuthTokens(
         cookies={"SID": "x", "__Secure-1PSIDTS": "y"},
         csrf_token="t",
         session_id="s",
         storage_path=storage_path,
+        cookie_jar=jar,
     )
     storage_path.write_text('{"cookies": []}')
     return build_client_shell_for_tests(auth, cookie_saver=cookie_saver)
@@ -60,11 +64,11 @@ def _make_core(tmp_path: Path, *, cookie_saver=None) -> NotebookLMClient:
 async def test_save_lock_acquired_off_event_loop_thread(
     tmp_path: Path,
 ) -> None:
-    """The thread that holds ``_save_lock`` MUST NOT be the event-loop thread.
+    """The thread that holds ``CookiePersistence.save_lock`` MUST NOT be the loop thread.
 
     We spy on ``save_cookies_to_storage`` — which the production ``_save()``
     closure calls from inside ``with lock:`` — and record the thread it runs
-    on. If a future refactor accidentally moves the ``with self._save_lock:``
+    on. If a future refactor accidentally moves the ``with lock:``
     onto the loop thread (e.g. by inlining the closure into ``save_cookies``
     without ``asyncio.to_thread``), the spy will see the loop thread holding
     the lock, and this assertion will fail.
@@ -79,10 +83,8 @@ async def test_save_lock_acquired_off_event_loop_thread(
     def spy(jar, path, **kwargs):  # type: ignore[no-untyped-def]
         # ``save_cookies_to_storage`` is called from inside ``with lock:``
         # in ``_save()``. Whichever thread runs this spy is, by definition,
-        # the thread currently holding ``_save_lock``.
-        observed["lock_held"] = core_ref[
-            "core"
-        ]._collaborators.cookie_persistence.save_lock.locked()
+        # the thread currently holding ``CookiePersistence.save_lock``.
+        observed["lock_held"] = core_ref["core"]._web_runtime.cookie_persistence.save_lock.locked()
         observed["holder_thread"] = threading.current_thread()
         return True
 
@@ -91,10 +93,7 @@ async def test_save_lock_acquired_off_event_loop_thread(
     core = _make_core(tmp_path, cookie_saver=spy)
     core_ref["core"] = core
 
-    await core._collaborators.lifecycle.save_cookies(
-        core._collaborators.cookie_persistence,
-        httpx.Cookies(),
-    )
+    await core._web_runtime.web_transport.save_cookies(httpx.Cookies())
 
     assert observed["lock_held"] is True, (
         "save_cookies must hold _save_lock for the duration of "
@@ -121,12 +120,12 @@ async def test_save_lock_acquired_off_event_loop_thread(
 async def test_save_lock_does_not_block_event_loop(
     tmp_path: Path,
 ) -> None:
-    """While ``_save_lock`` is held by a worker thread, the event loop must
+    """While ``CookiePersistence.save_lock`` is held by a worker, the event loop must
     remain responsive.
 
     Direct proof of the no-priority-inversion property: hold the worker
     inside ``save_cookies_to_storage`` (which is called from inside
-    ``with self._save_lock:``) and concurrently schedule loop work. If the
+    ``with lock:``) and concurrently schedule loop work. If the
     loop were blocked on the lock, the heartbeat coroutine wouldn't run
     until the worker released; with the contract intact, the heartbeat
     observes the lock IS held while the loop is still scheduling.
@@ -137,7 +136,7 @@ async def test_save_lock_does_not_block_event_loop(
 
     def spy(jar, path, **kwargs):  # type: ignore[no-untyped-def]
         in_save.set()
-        # Hold the worker thread (and thus _save_lock) until the loop has
+        # Hold the worker thread (and thus CookiePersistence.save_lock) until the loop has
         # demonstrated it can still schedule coroutines. Bounded to avoid a
         # hung test if the contract is ever violated and the loop deadlocks.
         assert release_save.wait(timeout=5.0), (
@@ -159,14 +158,11 @@ async def test_save_lock_does_not_block_event_loop(
             await asyncio.sleep(0.01)
         # If we reach here, the loop is still scheduling tasks AND the
         # worker thread is inside the spy (lock held).
-        loop_observations.append(core._collaborators.cookie_persistence.save_lock.locked())
+        loop_observations.append(core._web_runtime.cookie_persistence.save_lock.locked())
         release_save.set()
 
     await asyncio.gather(
-        core._collaborators.lifecycle.save_cookies(
-            core._collaborators.cookie_persistence,
-            httpx.Cookies(),
-        ),
+        core._web_runtime.web_transport.save_cookies(httpx.Cookies()),
         heartbeat(),
     )
 
@@ -178,17 +174,19 @@ async def test_save_lock_does_not_block_event_loop(
     )
 
 
-def test_save_lock_only_acquired_inside_save_closure() -> None:
-    """Static guard: the blocking lock is acquired inside the worker closure.
+def test_save_lock_only_acquired_inside_worker_closures() -> None:
+    """Static guard: the blocking lock is acquired inside known worker closures.
 
-    This catches a refactor that adds a second ``with self.save_lock:`` or
-    aliased ``with lock:`` elsewhere (e.g. inside an async method) before such
-    a change can ship — static-only, so it has zero runtime cost and runs even
-    when the async test infrastructure is offline.
+    This catches a refactor that adds ``with self.save_lock:`` or aliased
+    ``with lock:`` elsewhere (e.g. directly inside an async method) before
+    such a change can ship — static-only, so it has zero runtime cost and runs
+    even when the async test infrastructure is offline.
     """
 
     source_path = Path(inspect.getsourcefile(CookiePersistence) or "")
-    assert source_path.is_file(), f"could not locate _cookie_persistence.py source: {source_path!r}"
+    assert source_path.is_file(), (
+        f"could not locate _web/transport/cookie_persistence.py source: {source_path!r}"
+    )
     tree = ast.parse(source_path.read_text())
 
     # Find every ``with self.save_lock:`` or closure-aliased ``with lock:`` by
@@ -197,8 +195,9 @@ def test_save_lock_only_acquired_inside_save_closure() -> None:
 
     class _Visitor(ast.NodeVisitor):
         """Walk the module, tracking the enclosing function chain so any
-        ``with self._save_lock:`` site can be attributed to the function
-        that contains it (lets us check whether it sits inside ``_save``).
+        ``with lock:`` site can be attributed to the function
+            that contains it (lets us check whether it sits inside an approved
+            worker closure).
         """
 
         def __init__(self) -> None:
@@ -232,21 +231,25 @@ def test_save_lock_only_acquired_inside_save_closure() -> None:
 
         def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
             for item in node.items:
-                # An ``async with self._save_lock:`` would itself be a contract
+                # An ``async with CookiePersistence.save_lock:`` would itself be a contract
                 # violation (lock is sync), so flag it the same way.
                 self._record_if_save_lock(item.context_expr)
             self.generic_visit(node)
 
     _Visitor().visit(tree)
 
+    worker_closures = {"_save", "_adopt"}
     offenders = [
-        (where, lineno) for (where, lineno) in acquisition_sites if "_save" not in where.split(".")
+        (where, lineno)
+        for (where, lineno) in acquisition_sites
+        if not worker_closures.intersection(where.split("."))
     ]
     assert offenders == [], (
         "_save_lock contract violation: blocking lock acquisition found "
-        f"outside the ``_save`` closure: {offenders!r}. The lock must "
-        "ONLY be acquired inside ``_save()`` (run via asyncio.to_thread). "
-        "See ``_cookie_persistence.py`` "
+        f"outside an approved worker closure: {offenders!r}. The lock must "
+        "ONLY be acquired inside ``_save()`` or ``_adopt()`` (run via "
+        "asyncio.to_thread). "
+        "See ``_web/transport/cookie_persistence.py`` "
         "for the contract details."
     )
-    assert acquisition_sites, "expected CookiePersistence.save to acquire the save lock"
+    assert {where.rsplit(".", 1)[-1] for where, _ in acquisition_sites} == worker_closures

@@ -47,14 +47,14 @@ LOOP_BOUND_PRIMITIVES = frozenset({"Lock", "Semaphore", "BoundedSemaphore", "Eve
 # A class is considered compliant when it defines BOTH.
 REQUIRED_GUARD_METHODS = ("set_bound_loop", "reset_after_open")
 
-# The template-method base that supplies ``set_bound_loop`` (and the
-# ``_bound_loop`` field) to its subclasses. A class inheriting this provides the
+# The template-method bases that supply ``set_bound_loop`` (and the
+# ``_bound_loop`` field) to their subclasses. A class inheriting one provides the
 # ``set_bound_loop`` half of the protocol by inheritance, not by a direct
 # ``def`` — the AST method scan must credit it so the owners that dropped their
-# duplicated ``set_bound_loop`` body in favour of the mixin stay compliant. They
+# duplicated ``set_bound_loop`` body in favour of the base stay compliant. They
 # still must define ``reset_after_open`` directly (each resets distinct
 # owner-specific state, intentionally not unified into the base).
-LOOP_BOUND_BASE = "LoopBoundPrimitive"
+LOOP_BOUND_BASES = frozenset({"EpochFenced", "LoopBoundPrimitive"})
 
 
 class _AllowlistEntry:
@@ -93,8 +93,8 @@ class _AllowlistEntry:
 # constructs a primitive is reported as stale so the list keeps tightening.
 # ---------------------------------------------------------------------------
 ALLOWLIST: tuple[_AllowlistEntry, ...] = (
-    # NOTE: ``ClientComposed``, ``TransportDrainTracker``,
-    # ``SourceUploadPipeline``, and ``ChatAPI`` are NOT allowlisted — they
+    # NOTE: ``ClientComposed``, ``SourceUploadPipeline``, and ``ChatAPI`` are
+    # NOT allowlisted — they
     # inherit ``set_bound_loop`` from ``LoopBoundPrimitive`` (credited by the
     # base-class check in ``_class_methods``) and each still define
     # ``reset_after_open`` directly, so the owner-method scan detects them as
@@ -108,33 +108,69 @@ ALLOWLIST: tuple[_AllowlistEntry, ...] = (
     # binding so the next ``open()`` rebinds. A ``reset_after_open`` would be
     # a no-op here (the locks are never held across ``open()``).
     _AllowlistEntry(
-        "src/notebooklm/_runtime/auth.py",
+        "src/notebooklm/_web/transport/auth.py",
         "AuthRefreshCoordinator",
         "Guarded by set_bound_loop + call-site assert_bound_loop; the lazy "
         "Lock is never held across open() so reset_after_open is unnecessary.",
     ),
     _AllowlistEntry(
-        "src/notebooklm/_reqid_counter.py",
+        "src/notebooklm/_web/transport/reqid_counter.py",
         "ReqidCounter",
         "Guarded by set_bound_loop + call-site assert_bound_loop in "
         "next_reqid; the lazy Lock is never held across open().",
     ),
-    # Module-global, PER-RUNNING-LOOP registries: the lock is keyed by
+    # Server-lifetime singleton: ``SelfHostedOAuthProvider`` is constructed once
+    # by ``build_oauth_provider`` and used entirely within the single MCP-server
+    # event loop (the OAuth handlers). The save-serialization Lock is never
+    # shared across loops — the provider is not reopened on a fresh loop the way
+    # a reusable client is — so it is structurally loop-safe without the
+    # open()/close() affinity protocol.
+    _AllowlistEntry(
+        "src/notebooklm/mcp/_oauth.py",
+        "SelfHostedOAuthProvider",
+        "Server-lifetime singleton built once by build_oauth_provider and used "
+        "entirely within the single MCP-server event loop; the save-lock is "
+        "never shared across loops, so it is structurally loop-safe without the "
+        "open()/close() affinity protocol.",
+    ),
+    # Process-owned PER-RUNNING-LOOP registries: the lock is keyed by
     # ``asyncio.get_running_loop()`` in a ``WeakKeyDictionary``, so every loop
     # gets its own lock and a stale cross-loop primitive can never be reused.
-    # These have no enclosing class to host the protocol; the per-loop keying
-    # is the structural guard.
     _AllowlistEntry(
         "src/notebooklm/_auth/keepalive.py",
-        None,
-        "Module-global per-running-loop lock registry (keyed by "
+        "RotationState",
+        "Process-owned per-running-loop lock registry (keyed by "
         "asyncio.get_running_loop()); structurally immune to cross-loop reuse.",
     ),
+    # ``refresh.py`` no longer constructs an ``asyncio.Lock`` (c-PR2): its
+    # cross-loop coalescing moved to ``_auth/single_flight.py``, which uses a
+    # ``threading.Lock`` + ``concurrent.futures.Future`` bridge (neither is a
+    # loop-bound asyncio primitive), so there is nothing left to allowlist here.
     _AllowlistEntry(
-        "src/notebooklm/_auth/refresh.py",
+        "src/notebooklm/_auth/recovery.py",
+        "ColdRecoveryState",
+        "Process-owned per-running-loop lock registry, "
+        "weakly keyed by asyncio.get_running_loop()); structurally immune to "
+        "cross-loop reuse; the per-loop revalidate lock remains consumer policy.",
+    ),
+    # The REST client-load lock is constructed inside one FastAPI lifespan and
+    # discarded when that same lifespan exits. It therefore cannot survive an
+    # app reopen or be observed from a different event loop.
+    _AllowlistEntry(
+        "src/notebooklm/server/app.py",
         None,
-        "Module-global per-running-loop lock registry (keyed by "
-        "asyncio.get_running_loop()); structurally immune to cross-loop reuse.",
+        "Lifespan-local lock created and discarded within one FastAPI event "
+        "loop; it is never retained by the reusable app across lifespan runs.",
+    ),
+    # Each close wave constructs its abort Event on the lifecycle's currently
+    # asserted loop and discards the whole wave before a later reopen. The
+    # primitive is neither cached nor reusable across generations/loops, so the
+    # collaborator reset protocol does not apply to this root-owned wave state.
+    _AllowlistEntry(
+        "src/notebooklm/_runtime/lifecycle.py",
+        "ClientLifecycle",
+        "Close-wave-local Event created after loop-affinity validation and "
+        "discarded with that wave before reopen; never cached across loops.",
     ),
 )
 
@@ -213,7 +249,7 @@ class _ConstructionSite:
 
 
 def _inherits_loop_bound_base(node: ast.ClassDef) -> bool:
-    """Return ``True`` if *node* lists :data:`LOOP_BOUND_BASE` among its bases.
+    """Return ``True`` if *node* lists a shared loop-bound base among its bases.
 
     Matches both ``class C(LoopBoundPrimitive)`` (a bare ``Name``) and a
     dotted/aliased reference ``class C(mod.LoopBoundPrimitive)`` (an
@@ -221,9 +257,9 @@ def _inherits_loop_bound_base(node: ast.ClassDef) -> bool:
     under a module-qualified path.
     """
     for base in node.bases:
-        if isinstance(base, ast.Name) and base.id == LOOP_BOUND_BASE:
+        if isinstance(base, ast.Name) and base.id in LOOP_BOUND_BASES:
             return True
-        if isinstance(base, ast.Attribute) and base.attr == LOOP_BOUND_BASE:
+        if isinstance(base, ast.Attribute) and base.attr in LOOP_BOUND_BASES:
             return True
     return False
 
@@ -236,7 +272,7 @@ def _class_methods(module: ast.Module) -> dict[int, set[str]]:
     two separate outer classes) don't collide and silently misreport
     compliance.
 
-    A class inheriting :data:`LOOP_BOUND_BASE` is credited with
+    A class inheriting one of :data:`LOOP_BOUND_BASES` is credited with
     ``set_bound_loop`` even though it no longer defines it directly: the
     template-method base supplies that half of the protocol. ``reset_after_open``
     is *not* credited by inheritance — each owner must still define it directly.
@@ -428,7 +464,7 @@ def test_inherits_loop_bound_base_credits_only_the_right_classes() -> None:
     """The base-class check matches bare + dotted bases and nothing else.
 
     Guards the inheritance credit in ``_class_methods``: if this regressed,
-    the four mixin owners would silently lose their ``set_bound_loop`` credit
+    the shared-base owners would silently lose their ``set_bound_loop`` credit
     and either be (wrongly) flagged or, worse, an unrelated class could be
     (wrongly) credited and an unguarded primitive could slip through.
     """
@@ -436,6 +472,10 @@ def test_inherits_loop_bound_base_credits_only_the_right_classes() -> None:
     assert _inherits_loop_bound_base(_first_classdef("class C(LoopBoundPrimitive): pass"))
     # Dotted / module-qualified base.
     assert _inherits_loop_bound_base(_first_classdef("class C(mod.LoopBoundPrimitive): pass"))
+    # The epoch-fenced base derives from ``LoopBoundPrimitive`` and supplies
+    # the same method transitively.
+    assert _inherits_loop_bound_base(_first_classdef("class C(EpochFenced): pass"))
+    assert _inherits_loop_bound_base(_first_classdef("class C(mod.EpochFenced): pass"))
     # Mixed bases — credited as long as the base appears anywhere.
     assert _inherits_loop_bound_base(_first_classdef("class C(Base, LoopBoundPrimitive): pass"))
     # No inheritance / unrelated base must NOT be credited.

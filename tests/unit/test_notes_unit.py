@@ -4,22 +4,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from notebooklm._mind_map import NoteBackedMindMapService
-from notebooklm._note_service import NoteService
-from notebooklm._notes import NotesAPI
+from notebooklm._web.mind_maps import NoteBackedMindMapService
+from notebooklm._web.notes import NoteService, WebNotesAPI
 from notebooklm.exceptions import NoteNotFoundError, RPCError
 
 
 @pytest.fixture
 def mock_core():
-    """Create a mocked Session for NotesAPI.
+    """Create a fake core for NotesAPI.
 
     ``NoteService`` and ``NoteBackedMindMapService`` are wired against
     this same mock, so a ``mock_core.rpc_executor.rpc_call`` stub drives both the
     note-row primitives and the mind-map facade — the same surface
     NotesAPI used to exercise via the legacy ``_mind_map`` module-level helpers.
     """
-    from _fixtures.fake_core import make_fake_core
+    from tests._fixtures.fake_core import make_fake_core
 
     return make_fake_core(rpc_call=AsyncMock())
 
@@ -32,9 +31,10 @@ def notes_api(mock_core):
     fixture exercises the production wiring rather than a fully-mocked
     collaborator surface.
     """
-    note_service = NoteService(mock_core)
+    note_service = NoteService(mock_core, supervisor=mock_core)
     mind_maps = NoteBackedMindMapService(note_service)
-    return NotesAPI(
+    return WebNotesAPI(
+        supervisor=mock_core,
         notes=note_service,
         mind_maps=mind_maps,
     )

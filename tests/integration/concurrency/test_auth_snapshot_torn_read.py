@@ -12,9 +12,8 @@ mutation prologue, and a URL builder that read
 CSRF and the URL's ``f.sid`` from different generations on the wire.
 
 The fix — which is what the current code implements (see
-``AuthRefreshCoordinator.snapshot`` in
-``src/notebooklm/_runtime/auth.py:182-207`` and
-``RpcExecutor.build_url`` in ``src/notebooklm/_rpc_executor.py``, the
+``src/notebooklm/_web/transport/auth.py::AuthRefreshCoordinator.snapshot`` and
+``RpcExecutor.build_url`` in ``src/notebooklm/_web/transport/executor.py``, the
 canonical homes since PR #4b inlined the Session-level
 ``_snapshot`` / ``_build_url`` thin wrappers) — introduces a dedicated
 ``_auth_snapshot_lock`` that:
@@ -41,7 +40,7 @@ the design composes correctly under concurrent load. It does not, on
 its own, surface a pre-fix torn read against an unfixed code base —
 the original hazard (a URL builder reading ``self.auth`` live instead
 of consuming a frozen ``AuthSnapshot``) only materializes if a yield
-point slips into ``_perform_authed_post``'s prologue between snapshot
+point slips into the shared transport prologue between snapshot
 capture and request build, which is what the AST guards in
 ``tests/unit/test_concurrency_refresh_race.py`` lock down statically
 (``RpcExecutor.build_url`` is now AST-checked to consume the snapshot
@@ -62,10 +61,10 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from _fixtures.kernel_test_helpers import install_http_client_for_test
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm.auth import AuthTokens
 from notebooklm.rpc import RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 # Mock-only test (no real HTTP, no cassette) — opt out of the
 # integration-tree enforcement hook in ``tests/integration/conftest.py``.
@@ -131,44 +130,44 @@ def _extract_cookie_gen(cookie_header: str) -> int:
 async def test_concurrent_refresh_does_not_tear_auth_triple_across_fan_out():
     """Fan 50 RPCs truly concurrently with a refresh, assert no torn triple.
 
-    Mechanism:
+        Mechanism:
 
-    - 50 ``rpc_call`` coroutines AND one refresh coroutine are dispatched
-      into a single ``asyncio.gather``. They all become ready at the
-      same time and the event loop schedules them onto the loop's task
-      queue together — there is no "first batch / second batch"
-      pre-serialization.
-    - The mock transport's handler captures the request and then yields
-      via ``asyncio.sleep(0)`` so the refresh task can interleave its
-      lock-acquired write block against any RPCs that are mid-
-      ``_perform_authed_post``. Each captured ``httpx.Request`` already
-      has its URL / body / cookie header frozen by the time the handler
-      runs (httpx builds the request synchronously before the transport
-      sees it), so the captured triple IS what crossed the wire.
-    - The refresh task is also dispatched via ``gather`` — same event-
-      loop scheduling as the RPCs. It acquires
-      ``_auth_snapshot_lock`` and writes csrf/sid/cookies atomically.
+        - 50 ``rpc_call`` coroutines AND one refresh coroutine are dispatched
+          into a single ``asyncio.gather``. They all become ready at the
+          same time and the event loop schedules them onto the loop's task
+          queue together — there is no "first batch / second batch"
+          pre-serialization.
+        - The mock transport's handler captures the request and then yields
+          via ``asyncio.sleep(0)`` so the refresh task can interleave its
+          lock-acquired write block against any RPCs that are mid-
+          ``RuntimeTransport.perform_authed_post``. Each captured ``httpx.Request`` already
+          has its URL / body / cookie header frozen by the time the handler
+          runs (httpx builds the request synchronously before the transport
+          sees it), so the captured triple IS what crossed the wire.
+        - The refresh task is also dispatched via ``gather`` — same event-
+          loop scheduling as the RPCs. It acquires
+          ``_auth_snapshot_lock`` and writes csrf/sid/cookies atomically.
 
-    The asserted invariant: for EVERY captured POST, the three
-    generation tags extracted from
-    ``(body's CSRF, URL's f.sid, Cookie header's SID)`` must agree.
+        The asserted invariant: for EVERY captured POST, the three
+        generation tags extracted from
+        ``(body's CSRF, URL's f.sid, Cookie header's SID)`` must agree.
 
-    Scope honestly: this test verifies the *new design works end-to-end
-    under concurrent load* — the lock serializes
-    ``AuthRefreshCoordinator.snapshot()`` reads with the refresh writes,
-    the snapshot consumer in ``RpcExecutor.build_url`` makes URL + body
-    share the same generation, and 50 concurrent RPCs
-    + 1 refresh produce 50 coherent captured triples. It does NOT, on
-    its own, surface the pre-fix torn read against an unfixed code
+        Scope honestly: this test verifies the *new design works end-to-end
+        under concurrent load* — the lock serializes
+        ``AuthRefreshCoordinator.snapshot()`` reads with the refresh writes,
+        the snapshot consumer in ``RpcExecutor.build_url`` makes URL + body
+        share the same generation, and 50 concurrent RPCs
+        + 1 refresh produce 50 coherent captured triples. It does NOT, on
+        its own, surface the pre-fix torn read against an unfixed code
     base — that requires a yield point between snapshot capture and
     request build (introduced via a future ``await`` slipping into the
-    prologue), which the AST guards
-    (``test_perform_authed_post_has_no_await_before_post_per_iteration``,
-    ``test_build_url_does_not_read_self_auth``,
-    ``test_snapshot_acquires_auth_snapshot_lock``) catch statically.
-    The three guards together form the regression net; this test is the
-    runtime smoke proof that the design composes correctly with real
-    concurrent traffic.
+    shared transport prologue), which the AST guards
+    (``test_kernel_post_terminal_has_no_await_before_post_per_attempt``,
+        ``test_build_url_does_not_read_self_auth``,
+        ``test_snapshot_acquires_auth_snapshot_lock``) catch statically.
+        The three guards together form the regression net; this test is the
+        runtime smoke proof that the design composes correctly with real
+        concurrent traffic.
     """
     fan_out = 50
 
@@ -218,13 +217,13 @@ async def test_concurrent_refresh_does_not_tear_auth_triple_across_fan_out():
         """
         nonlocal current_gen
         new_gen = next(gen_iter)
-        async with core._collaborators.auth_coord.get_auth_snapshot_lock():
+        async with core._web_runtime.auth_coord.get_auth_snapshot_lock():
             core._auth.csrf_token = f"CSRF_{new_gen}"
             core._auth.session_id = f"SID_{new_gen}"
             # Update the live httpx cookie jar synchronously — this is
             # the same jar httpx merges into the outgoing Cookie header.
-            assert core._collaborators.kernel.http_client is not None
-            core._collaborators.kernel.get_http_client().cookies.set(
+            assert core._web_runtime.kernel.http_client is not None
+            core._web_runtime.kernel.get_http_client().cookies.set(
                 "SID", f"sid_cookie_{new_gen}", domain=".google.com"
             )
             core._auth.cookies = {("SID", ".google.com"): f"sid_cookie_{new_gen}"}
@@ -234,10 +233,10 @@ async def test_concurrent_refresh_does_not_tear_auth_triple_across_fan_out():
     try:
         # Replace the auto-built client with one using our MockTransport so
         # we can observe outgoing requests post-cookie-merge.
-        prior_cookies = core._collaborators.kernel.get_http_client().cookies
-        await core._collaborators.kernel.get_http_client().aclose()
+        prior_cookies = core._web_runtime.kernel.get_http_client().cookies
+        await core._web_runtime.kernel.get_http_client().aclose()
         install_http_client_for_test(
-            core._collaborators.kernel,
+            core._web_runtime.kernel,
             httpx.AsyncClient(
                 cookies=prior_cookies,
                 transport=transport,
@@ -250,7 +249,7 @@ async def test_concurrent_refresh_does_not_tear_auth_triple_across_fan_out():
         # instance. Without this priming, the lazy-init's "first caller
         # wins" check-then-assign would race the parallel coroutines and
         # potentially create two distinct Lock instances.
-        core._collaborators.auth_coord.get_auth_snapshot_lock()
+        core._web_runtime.auth_coord.get_auth_snapshot_lock()
 
         # Fan out 50 RPCs and one refresh concurrently. ``asyncio.gather``
         # schedules them together; the handler's ``asyncio.sleep(0)``
@@ -258,7 +257,7 @@ async def test_concurrent_refresh_does_not_tear_auth_triple_across_fan_out():
         # acquired write between RPC ``AuthRefreshCoordinator.snapshot()``
         # and ``client.post(...)`` boundaries.
         async def one_rpc() -> None:
-            await core._rpc_executor.rpc_call(RPC_METHOD, [])
+            await core._web_runtime.executor.rpc_call(RPC_METHOD, [])
 
         await asyncio.gather(
             bump_generation_under_lock(),

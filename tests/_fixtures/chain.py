@@ -2,13 +2,13 @@
 
 These helpers let middleware tests build a chain with
 ``[middleware_under_test, ...]``, call it with a benign ``RpcRequest``, and
-assert behavior without opening a real ``Session`` or HTTP client.
+assert behavior without opening a real client/runtime HTTP stack.
 
 Three helpers live here:
 
 - :class:`FakeChainTerminal` — programmable terminal stub matching the
   ``NextCall`` shape: ``RpcRequest -> RpcResponse``.
-- :func:`make_request` — factory for :class:`notebooklm._middleware.core.RpcRequest`
+- :func:`make_request` — factory for :class:`notebooklm._web.transport.middleware.core.RpcRequest`
   instances with benign defaults. Tests override only the fields they care
   about via keyword arguments.
 - :func:`chain_calls_through_to_terminal` — assertion helper that builds a
@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from notebooklm._middleware.core import (
+from notebooklm._web.transport.middleware.core import (
     Middleware,
     RpcRequest,
     RpcResponse,

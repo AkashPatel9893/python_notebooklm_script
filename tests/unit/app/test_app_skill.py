@@ -16,18 +16,25 @@ net-new direct coverage of the neutral surface.
 
 from __future__ import annotations
 
+import io
+import re
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from notebooklm._app.skill import (
     SCOPES,
+    SKILL_ARCHIVE_DIRNAME,
+    SKILL_ARCHIVE_ENTRY,
     TARGET_CREATE,
     TARGET_OVERWRITE,
     TARGET_UP_TO_DATE,
     TARGETS,
     add_version_comment,
+    build_skill_archive_bytes,
     classify_target,
     get_scope_root,
+    get_skill_content_mismatch,
     get_skill_path,
     get_skill_version,
     iter_targets,
@@ -56,6 +63,84 @@ def test_get_skill_version_no_version(tmp_path: Path) -> None:
 
 def test_get_skill_version_file_not_exists(tmp_path: Path) -> None:
     assert get_skill_version(tmp_path / "nonexistent.md") is None
+
+
+def test_get_skill_version_invalid_utf8_is_unknown(tmp_path: Path) -> None:
+    """Invalid UTF-8 makes the embedded version unavailable without raising."""
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_bytes(b"<!-- notebooklm-py v1.2.3 -->\n\xff")
+
+    assert get_skill_version(skill_file) is None
+
+
+# ---------------------------------------------------------------------------
+# get_skill_content_mismatch
+# ---------------------------------------------------------------------------
+
+
+def test_get_skill_content_mismatch_false_for_exact_bytes(tmp_path: Path) -> None:
+    """Canonical installed bytes report no drift."""
+    skill_file = tmp_path / "SKILL.md"
+    canonical = "<!-- notebooklm-py v1.2.3 -->\n# Test"
+    skill_file.write_text(canonical, encoding="utf-8")
+
+    assert get_skill_content_mismatch(skill_file, canonical) is False
+
+
+def test_get_skill_content_mismatch_false_for_windows_crlf(tmp_path: Path) -> None:
+    """Platform CRLF translation is equivalent to canonical LF content."""
+    skill_file = tmp_path / "SKILL.md"
+    canonical = "<!-- notebooklm-py v1.2.3 -->\n# Test\n"
+    skill_file.write_bytes(canonical.encode("utf-8").replace(b"\n", b"\r\n"))
+
+    assert get_skill_content_mismatch(skill_file, canonical) is False
+
+
+def test_get_skill_content_mismatch_true_for_drift(tmp_path: Path) -> None:
+    """Differing readable content reports drift."""
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text("locally edited", encoding="utf-8")
+
+    assert get_skill_content_mismatch(skill_file, "canonical") is True
+
+
+def test_get_skill_content_mismatch_true_for_invalid_utf8(tmp_path: Path) -> None:
+    """Malformed installed bytes remain detectable as drift."""
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_bytes(b"canonical\xff")
+
+    assert get_skill_content_mismatch(skill_file, "canonical") is True
+
+
+def test_get_skill_content_mismatch_none_when_target_missing(tmp_path: Path) -> None:
+    """A missing installed target has unavailable integrity."""
+    assert get_skill_content_mismatch(tmp_path / "missing.md", "canonical") is None
+
+
+def test_get_skill_content_mismatch_none_when_canonical_unavailable(tmp_path: Path) -> None:
+    """Missing canonical package content makes comparison unavailable."""
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text("installed", encoding="utf-8")
+
+    assert get_skill_content_mismatch(skill_file, None) is None
+
+
+def test_get_skill_content_mismatch_none_on_io_failure(tmp_path: Path) -> None:
+    """An installed-content read failure makes comparison unavailable."""
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text("installed", encoding="utf-8")
+
+    with patch.object(Path, "read_bytes", side_effect=PermissionError("denied")):
+        assert get_skill_content_mismatch(skill_file, "canonical") is None
+
+
+def test_skill_path_probe_failure_returns_unavailable(tmp_path: Path) -> None:
+    """An inaccessible target path does not escape version or drift probes."""
+    skill_file = tmp_path / "SKILL.md"
+
+    with patch.object(Path, "exists", side_effect=PermissionError("denied")):
+        assert get_skill_version(skill_file) is None
+        assert get_skill_content_mismatch(skill_file, "canonical") is None
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +364,58 @@ def test_remove_empty_parents_never_removes_scope_root(tmp_path: Path) -> None:
         remove_empty_parents(skill_path, "user")
 
     assert home.exists()
+
+
+# ---------------------------------------------------------------------------
+# build_skill_archive_bytes (Claude-uploadable skill archive)
+# ---------------------------------------------------------------------------
+
+_STAMPED = "---\nname: notebooklm\ndescription: test\n---\n<!-- notebooklm-py v1.2.3 -->\n# Body\n"
+
+
+def test_build_skill_archive_bytes_single_entry_roundtrip() -> None:
+    data = build_skill_archive_bytes(_STAMPED)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        assert archive.namelist() == [SKILL_ARCHIVE_ENTRY]
+        extracted = archive.read(SKILL_ARCHIVE_ENTRY).decode("utf-8")
+    assert extracted == _STAMPED
+    # Frontmatter must stay the first bytes for upload validation.
+    assert extracted.startswith("---\n")
+
+
+def test_build_skill_archive_bytes_is_deterministic() -> None:
+    assert build_skill_archive_bytes(_STAMPED) == build_skill_archive_bytes(_STAMPED)
+
+
+def test_build_skill_archive_bytes_entry_is_deflated() -> None:
+    # ZipFile's archive-level compression default does NOT apply to an
+    # explicit ZipInfo; guard against a silent ZIP_STORED regression.
+    data = build_skill_archive_bytes(_STAMPED)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        assert archive.getinfo(SKILL_ARCHIVE_ENTRY).compress_type == zipfile.ZIP_DEFLATED
+
+
+def test_build_skill_archive_bytes_pins_entry_metadata() -> None:
+    data = build_skill_archive_bytes(_STAMPED)
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        info = archive.getinfo(SKILL_ARCHIVE_ENTRY)
+    assert info.date_time == (2020, 1, 1, 0, 0, 0)
+    assert info.create_system == 3
+    assert info.external_attr == 0o100644 << 16
+
+
+def test_skill_archive_entry_lives_in_archive_dirname() -> None:
+    assert f"{SKILL_ARCHIVE_DIRNAME}/SKILL.md" == SKILL_ARCHIVE_ENTRY
+
+
+def test_skill_archive_dirname_matches_repo_frontmatter_name() -> None:
+    # Upload validation requires the zip-root folder name to equal the
+    # SKILL.md frontmatter ``name`` (R3 tripwire).
+    skill_md = Path(__file__).resolve().parents[3] / "SKILL.md"
+    frontmatter = skill_md.read_text(encoding="utf-8").split("---", 2)[1]
+    match = re.search(r"^name:\s*(.*)$", frontmatter, flags=re.MULTILINE)
+    assert match is not None
+    assert match.group(1).strip() == SKILL_ARCHIVE_DIRNAME

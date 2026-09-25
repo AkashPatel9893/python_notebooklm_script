@@ -1,14 +1,14 @@
 """Firefox-family cookie helpers (containers + container-aware extractor).
 
-Bypasses rookiepy for Firefox Multi-Account Containers because rookiepy
-0.5.6 doesn't filter on ``originAttributes`` and silently merges every
+Bypasses rookie-cookies for Firefox Multi-Account Containers because rookie-cookies
+doesn't filter on ``originAttributes`` and silently merges every
 container's cookies (see issues #366 / #367). Uses the helpers in
 :mod:`notebooklm.cli._firefox_containers` to talk to ``cookies.sqlite``
 directly.
 
 Imports from :mod:`.cookie_jar` (allowed-but-unused per the DAG;
 firefox container reads return raw cookie dicts that the caller hands
-back to ``_enumerate_one_jar``), :mod:`.rookiepy_errors` (friendly
+back to ``_enumerate_one_jar``), :mod:`.rookie_cookies_errors` (friendly
 error printer), and :mod:`.cookie_domains` (domain-list builder).
 """
 
@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from .cookie_domains import _build_google_cookie_domains
 from .outcomes import BrowserCookieOutcome, CookieValidationFailure
-from .rookiepy_errors import _handle_rookiepy_error
+from .rookie_cookies_errors import _handle_rookie_cookies_error
 
 if TYPE_CHECKING:
     from .io_seam import LoginIO
@@ -49,10 +49,11 @@ def _read_firefox_container_cookies(
     *,
     verbose: bool = True,
     include_domains: set[str] | None = None,
+    firefox_containers: Any | None = None,
 ) -> list[dict[str, Any]] | BrowserCookieOutcome:
     """Load Google cookies from a specific Firefox Multi-Account Container.
 
-    Bypasses rookiepy because rookiepy 0.5.6 does not filter on
+    Bypasses rookie-cookies because rookie-cookies does not filter on
     ``originAttributes`` and silently merges every container's cookies (see
     issue #366 / #367). We talk to ``cookies.sqlite`` directly via the
     helpers in :mod:`notebooklm.cli._firefox_containers`.
@@ -66,7 +67,7 @@ def _read_firefox_container_cookies(
             ``auth inspect --json``.
 
     Returns:
-        On success — rookiepy-shape cookie dicts (compatible with
+        On success — rookie-cookies-shape cookie dicts (compatible with
         :func:`convert_rookiepy_cookies_to_storage_state`).
 
         On failure — a :class:`.outcomes.BrowserCookieOutcome` carrying the
@@ -75,7 +76,7 @@ def _read_firefox_container_cookies(
         renders ``outcome.message`` and exits, keeping presentation + exit
         policy out of ``cli/services``.
     """
-    firefox_containers = _firefox_containers_module()
+    firefox_containers = firefox_containers or _firefox_containers_module()
 
     profile_path = firefox_containers.find_firefox_profile_path()
     if profile_path is None:
@@ -86,7 +87,7 @@ def _read_firefox_container_cookies(
                 "Looked for profiles.ini in the standard Firefox locations. "
                 "If you have Firefox installed in a non-standard location, the "
                 "container-aware extractor cannot find it. Drop the '::<container>' "
-                "suffix to fall back to rookiepy's autodetection."
+                "suffix to fall back to rookie-cookies' autodetection."
             ),
         )
 
@@ -114,7 +115,7 @@ def _read_firefox_container_cookies(
         return CookieValidationFailure(code="FIREFOX_COOKIES_NOT_FOUND", message=f"[red]{e}[/red]")
     except (OSError, RuntimeError) as e:
         return CookieValidationFailure(
-            code="COOKIE_READ_FAILED", message=_handle_rookiepy_error(e, "firefox")
+            code="COOKIE_READ_FAILED", message=_handle_rookie_cookies_error(e, "firefox")
         )
     except sqlite3.DatabaseError as e:
         return CookieValidationFailure(
@@ -123,7 +124,11 @@ def _read_firefox_container_cookies(
         )
 
 
-def _maybe_warn_firefox_containers_in_use(io: LoginIO) -> None:
+def _maybe_warn_firefox_containers_in_use(
+    io: LoginIO,
+    *,
+    firefox_containers: Any | None = None,
+) -> None:
     """Emit a one-line warning when unscoped ``firefox`` is risky.
 
     Triggers when ``cookies.sqlite`` has at least one row whose
@@ -135,7 +140,7 @@ def _maybe_warn_firefox_containers_in_use(io: LoginIO) -> None:
 
     Any probe failure is swallowed inside ``has_container_cookies_in_use``.
     """
-    firefox_containers = _firefox_containers_module()
+    firefox_containers = firefox_containers or _firefox_containers_module()
 
     profile_path = firefox_containers.find_firefox_profile_path()
     if profile_path is None:

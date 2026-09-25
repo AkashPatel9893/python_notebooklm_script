@@ -9,8 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+from notebooklm.cli import helpers as helpers_module
+from notebooklm.exceptions import ValidationError
 from notebooklm.notebooklm_cli import cli
 from notebooklm.types import (
+    DriveSourceStatus,
     Source,
     SourceFulltext,
     SourceNotFoundError,
@@ -27,6 +31,43 @@ from .conftest import (
     source_guide,
 )
 
+#: Ids/titles copied from the live-captured Drive ``ADD_SOURCE`` response used by
+#: ``tests/unit/test_sources_row_adapter.py::_live_google_docs_row`` (itself taken
+#: verbatim from ``tests/cassettes/web/sources_add_drive.yaml``). Note the absent
+#: ``url``: a Drive source populates no URL slot, which is why
+#: ``drive_document_id`` is the only handle on it (#2113).
+_DRIVE_FILE_ID = "1oAk_INJHbIPsIh49jgNqj3FESSGHZrzxFY7t05Lvvl0"
+_DRIVE_SOURCE_ID = "ef72c03c-b429-41cb-ae79-8529d35d6d5b"
+
+
+def _drive_source(drive_status: DriveSourceStatus | None) -> Source:
+    """A realistic Google-native Drive source (type code 1, no URL)."""
+    return Source(
+        id=_DRIVE_SOURCE_ID,
+        title="Rubisco Research: Status and Future",
+        url=None,
+        _type_code=1,
+        # Ingestion completed and STAYS complete after the Drive file goes
+        # away — the #2111 trap the Drive axis exists to disambiguate.
+        status=SourceStatus.READY,
+        created_at=datetime(2026, 1, 23, 18, 42),
+        drive_document_id=_DRIVE_FILE_ID,
+        drive_status=drive_status,
+    )
+
+
+def _web_source() -> Source:
+    """A plain web-page source: no Drive claim on any axis."""
+    return Source(
+        id="9f1c2d34-5678-4abc-def0-112233445566",
+        title="Example Page",
+        url="https://example.com",
+        _type_code=5,
+        status=SourceStatus.READY,
+        created_at=datetime(2026, 1, 23, 18, 45),
+    )
+
+
 source_module = importlib.import_module("notebooklm.cli.source_cmd")
 research_import_module = importlib.import_module("notebooklm.cli.research_import")
 
@@ -38,7 +79,7 @@ def runner():
 
 @pytest.fixture
 def mock_auth():
-    with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock:
+    with patch.object(helpers_module, "load_auth_from_storage") as mock:
         mock.return_value = {
             "SID": "test",
             "HSID": "test",
@@ -55,6 +96,117 @@ def mock_auth():
 
 
 class TestSourceList:
+    def test_source_list_composes_cli_service_and_client_boundary(self, runner, mock_auth):
+        """The CLI list path reaches the client-backed source-list service.
+
+        Output assertions alone could pass if the command fabricated a
+        response or bypassed the client. Invoke the real Click command and
+        service pipeline, then verify the client calls that supplied its
+        envelope.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[Source(id="src_1", title="Source One", url="https://example.com")]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["notebook_id"] == "nb_123"
+        assert payload["count"] == 1
+        assert payload["sources"][0]["id"] == "src_1"
+        mock_client.sources.list.assert_awaited_once_with("nb_123")
+        mock_client.notebooks.get.assert_awaited_once_with("nb_123")
+
+    def test_source_list_status_preparing_surfaces_the_orphan(self, runner, mock_auth):
+        """``--status preparing`` finds a row a failed add left behind (#2138).
+
+        The orphan sits at PREPARING, not ERROR, so before this option the CLI
+        had no way to reach it at all — ``source list`` showed it buried among
+        healthy rows and offered no filter, while the status a caller would
+        reach for (``error``) never matches it.
+
+        The ``count`` must narrow with the rows: the filter runs inside the
+        fetch precisely so the envelope and the listing cannot disagree.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(id="src_ok", title="Good", status=SourceStatus.READY),
+                Source(id="src_orphan", title="probe_excel.xlsx", status=SourceStatus.PREPARING),
+            ]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--status", "preparing", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["count"] == 1
+        assert [src["id"] for src in payload["sources"]] == ["src_orphan"]
+
+    def test_source_list_status_error_does_not_match_a_preparing_orphan(self, runner, mock_auth):
+        """The other half: ``error`` is where callers look, and it stays empty.
+
+        This is the gap #2138 reports, pinned so it cannot be "fixed" by
+        quietly reclassifying PREPARING as an error state — which would break
+        every genuinely mid-upload row.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                Source(id="src_orphan", title="probe_excel.xlsx", status=SourceStatus.PREPARING)
+            ]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--status", "error", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output)["count"] == 0
+
+    def test_source_list_rejects_an_unknown_status(self, runner, mock_auth):
+        """``--status`` is constrained to the enum's labels, not free text."""
+        mock_client = create_mock_client()
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--status", "stuck"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code != 0
+        assert "stuck" in result.output
+
     @pytest.mark.parametrize("output_mode", ["text", "json"])
     def test_source_list(self, runner, mock_auth, output_mode):
         mock_client = create_mock_client()
@@ -73,8 +225,8 @@ class TestSourceList:
         args = ["source", "list", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -100,9 +252,180 @@ class TestSourceList:
                 "status",
                 "status_id",
                 "created_at",
+                # The Drive axis is emitted on EVERY row, null on non-Drive
+                # sources, so a jq filter needs no `// empty` guard (#2113/#2111).
+                "drive_document_id",
+                "drive_status",
+                "is_drive_degraded",
             ]
             assert data["sources"][0]["id"] == "src_1"
             assert data["sources"][0]["type"] == "web_page"
+
+    def test_source_list_json_carries_the_drive_axis(self, runner, mock_auth):
+        """``source list --json`` reports Drive identity + health (#2113/#2111).
+
+        Both fields shipped to MCP and REST but were invisible to the CLI,
+        because the CLI row is hand-composed rather than a dataclass dump. The
+        degraded row is the point: ``status`` still reads ``ready`` (ingestion
+        did finish), so without the Drive axis nothing in CLI output says the
+        Drive file is gone.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[_drive_source(DriveSourceStatus.DELETED), _web_source()]
+        )
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        drive_row, web_row = json.loads(result.output)["sources"]
+
+        assert drive_row["status"] == "ready"
+        assert drive_row["drive_document_id"] == _DRIVE_FILE_ID
+        assert drive_row["drive_status"] == "deleted"
+        assert drive_row["is_drive_degraded"] is True
+        # The Drive row carries no URL, so ``drive_document_id`` is the only
+        # thing tying it back to the file it was created from.
+        assert drive_row["url"] is None
+
+        # Non-Drive rows keep the keys with null values (stable row shape).
+        assert web_row["drive_document_id"] is None
+        assert web_row["drive_status"] is None
+        assert web_row["is_drive_degraded"] is False
+
+    def test_source_list_json_keeps_the_file_id_when_no_health_slot_is_sent(
+        self, runner, mock_auth
+    ):
+        """A Drive row with an id but NO health claim keeps its id (#2113).
+
+        This is the only Drive shape this project has actually captured: the
+        row in ``tests/cassettes/web/sources_add_drive.yaml`` carries a
+        ``documentId`` while its settings block is ``[None, 2]`` — no Drive
+        status slot at all. The two fields decode from structurally unrelated
+        slots, so gating the id on the status would blank #2113's entire reason
+        for existing on the most common real shape while every degraded-row
+        test above stayed green.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[_drive_source(None)])
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="Test Notebook"))
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        row = json.loads(result.output)["sources"][0]
+        assert row["drive_document_id"] == _DRIVE_FILE_ID
+        # No claim on the health axis — and "no claim" is not "unknown".
+        assert row["drive_status"] is None
+        assert row["is_drive_degraded"] is False
+
+    def test_source_list_table_flags_only_the_degraded_drive_row(self, runner, mock_auth):
+        """The Status cell gains a Drive note ONLY where the two axes disagree.
+
+        Human output must stay readable for the overwhelming majority of
+        sources that are not Drive-backed, so there is no Drive column: a
+        healthy Drive row and a web row render exactly as they did before.
+        """
+
+        # Short ids/titles so the Status cell cannot wrap and split the
+        # annotation across lines on a narrow console.
+        def _short(sid, drive_status):
+            return Source(
+                id=sid,
+                title="Doc",
+                _type_code=1,
+                status=SourceStatus.READY,
+                drive_document_id="1AbC",
+                drive_status=drive_status,
+            )
+
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                _short("src_gone", DriveSourceStatus.DELETED),
+                _short("src_ok", DriveSourceStatus.ACTIVE),
+                Source(id="src_web", title="Page", _type_code=5, status=SourceStatus.READY),
+            ]
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "list", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        # One annotated cell for the deleted Drive file; the healthy Drive row
+        # and the web row leave the Status column untouched.
+        assert result.output.count("(drive: deleted)") == 1
+        assert "(drive: active)" not in result.output
+        assert result.output.count("ready") == 3
+        header = next(
+            line for line in result.output.splitlines() if "Title" in line and "Status" in line
+        )
+        assert "Drive" not in header  # no new column
+
+    def test_source_list_table_never_ellipsizes_the_drive_label(
+        self, runner, mock_auth, narrow_console
+    ):
+        """The longest Drive label survives a narrow terminal intact.
+
+        `ready (drive: gen_ai_access_denied)` is the widest annotation this can
+        produce. Under the Status column's default `overflow="ellipsis"` an
+        80-column table clips it to `gen_ai_acces…`, dropping the one word the
+        annotation exists to carry — so the spec pins `overflow="fold"`. The
+        other table tests run at the autouse 400-column width and cannot see
+        this.
+        """
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(
+            return_value=[
+                _drive_source(DriveSourceStatus.GEN_AI_ACCESS_DENIED),
+                _web_source(),
+            ]
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "list", "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        # The cell folds over several visual lines, and the other columns sit
+        # between the fragments — so rebuild the Status column (the last cell
+        # of each body row) rather than squashing the whole table.
+        status_column = "".join(
+            line.split("│")[-2].strip()
+            for line in result.output.splitlines()
+            if line.count("│") >= 2
+        )
+        assert "ready (drive: gen_ai_access_denied)".replace(" ", "") in status_column.replace(
+            " ", ""
+        )
+        # Nothing in the folded cell was ellipsized away.
+        assert "…" not in status_column
 
     @pytest.mark.parametrize("output_mode", ["text", "json"])
     def test_source_list_limit_caps_rows(self, runner, mock_auth, output_mode):
@@ -116,8 +439,8 @@ class TestSourceList:
         args = ["source", "list", "-n", "nb_123", "--limit", limit]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -146,8 +469,8 @@ class TestSourceList:
         mock_client = create_mock_client()
         mock_client.sources.list = AsyncMock(return_value=[Source(id="src_long", title=long_title)])
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -166,8 +489,8 @@ class TestSourceList:
         mock_client = create_mock_client()
         mock_client.sources.list = AsyncMock(return_value=[Source(id="src_long", title=long_title)])
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -204,8 +527,8 @@ class TestSourceList:
         args = ["source", "list", "-n", "nb_123", "--label", "lblaaa111"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -235,8 +558,8 @@ class TestSourceList:
         )
         mock_client.labels.sources = AsyncMock(return_value=[all_sources[0]])
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -272,8 +595,8 @@ class TestSourceAdd:
         args = ["source", "add", "https://example.com", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -294,8 +617,8 @@ class TestSourceAdd:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -313,8 +636,8 @@ class TestSourceAdd:
             return_value=Source(id="src_text", title="My Text Source")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -331,8 +654,8 @@ class TestSourceAdd:
             return_value=Source(id="src_text", title="Custom Title")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -363,8 +686,8 @@ class TestSourceAdd:
             return_value=Source(id="src_file", title="test.pdf")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -385,8 +708,8 @@ class TestSourceAdd:
             return_value=Source(id="src_file", title="test.pdf")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -425,8 +748,8 @@ class TestSourceAdd:
             return_value=Source(id="src_file", title="test.pdf")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -457,8 +780,8 @@ class TestSourceAdd:
             return_value=Source(id="src_t", title="X", url="https://example.com")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -485,8 +808,8 @@ class TestSourceAdd:
             return_value=Source(id="src_d", title="Y", url="https://example.com")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -520,8 +843,8 @@ class TestSourceGet:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -532,14 +855,106 @@ class TestSourceGet:
         assert "Test Source" in result.output
         assert "src_123" in result.output
 
+    @pytest.mark.parametrize(
+        ("drive_status", "expected_label", "expect_stale_warning"),
+        [
+            (DriveSourceStatus.DELETED, "deleted", True),
+            (DriveSourceStatus.ACTIVE, "active", False),
+        ],
+    )
+    def test_source_get_text_reports_drive_file_and_status(
+        self, runner, mock_auth, drive_status, expected_label, expect_stale_warning
+    ):
+        """Text ``source get`` shows the Drive file id and its health.
+
+        A Drive source has no URL, so before this the text output had nothing
+        tying the row to its Drive file (#2113), and nothing at all about a
+        file that was deleted after ingestion completed (#2111).
+        """
+        drive = _drive_source(drive_status)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert f"Drive File ID: {_DRIVE_FILE_ID}" in output
+        assert f"Drive Status: {expected_label}" in output
+        # Only the degraded row earns the "may be stale" caveat.
+        # Status-neutral wording: a degraded Drive file can sit on a source
+        # that is still processing, so this must not claim ingestion finished.
+        assert ("may be stale" in output) is expect_stale_warning
+        assert "ingestion finished" not in output
+        # And it must not point at a "Status above" line — this view prints no
+        # ingestion status at all.
+        assert "Status above" not in output
+        assert "Status:" not in output.replace("Drive Status:", "")
+
+    def test_source_get_text_shows_the_file_id_when_no_health_slot_is_sent(self, runner, mock_auth):
+        """The captured Drive row — id present, health slot absent — still shows its id.
+
+        The two lines are gated independently; this pins that. Hoisting the
+        Drive-status guard above the file-id line would blank #2113 on the only
+        Drive shape this project has ever captured, and every degraded-row test
+        would stay green.
+        """
+        drive = _drive_source(None)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert f"Drive File ID: {_DRIVE_FILE_ID}" in output
+        # No health claim -> no status line at all (not "unknown", not blank).
+        assert "Drive Status" not in output
+
+    def test_source_get_text_omits_drive_lines_for_a_non_drive_source(self, runner, mock_auth):
+        """A web source's text output is unchanged — no empty Drive lines."""
+        web = _web_source()
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[web])
+        mock_client.sources.get_or_none = AsyncMock(return_value=web)
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli, ["source", "get", web.id, "-n", "nb_123"], obj=inject_client(mock_client)
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Drive" not in result.output
+
     def test_source_get_not_found(self, runner, mock_auth):
         mock_client = create_mock_client()
         # Mock sources.list to return empty (no match for resolve_source_id)
         mock_client.sources.list = AsyncMock(return_value=[])
         mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -580,8 +995,8 @@ class TestSourceGet:
         mock_client.sources.list = AsyncMock(return_value=[])
         mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -599,8 +1014,8 @@ class TestSourceGet:
         mock_client.sources.list = AsyncMock(return_value=[])
         mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -628,8 +1043,8 @@ class TestSourceGet:
         )
         mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -649,8 +1064,8 @@ class TestSourceGet:
         )
         mock_client.sources.get_or_none = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -681,8 +1096,8 @@ class TestSourceDelete:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -702,8 +1117,8 @@ class TestSourceDelete:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -730,8 +1145,8 @@ class TestSourceDelete:
         )
         mock_client.sources.delete = AsyncMock(side_effect=RPCError("delete blew up"))
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -748,8 +1163,8 @@ class TestSourceDelete:
         mock_client.sources.delete = AsyncMock(return_value=True)
 
         source_id = "03abe51c-d8df-43ba-ae2d-0efe02c71c4a"
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -768,8 +1183,8 @@ class TestSourceDelete:
         mock_client.sources.delete = AsyncMock(return_value=True)
 
         source_id = "03abe51cd8df43baae2d0efe02c71c4a"
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -794,8 +1209,8 @@ class TestSourceDelete:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -815,8 +1230,8 @@ class TestSourceDelete:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -839,8 +1254,8 @@ class TestSourceDelete:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -862,8 +1277,8 @@ class TestSourceDeleteByTitle:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -886,8 +1301,8 @@ class TestSourceDeleteByTitle:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -905,8 +1320,8 @@ class TestSourceDeleteByTitle:
         mock_client.sources.list = AsyncMock(return_value=[])
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -926,8 +1341,8 @@ class TestSourceDeleteByTitle:
         )
         mock_client.sources.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -954,8 +1369,8 @@ class TestSourceRename:
         mock_client.sources.list = AsyncMock(return_value=[Source(id="src_123", title="Old Title")])
         mock_client.sources.rename = AsyncMock(return_value=Source(id="src_123", title="New Title"))
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -985,8 +1400,8 @@ class TestSourceRefresh:
             return_value=Source(id="src_123", title="Refreshed Source")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1008,8 +1423,8 @@ class TestSourceRefresh:
         )
         mock_client.sources.refresh = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1038,8 +1453,8 @@ class TestSourceAddDrive:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1060,8 +1475,8 @@ class TestSourceAddDrive:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1081,6 +1496,19 @@ class TestSourceAddDrive:
 
         assert result.exit_code == 0
 
+    def test_source_add_drive_unsupported_mime_hints_upload(self, runner, mock_auth):
+        """An unsupported Drive mime (e.g. ``epub``) is rejected at the CLI boundary
+        with the file-upload hint, not a bare Click choice error (#1827)."""
+        result = runner.invoke(
+            cli,
+            ["source", "add-drive", "file_id", "Book", "--mime-type", "epub", "-n", "nb_123"],
+        )
+        assert result.exit_code == 2
+        out = result.output.lower()
+        assert "not importable via drive" in out
+        assert "download" in out
+        assert "file" in out
+
     def test_source_add_drive_mime_type_no_deprecation_warning(self, runner, mock_auth):
         """Regression guard: Drive ``--mime-type`` MUST stay deprecation-free.
 
@@ -1096,8 +1524,8 @@ class TestSourceAddDrive:
                 return_value=Source(id="src_drive", title="My Drive Source")
             )
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1120,6 +1548,83 @@ class TestSourceAddDrive:
                 f"Drive --mime-type={choice} unexpectedly triggered the "
                 f"file-source deprecation notice"
             )
+
+
+class TestSourceAddDriveFile:
+    """The ``source add-drive-file`` command (#1884) — auto-route upload-only types."""
+
+    def test_happy_path_text(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive_file = AsyncMock(
+            return_value=Source(id="src_epub", title="Book.epub", _type_code=17)
+        )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add-drive-file", "drive_epub_id", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+        assert result.exit_code == 0, result.output
+        assert "Added Drive file source" in result.output
+        mock_client.sources.add_drive_file.assert_awaited_once_with(
+            "nb_123", "drive_epub_id", title=None, wait=False, wait_timeout=120.0
+        )
+
+    def test_json_envelope(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive_file = AsyncMock(
+            return_value=Source(id="src_epub", title="Book.epub", _type_code=17)
+        )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                [
+                    "source",
+                    "add-drive-file",
+                    "drive_epub_id",
+                    "--title",
+                    "My Book",
+                    "-n",
+                    "nb_123",
+                    "--json",
+                ],
+                obj=inject_client(mock_client),
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["action"] == "add-drive-file"
+        assert data["source"]["id"] == "src_epub"
+        assert data["source"]["type"] == "epub"
+        assert data["document_id"] == "drive_epub_id"
+        assert data["notebook_id"] == "nb_123"
+        mock_client.sources.add_drive_file.assert_awaited_once_with(
+            "nb_123", "drive_epub_id", title="My Book", wait=False, wait_timeout=120.0
+        )
+
+    def test_unsupported_type_error_exits_nonzero(self, runner, mock_auth):
+        mock_client = create_mock_client()
+        mock_client.sources.add_drive_file = AsyncMock(
+            side_effect=ValidationError(
+                "HTML isn't supported by NotebookLM upload; convert to .txt/.md/.pdf first."
+            )
+        )
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["source", "add-drive-file", "drive_html_id", "-n", "nb_123"],
+                obj=inject_client(mock_client),
+            )
+        assert result.exit_code != 0
+        assert "HTML" in result.output or "html" in result.output
 
 
 # =============================================================================
@@ -1150,8 +1655,8 @@ class TestSourceAddResearch:
             )
             mock_import.return_value = [{"id": "src_1", "title": "Source 1"}]
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1204,8 +1709,8 @@ class TestSourceAddResearch:
             )
             mock_import.return_value = [{"id": "src_1", "title": "Cited"}]
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1266,8 +1771,8 @@ class TestSourceAddResearch:
             )
             mock_import.return_value = [{"id": "src_t1", "title": "S"}]
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1329,8 +1834,8 @@ class TestSourceAddResearch:
             mock_client.research.poll = AsyncMock(side_effect=poll_responses)
             mock_import.return_value = [{"id": "src_long", "title": "S"}]
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1374,8 +1879,8 @@ class TestSourceAddResearch:
             )
             mock_client.research.poll = AsyncMock(side_effect=poll_responses)
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1410,8 +1915,8 @@ class TestSourceAddResearch:
             )
             mock_import.return_value = [{"id": "src_report", "title": "S"}]
 
-            with patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            with patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch:
                 mock_fetch.return_value = ("csrf", "session")
                 result = runner.invoke(
@@ -1464,8 +1969,8 @@ class TestSourceGuide:
         args = ["source", "guide", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -1491,8 +1996,8 @@ class TestSourceGuide:
             return_value=source_guide({"summary": "", "keywords": []})
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1512,8 +2017,8 @@ class TestSourceGuide:
             return_value=source_guide({"summary": "Summary without keywords", "keywords": []})
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1535,8 +2040,8 @@ class TestSourceGuide:
             return_value=source_guide({"summary": "", "keywords": ["AI", "ML", "Data"]})
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1572,8 +2077,8 @@ class TestSourceStale:
         args = ["source", "stale", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -1600,8 +2105,8 @@ class TestSourceStale:
         args = ["source", "stale", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -1672,8 +2177,8 @@ class TestSourceAddAutoDetect:
             return_value=Source(id="src_file", title="notes.txt")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1695,8 +2200,8 @@ class TestSourceAddAutoDetect:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1721,8 +2226,8 @@ class TestSourceAddAutoDetect:
             return_value=Source(id="src_text", title="Custom Title")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1758,8 +2263,8 @@ class TestSourceAddAutoDetect:
             return_value=Source(id="src_md", title="Real Intended Title")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1811,8 +2316,8 @@ class TestSourceAddPathShapedMissing:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1843,8 +2348,8 @@ class TestSourceAddPathShapedMissing:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1868,8 +2373,8 @@ class TestSourceAddPathShapedMissing:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1902,8 +2407,8 @@ class TestSourceAddPathShapedMissing:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1932,8 +2437,8 @@ class TestSourceAddPathShapedMissing:
             return_value=Source(id="src_file", title="real.md")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1975,8 +2480,8 @@ class TestSourceFulltext:
         args = ["source", "fulltext", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -2014,8 +2519,8 @@ class TestSourceFulltext:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2046,8 +2551,8 @@ class TestSourceFulltext:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2074,8 +2579,8 @@ class TestSourceFulltext:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2107,8 +2612,8 @@ class TestSourceFulltext:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2141,8 +2646,8 @@ class TestSourceWait:
         args = ["source", "wait", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -2165,8 +2670,8 @@ class TestSourceWait:
             return_value=Source(id="src_123", title="My Source Title", status=2)
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2188,8 +2693,8 @@ class TestSourceWait:
         args = ["source", "wait", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -2216,8 +2721,8 @@ class TestSourceWait:
         args = ["source", "wait", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -2245,8 +2750,8 @@ class TestSourceWait:
         args = ["source", "wait", "src_123", "-n", "nb_123"]
         if output_mode == "json":
             args.append("--json")
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, args, obj=inject_client(mock_client))
@@ -2280,8 +2785,8 @@ class TestSourceWait:
             return_value=Source(id="src_123", title="Test Source", status=2)
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2328,8 +2833,8 @@ class TestSourceWait:
         )
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
             patch.object(source_module.console, "status") as mock_status,
         ):
@@ -2362,8 +2867,8 @@ class TestSourceWait:
         )
 
         with (
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
             patch.object(source_module.console, "status") as mock_status,
         ):
@@ -2395,8 +2900,8 @@ class TestSourceWait:
         )
         mock_client.sources.wait_until_ready = AsyncMock(side_effect=KeyboardInterrupt)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2420,8 +2925,8 @@ class TestSourceWait:
         mock_client.sources.list = AsyncMock(return_value=[Source(id="src_json_sigint", title="T")])
         mock_client.sources.wait_until_ready = AsyncMock(side_effect=KeyboardInterrupt)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2547,7 +3052,7 @@ class _CleanPatch:
         self.obj = inject_client(mock_client)
 
         fetch_mock = self._exit_stack.enter_context(
-            patch("notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock)
+            patch.object(auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock)
         )
         fetch_mock.return_value = ("csrf", "session")
         return self
@@ -2577,8 +3082,9 @@ class TestSourceJsonOutput:
     """
 
     def _patch_fetch_tokens(self):
-        return patch(
-            "notebooklm.auth.fetch_tokens_with_domains",
+        return patch.object(
+            auth_module,
+            "fetch_tokens_with_domains",
             new_callable=AsyncMock,
             return_value=("csrf", "session"),
         )
@@ -2611,6 +3117,88 @@ class TestSourceJsonOutput:
         assert data["source"]["type"] == "web_page"
         assert data["source"]["url"] == "https://example.com"
         assert data["source"]["created_at"] == "2024-01-01T12:00:00"
+
+    def test_source_get_json_carries_drive_health(self, runner, mock_auth):
+        """``source get --json`` reports the Drive axis, not just ingestion (#2111).
+
+        The CLI mirror of ``tests/server/test_sources.py::
+        test_get_source_carries_drive_health``: without it the whole Drive axis
+        could vanish from CLI output with the CLI suite still green — which is
+        exactly how it never arrived in the first place.
+        """
+        drive = _drive_source(DriveSourceStatus.INACCESSIBLE)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        source = json.loads(result.output)["source"]
+        # Ingestion finished, so ``status`` still reads ready — that is the bug
+        # #2111 is about, and the Drive axis is what disambiguates it.
+        assert source["status"] == "ready"
+        assert source["drive_document_id"] == _DRIVE_FILE_ID
+        assert source["drive_status"] == "inaccessible"
+        assert source["is_drive_degraded"] is True
+
+    def test_source_get_json_drive_axis_is_null_for_a_non_drive_source(self, runner, mock_auth):
+        """A web source gets the Drive keys as ``null``/``false``, never omitted."""
+        web = _web_source()
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[web])
+        mock_client.sources.get_or_none = AsyncMock(return_value=web)
+
+        with self._patch_fetch_tokens():
+            result = runner.invoke(
+                cli,
+                ["source", "get", web.id, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        source = json.loads(result.output)["source"]
+        assert source["drive_document_id"] is None
+        assert source["drive_status"] is None
+        assert source["is_drive_degraded"] is False
+
+    def test_source_get_json_row_shape_matches_source_list(self, runner, mock_auth):
+        """``source get --json`` and ``source list --json`` share one row shape.
+
+        The two paths built their row independently, which is how a new field
+        could land on one and not the other. They now share
+        ``source_row_payload``; this pins that they agree key-for-key (``list``
+        adds only its 1-based ``index``).
+        """
+        drive = _drive_source(DriveSourceStatus.SYNCING)
+        mock_client = create_mock_client()
+        mock_client.sources.list = AsyncMock(return_value=[drive])
+        mock_client.sources.get_or_none = AsyncMock(return_value=drive)
+        mock_client.notebooks.get = AsyncMock(return_value=MagicMock(title="NB"))
+
+        with self._patch_fetch_tokens():
+            got = runner.invoke(
+                cli,
+                ["source", "get", _DRIVE_SOURCE_ID, "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+            listed = runner.invoke(
+                cli,
+                ["source", "list", "-n", "nb_123", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert got.exit_code == 0, got.output
+        assert listed.exit_code == 0, listed.output
+        get_row = json.loads(got.output)["source"]
+        list_row = json.loads(listed.output)["sources"][0]
+        assert list_row.pop("index") == 1
+        assert get_row == list_row
 
     def test_source_get_json_not_found_exits_1_with_typed_json(self, runner, mock_auth):
         # The contract was flipped: ``get`` on not-found now exits 1
@@ -2866,8 +3454,8 @@ class TestSourceAddStdinDash:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2890,8 +3478,8 @@ class TestSourceAddStdinDash:
             return_value=Source(id="src_text", title="My Title")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2912,8 +3500,8 @@ class TestSourceAddStdinDash:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2931,8 +3519,8 @@ class TestSourceAddStdinDash:
     @pytest.mark.parametrize("source_type", ["url", "file", "youtube"])
     def test_source_add_dash_rejects_non_text_type(self, runner, mock_auth, source_type):
         client_calls: list = []
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2948,8 +3536,8 @@ class TestSourceAddStdinDash:
 
     def test_source_add_dash_rejects_non_text_type_json(self, runner, mock_auth):
         client_calls: list = []
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -2977,8 +3565,8 @@ class TestSourceAddStdinDash:
             return_value=Source(id="src_text", title="Pasted Text")
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -3017,8 +3605,9 @@ class TestSourceBundleP1T2:
     """Regression tests for the P1.T2 source.py bug bundle (CLI audit)."""
 
     def _patch_fetch_tokens(self):
-        return patch(
-            "notebooklm.auth.fetch_tokens_with_domains",
+        return patch.object(
+            auth_module,
+            "fetch_tokens_with_domains",
             new_callable=AsyncMock,
             return_value=("csrf", "session"),
         )

@@ -7,7 +7,7 @@ assert (a) the wire body matches our captured request byte-for-byte and
 (b) the returned ``Note`` is parsed correctly from the captured response.
 
 A VCR cassette would be the canonical fixture for this (per
-``tests/cassettes/notes_create*.yaml``), but recording a fresh cassette
+``tests/cassettes/web/notes_create*.yaml``), but recording a fresh cassette
 requires a live auth session against the real service. The captured
 request/response pair under ``tests/unit/fixtures/`` is the next-best
 thing — it carries the exact wire payload Google's web UI sends when
@@ -137,3 +137,11 @@ async def test_save_answer_as_note_wire_round_trip(
     assert note.notebook_id == notebook_id
     # Content is the answer text WITH [N] markers (rich anchors live server-side).
     assert note.content == ask_result.answer
+    # The captured response carries the creation timestamp in the note metadata
+    # envelope (``note[2][2][0]``); save_answer_as_note now decodes it through
+    # NoteRow.created_at (issue #1529). Pin the EPOCH INT (TZ-invariant) — the
+    # fixture's [1778936820, 976814000] timestamp — never the wall-time string.
+    expected_epoch = response_note[2][2][0]
+    assert expected_epoch == 1778936820
+    assert note.created_at is not None
+    assert int(note.created_at.timestamp()) == expected_epoch

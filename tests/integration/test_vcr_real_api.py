@@ -14,10 +14,12 @@ Note: These tests are automatically skipped if cassettes are not available.
 import os
 
 import pytest
-from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
-from tests.vcr_config import notebooklm_vcr
 
 from notebooklm import NotebookLMClient
+from notebooklm.options import ClientConfig, WebBackendConfig
+from notebooklm.rpc import RPCMethod
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # Skip all tests in this module if cassettes are not available
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
@@ -42,6 +44,24 @@ class TestRealAPIWithVCR:
         assert isinstance(notebooks, list)
         # Should have at least the test notebook
         assert len(notebooks) >= 1
+
+    @pytest.mark.vcr
+    @pytest.mark.asyncio
+    @notebooklm_vcr.use_cassette("real_api_list_notebooks.yaml")
+    async def test_raw_web_call_replays_existing_rpc_cassette(self):
+        """The new namespace keeps the old raw executor wire contract unchanged."""
+        auth = await get_vcr_auth()
+
+        async with NotebookLMClient(
+            auth, config=ClientConfig(backend=WebBackendConfig())
+        ) as client:
+            result = await client.raw.call(
+                RPCMethod.LIST_NOTEBOOKS,
+                [None, 1, None, [2]],
+            )
+
+        assert isinstance(result, list)
+        assert result
 
     @pytest.mark.vcr
     @pytest.mark.asyncio

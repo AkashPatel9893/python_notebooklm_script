@@ -1,6 +1,6 @@
 """Unit tests for :class:`RetryMiddleware` (Tier-12 PR 12.7).
 
-Pins the contract documented in ``src/notebooklm/_middleware/retry.py`` and
+Pins the contract documented in ``src/notebooklm/_web/transport/middleware/retry.py`` and
 ADR-0009 §"Chain ordering":
 
 - **Pass-through on success.** Single ``next_call`` invocation; result
@@ -13,7 +13,7 @@ ADR-0009 §"Chain ordering":
   the first failure propagates without retry.
 - **Exhaustion**: after the budget is spent, the last exception re-raises
   unchanged so callers
-  (``_chat.transport.chat_aware_authed_post``) see the same shape they
+  (``_web.transport.chat.chat_aware_authed_post``) see the same shape they
   always did.
 - **Metrics**: ``rpc_rate_limit_retries`` / ``rpc_server_error_retries``
   increment per retry (NOT for the original failed attempt — same
@@ -36,13 +36,14 @@ from typing import Any
 import httpx
 import pytest
 
-# pytest puts ``tests/`` on ``sys.path``; ``_fixtures.chain`` is the canonical
-# import path documented in ``tests/_fixtures/__init__.py``.
-from _fixtures.chain import make_request
 from notebooklm._client_metrics import ClientMetrics
-from notebooklm._middleware.core import NextCall, RpcRequest, RpcResponse, build_chain
-from notebooklm._middleware.retry import RetryMiddleware
-from notebooklm._transport_errors import TransportRateLimited, TransportServerError
+from notebooklm._web.transport.errors import TransportRateLimited, TransportServerError
+from notebooklm._web.transport.middleware.core import NextCall, RpcRequest, RpcResponse, build_chain
+from notebooklm._web.transport.middleware.retry import RetryMiddleware
+
+# The ``tests/`` package chain is complete; ``tests._fixtures.chain`` is the
+# fully-qualified import path documented in ``tests/_fixtures/__init__.py``.
+from tests._fixtures.chain import make_request
 
 
 def _recording_sleep() -> tuple[Callable[[float], Awaitable[None]], list[float]]:
@@ -534,6 +535,86 @@ async def test_disable_read_timeout_retries_still_retries_connect_errors() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_factory",
+    [
+        pytest.param(lambda: _rate_limited(log_label="chat.ask"), id="http-429"),
+        pytest.param(lambda: _server_error(log_label="chat.ask"), id="http-5xx"),
+        pytest.param(
+            lambda: TransportServerError(
+                "chat write failed",
+                original=httpx.WriteError(
+                    "partial write", request=httpx.Request("POST", "https://example.test/x")
+                ),
+            ),
+            id="write-error",
+        ),
+        pytest.param(
+            lambda: TransportServerError(
+                "chat write timed out",
+                original=httpx.WriteTimeout(
+                    "partial write", request=httpx.Request("POST", "https://example.test/x")
+                ),
+            ),
+            id="write-timeout",
+        ),
+    ],
+)
+async def test_chat_post_transmission_matrix_never_replays(
+    failure_factory: Callable[[], BaseException],
+) -> None:
+    failure = failure_factory()
+    sleep, slept = _recording_sleep()
+    terminal, calls = _scripted_terminal([failure, httpx.Response(200)])
+    chain = build_chain(
+        [RetryMiddleware(rate_limit_max_retries=2, server_error_max_retries=2, sleep=sleep)],
+        terminal,
+    )
+
+    with pytest.raises(type(failure)) as captured:
+        await chain(
+            make_request(context={"log_label": "chat.ask", "disable_read_timeout_retries": True})
+        )
+
+    assert captured.value is failure
+    assert len(calls) == 1
+    assert slept == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original_factory",
+    [
+        pytest.param(httpx.ConnectError, id="connect-error"),
+        pytest.param(httpx.ConnectTimeout, id="connect-timeout"),
+        pytest.param(httpx.PoolTimeout, id="pool-timeout"),
+    ],
+)
+async def test_chat_zero_send_matrix_retains_replay(
+    original_factory: type[httpx.RequestError],
+) -> None:
+    request = httpx.Request("POST", "https://example.test/x")
+    failure = TransportServerError(
+        "chat zero-send failure",
+        original=original_factory("not sent", request=request),
+    )
+    sleep, slept = _recording_sleep()
+    terminal, calls = _scripted_terminal([failure, httpx.Response(200)])
+    chain = build_chain(
+        [RetryMiddleware(rate_limit_max_retries=2, server_error_max_retries=2, sleep=sleep)],
+        terminal,
+    )
+
+    response = await chain(
+        make_request(context={"log_label": "chat.ask", "disable_read_timeout_retries": True})
+    )
+
+    assert response.response.status_code == 200
+    assert len(calls) == 2
+    assert len(slept) == 1
+
+
+@pytest.mark.asyncio
 async def test_5xx_budget_exhausted_reraises_last_exception() -> None:
     """After ``server_error_max_retries`` exhausted, last ``TransportServerError`` propagates."""
     sleep, _slept = _recording_sleep()
@@ -743,9 +824,7 @@ async def test_missing_log_label_falls_back_to_sentinel(
     """A request without ``log_label`` admits a retry with a sentinel label.
 
     Defensive against ``__new__``-built fixtures driving the chain raw.
-    The middleware must not raise ``KeyError`` on a missing label —
-    matches DrainMiddleware's same fallback (pinned in
-    ``test_drain_middleware.py::test_missing_log_label_falls_back_to_sentinel``).
+    The middleware must not raise ``KeyError`` on a missing label.
     """
     sleep, _slept = _recording_sleep()
     terminal, _calls = _scripted_terminal(
@@ -811,7 +890,7 @@ async def test_429_and_5xx_budgets_are_independent() -> None:
 
 def test_middleware_satisfies_protocol() -> None:
     """``RetryMiddleware`` instance is assignable to ``Middleware``."""
-    from notebooklm._middleware.core import Middleware
+    from notebooklm._web.transport.middleware.core import Middleware
 
     middleware: Middleware = RetryMiddleware(rate_limit_max_retries=3, server_error_max_retries=3)
     assert callable(middleware)
@@ -826,12 +905,11 @@ def test_middleware_satisfies_protocol() -> None:
 async def test_non_transport_exception_propagates_without_retry() -> None:
     """``RetryMiddleware`` only catches transport exceptions; everything else flows up.
 
-    A generic ``RuntimeError`` from a deeper middleware (e.g. drain
-    rejection) must propagate without consuming the retry budget.
+    A generic ``RuntimeError`` from a deeper middleware must propagate
+    without consuming the retry budget.
     Pre-PR-12.7 the legacy transport loop only caught
     ``httpx.HTTPStatusError`` / ``httpx.RequestError``; the middleware
-    only catches the two named transport-exception types so
-    ``DrainMiddleware``'s ``RuntimeError("draining…")`` still propagates.
+    only catches the two named transport-exception types.
     """
     sleep, slept = _recording_sleep()
     boom = RuntimeError("not a transport error")

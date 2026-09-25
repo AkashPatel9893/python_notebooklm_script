@@ -29,10 +29,10 @@ not by notebook UUID.
 """
 
 import pytest
-from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
-from tests.vcr_config import notebooklm_vcr
 
 from notebooklm import NotebookLMClient
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 # Skip all tests in this module if cassettes are not available (mirrors the
 # pattern in tests/integration/test_vcr_comprehensive.py).
@@ -83,7 +83,7 @@ class TestEmptyResults:
         Covers both wings of the unified ``list`` implementation: the studio
         ``LIST_ARTIFACTS`` RPC (audio/video/reports/quizzes/...) AND the
         mind-map sidecar via the injected
-        :class:`notebooklm._mind_map.NoteBackedMindMapService`. A brand-new
+        :class:`notebooklm._web.mind_maps.NoteBackedMindMapService`. A brand-new
         notebook has neither, so the merged return must be ``[]``.
         """
         notebook_id = _get_scratch_notebook_id()

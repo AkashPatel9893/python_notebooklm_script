@@ -57,9 +57,23 @@ def _source(url: str = "http://ex.com", title: str = "S") -> SimpleNamespace:
 
 
 def _status(
-    status: ResearchStatus, *, sources: list[Any] | None = None, report: str = ""
+    status: ResearchStatus,
+    *,
+    sources: list[Any] | None = None,
+    report: str = "",
+    reason_message: str | None = None,
+    hint: str | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(status=status, sources=sources or [], report=report)
+    # ``reason_message`` / ``hint`` mirror the real ``ResearchTask`` derivations
+    # (#1964); they default to None, which is what a run with no termination
+    # reason carries.
+    return SimpleNamespace(
+        status=status,
+        sources=sources or [],
+        report=report,
+        reason_message=reason_message,
+        hint=hint,
+    )
 
 
 def _client() -> MagicMock:
@@ -83,12 +97,14 @@ class TestValidateAddResearchFlags:
     def test_cited_only_without_import_all_rejected(self) -> None:
         with pytest.raises(ValidationError) as exc:
             validate_add_research_flags(import_all=False, cited_only=True, no_wait=False)
-        assert "--cited-only requires --import-all" in str(exc.value)
+        assert exc.value.reason == "cited_requires_import"
+        assert "--" not in str(exc.value)
 
     def test_no_wait_with_import_all_rejected(self) -> None:
         with pytest.raises(ValidationError) as exc:
             validate_add_research_flags(import_all=True, cited_only=False, no_wait=True)
-        assert "--import-all requires" in str(exc.value)
+        assert exc.value.reason == "import_requires_wait"
+        assert "--" not in str(exc.value)
 
 
 # ===========================================================================
@@ -193,7 +209,7 @@ async def test_completed_import_all_but_no_sources_skips_importer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_json_output_threaded_to_importer() -> None:
+async def test_importer_receives_only_neutral_operation_inputs() -> None:
     client = _client()
     client.research.start = AsyncMock(return_value=_start())
     client.research.wait_for_completion = AsyncMock(
@@ -202,11 +218,9 @@ async def test_json_output_threaded_to_importer() -> None:
     importer = AsyncMock(
         return_value=SimpleNamespace(imported=[], sources=[], cited_selection=None)
     )
-    await execute_source_add_research(
-        client, _plan(import_all=True, json_output=True), import_sources=importer
-    )
+    await execute_source_add_research(client, _plan(import_all=True), import_sources=importer)
     _, kwargs = importer.call_args
-    assert kwargs["json_output"] is True
+    assert "json_output" not in kwargs
 
 
 @pytest.mark.asyncio
@@ -252,3 +266,24 @@ async def test_unknown_status_preserves_raw_value() -> None:
     result = await execute_source_add_research(client, _plan(), import_sources=AsyncMock())
     assert result.outcome == "unknown_status"
     assert result.status == "in_progress"
+
+
+async def test_failed_outcome_carries_reason_and_hint() -> None:
+    """#1964: ``source add-research`` must be able to explain an empty Drive
+    search rather than rendering a bare "Research failed"."""
+    client = _client()
+    client.research.start = AsyncMock(return_value=_start())
+    client.research.wait_for_completion = AsyncMock(
+        return_value=_status(
+            ResearchStatus.FAILED,
+            reason_message="The search of Google Drive found no matches for 'x'.",
+            hint="Try the exact Drive filename, the document URL, or add the "
+            "document directly by its document id.",
+        )
+    )
+
+    result = await execute_source_add_research(client, _plan(), import_sources=AsyncMock())
+
+    assert result.outcome == "failed"
+    assert "no matches" in result.reason_message
+    assert "document id" in result.hint

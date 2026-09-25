@@ -16,13 +16,16 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from _fixtures.login_io import RecordingLoginIO
+import notebooklm.auth as auth_module
+from notebooklm._auth.cookie_policy import app_host_scope_note
+from notebooklm._env import ENTERPRISE_BASE_HOST, PERSONAL_LEGACY_HOST
 from notebooklm.cli.services.login import cookie_jar
 from notebooklm.cli.services.login.outcomes import (
     CookieValidationFailure,
     NetworkFailure,
     StaleCookies,
 )
+from tests._fixtures.login_io import RecordingLoginIO
 
 
 class _FakeAccount:
@@ -55,10 +58,12 @@ def _enumerate_env(*, validate_return, run_async_side_effect=None, run_async_ret
         stack.enter_context(
             patch.object(cookie_jar, "validate_with_recovery", return_value=validate_return)
         )
-        stack.enter_context(patch("notebooklm.auth.extract_cookies_with_domains", return_value={}))
-        stack.enter_context(patch("notebooklm.auth.build_cookie_jar", return_value=object()))
         stack.enter_context(
-            patch("notebooklm.auth.enumerate_accounts", MagicMock(return_value=object()))
+            patch.object(auth_module, "extract_cookies_with_domains", return_value={})
+        )
+        stack.enter_context(patch.object(auth_module, "build_cookie_jar", return_value=object()))
+        stack.enter_context(
+            patch.object(auth_module, "enumerate_accounts", MagicMock(return_value=object()))
         )
         yield RecordingLoginIO(run_async=run_async)
 
@@ -110,6 +115,42 @@ class TestStaleCookies:
         assert "Account discovery failed" in out.message
         assert "notebooklm login" in out.message
 
+    def test_loud_stale_outcome_names_the_probed_host_and_scope_caveat(self, monkeypatch):
+        """A stale-looking rejection can really be a scope mismatch on the sibling host.
+
+        ``enumerate_accounts`` probes the *configured* host, so the refresh advice
+        names that host (not a fixed URL), and carries the shared cross-host
+        caveat — otherwise the message sends the user to re-mint cookies on a
+        host this client never calls.
+        """
+        monkeypatch.setenv("NOTEBOOKLM_BASE_URL", f"https://{PERSONAL_LEGACY_HOST}")
+
+        with _enumerate_env(
+            validate_return=({"cookies": [1]}, None),
+            run_async_side_effect=ValueError("rejected"),
+        ) as io:
+            out = cookie_jar._enumerate_one_jar([{"x": 1}], "firefox", None, quiet=False, io=io)
+
+        assert isinstance(out, StaleCookies)
+        assert f"https://{PERSONAL_LEGACY_HOST} (the host this client probed)" in out.message
+        assert app_host_scope_note() in out.message
+
+    def test_loud_stale_outcome_drops_the_caveat_on_the_enterprise_host(self, monkeypatch):
+        """The enterprise host has no alias — no cross-host scope to warn about."""
+        monkeypatch.setenv("NOTEBOOKLM_BASE_URL", f"https://{ENTERPRISE_BASE_HOST}")
+
+        with _enumerate_env(
+            validate_return=({"cookies": [1]}, None),
+            run_async_side_effect=ValueError("rejected"),
+        ) as io:
+            out = cookie_jar._enumerate_one_jar([{"x": 1}], "firefox", None, quiet=False, io=io)
+
+        assert isinstance(out, StaleCookies)
+        assert f"https://{ENTERPRISE_BASE_HOST} (the host this client probed)" in out.message
+        assert "host-scoped" not in out.message
+        # Blank-line hygiene: no double gap where the caveat would have gone.
+        assert "\n\n\n" not in out.message
+
 
 class TestNetworkFailure:
     def test_quiet_reraises_network_error(self):
@@ -155,3 +196,15 @@ class TestSuccessPath:
         assert len(out) == 1
         assert out[0].browser_profile == "Profile 1"
         assert out[0].email == "a@gmail.com"
+
+
+class TestBrowserAliasMap:
+    def test_ie_and_octo_resolve_to_real_rookie_cookies_attribute_names(self):
+        # rookie_cookies only exports "internet_explorer" / "octo_browser"
+        # (Windows-only, gated in its __init__.py) -- there is no "ie" or
+        # "octo" attribute on the module at all. A stale "ie" -> "ie" /
+        # "octo" -> "octo" mapping means getattr(rookie_cookies, alias)
+        # always misses, so --browser-cookies ie/octo could never resolve.
+        aliases = cookie_jar._ROOKIE_COOKIES_BROWSER_ALIASES
+        assert aliases["ie"] == "internet_explorer"
+        assert aliases["octo"] == "octo_browser"

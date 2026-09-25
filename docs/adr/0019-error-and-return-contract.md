@@ -2,32 +2,19 @@
 
 ## Status
 
-Accepted. The library-wide error-and-return contract is ratified; this ADR
-records the decision ahead of the work. The v0.8.0 implementation is tracked
-separately under umbrella #1346, with the additive half landed and the breaking
-flips still pending. Ratifies the already-committed v0.8.0 work
-(#1247, #1254, #1251) as instances of one contract.
+Accepted and implemented in v0.8.0. The additive enforcement floor landed in
+v0.7.0, and the breaking flips this ADR queued shipped in v0.8.0: namespace
+`get()` methods raise their `*NotFoundError`, `get_or_none()` is the sanctioned
+`None`-on-miss lookup, dict-subscript compatibility was removed, deprecated
+keyword aliases were removed, and synchronous kickoff refusals now raise.
 
-**Status update (v0.7.0):** the additive, non-breaking half of the enforcement
-floor has landed. The Tier-1 *static* conformance gate
-(`tests/unit/test_public_api_contract.py`) is in force — its
-`inspect.signature` walk pins the whole public surface's return-shape rules —
-and the `mind_maps` divergence it names (`mind_maps.get() -> MindMap | None`
-added without the deprecation warning) is fixed. The Tier-1 *behavioural*
-companion (`tests/unit/test_public_api_behavior.py`) executes each namespace's
-miss path to assert today's warn-contract (`get()` warns + returns `None`;
-`get_or_none()` is silent), so a correctly-annotated `get()` that forgets to
-warn — the exact historical `mind_maps` bug — is now caught at runtime, not just
-by signature. Tier-2's single-sourced `unwrap_or_raise` helper (`_lookup.py`)
-also landed.
+Amended for the post-v0.8 aggregate artifact-read contract: additive
+`ArtifactListing` and `ArtifactLookup` results preserve completeness evidence.
+The legacy artifact `get()`/`get_or_none()` behavior remains in its own release
+runway and warns only when an unavailable backing makes absence ambiguous.
 
-**Status update (v0.8.0):** the *breaking* flips this ADR queued have now
-shipped — most notably issue #1247 (`get()` → **raises** `*NotFoundError`,
-dropping `| None`, single-sourced through `_lookup.py`'s `unwrap_or_raise`), so
-every namespace `get()` now raises on a miss and `get_or_none()` is the
-sanctioned `None`-on-miss lookup. The "Enforcement (in scope for 0.8.0)" section
-below describes that work; the static + behavioural gates that guarded the
-rollout are green against the post-flip surface.
+Amended for #2432: artifact listing absence remains unresolved until the
+original task reappears or the wait times out; it no longer implies removal.
 
 ## Context
 
@@ -68,7 +55,9 @@ contract and converging the rest in the same release.
 | ----- | -------- |
 | object / dataclass | success |
 | collection | zero-or-more (empty → `[]`) |
-| status handle (`GenerationStatus`/`ResearchTask`/`ResearchStart`) | async lifecycle only; terminal `failed`/`removed` and the *poll-observed* `not_found` are typed states. `status="failed"` ⇒ *started-then-failed*, never *couldn't-start* |
+| `ArtifactListing` | aggregate items plus explicit completeness and bounded component failures |
+| `ArtifactLookup` | `FOUND`, authoritative `MISSING`, or incomplete-read `UNKNOWN` |
+| status handle (`GenerationStatus`/`ResearchTask`/`ResearchStart`) | async lifecycle only; terminal `failed` and the *poll-observed* `not_found` are typed states. `removed` remains a legacy value, no longer inferred from absence. `status="failed"` ⇒ *started-then-failed*, never *couldn't-start* |
 | `None` | (a) idempotent `delete`; (b) explicit `get_or_none()`; (c) no-payload **command** success (`update`, `configure`, `remove_from_recent`, `rename(return_object=False)`); (d) a transient *not-ready* read (`get_tree` of an existing-but-unpopulated map); (e) a domain-optional field |
 
 Anything else that today carries an error meaning is banned.
@@ -77,13 +66,13 @@ Anything else that today carries an error meaning is banned.
 
 | Class | Methods | Contract |
 | ----- | ------- | -------- |
-| Lookup one | `get` | found → object; missing → **raise `*NotFoundError`**. Public `get_or_none()` is the sole sanctioned `None`-on-miss path. |
-| List many | `list`, `list_*` | always a collection; empty → `[]`. |
+| Lookup one | `get` | found → object; missing → **raise `*NotFoundError`**. Public `get_or_none()` is the sole sanctioned `None`-on-miss path. Aggregate artifacts additionally expose `lookup`, where absence is `MISSING` only after every relevant backing succeeds and an incomplete no-hit is `UNKNOWN`. |
+| List many | `list`, `list_*` | always a collection; empty → `[]`. Aggregate artifact `list()` remains the compatibility best-effort projection; `list_with_status()` carries completeness evidence. |
 | Derived read | `get_summary`, `get_description`, `get_guide`, `get_tree`, `check_freshness` | **do not police parent existence** — missing parent → empty / not-ready value (`""`, empty dataclass, `None` tree); shape-drift → **raise** (`DecodingError`/`UnknownRPCMethodError`). Resource existence is `get()`'s job, not a derived read's. |
 | Idempotent mutation | `delete` | success *or* already-absent → `None`; raise only on real failure. |
 | Mutate existing | `rename`, `update`, `configure` | target missing → **raise `*NotFoundError`**; no-payload success → `None`. |
 | Async kickoff | `generate_*`, `create`, `revise_slide`, `retry_failed`, `research.start`, `mind_maps.generate` | accepted → return status handle; **synchronous refusal → raise**; null/missing-id/shape-drift → raise. |
-| Lifecycle status / await | `poll_status`, `research.poll`, `wait_for_completion` | reflect lifecycle; terminal `failed`/`removed` stay returned status; *poll-observed* `not_found` is a typed sentinel (not a raise); does **not** raise for a terminal `failed`, but **does** raise on timeout and on cross-cutting faults. |
+| Lifecycle status / await | `poll_status`, `research.poll`, `wait_for_completion` | reflect lifecycle; terminal `failed` stays returned status; *poll-observed* `not_found` is a typed sentinel (not a raise) and never implies `removed`; does **not** raise for a terminal `failed`, but **does** raise on timeout and on cross-cutting faults. |
 | Readiness wait | `wait_until_ready`, `wait_for_sources` | return the ready **resource**; raise `*TimeoutError` on timeout and the domain error on terminal processing failure. (*Distinct from the lifecycle-status handles above.*) |
 | Cross-cutting | any | transport→`NetworkError`/`RPCTimeoutError`; auth→`AuthError`; rate-limit→`RateLimitError`; oversize→`RPCResponseTooLargeError`; decode→`DecodingError`. Always raise. |
 
@@ -95,12 +84,11 @@ Absence detection is single-sourced where shared (e.g. `_detect_kind` for mind m
 
 Ratify the existing tree (`NotebookLMError` root; multi-base
 `*NotFoundError(NotFoundError, RPCError, <Domain>Error)`; the `RPCError`
-transport subtree; `WaitTimeoutError(…, TimeoutError)`). Add, mirroring
-`SourceNotFoundError`: `NoteError`+`NoteNotFoundError`, `MindMapError`+`MindMapNotFoundError`
-(none exist yet). Standardize the `*TimeoutError` base order umbrella-first
-(`ArtifactTimeoutError(ArtifactError, WaitTimeoutError)` is the outlier,
-`exceptions.py:1117`). No new "refusal" exception — refusal reuses the existing
-`RateLimitError`/`RPCError`.
+transport subtree; `WaitTimeoutError(…, TimeoutError)`). `NoteError` /
+`NoteNotFoundError` and `MindMapError` / `MindMapNotFoundError` have landed,
+mirroring `SourceNotFoundError`. `ArtifactTimeoutError` now inherits
+umbrella-first from `WaitTimeoutError` before `ArtifactError`. No new "refusal"
+exception — refusal reuses the existing `RateLimitError`/`RPCError`.
 
 ### Rules
 
@@ -109,39 +97,47 @@ transport subtree; `WaitTimeoutError(…, TimeoutError)`). Add, mirroring
    not a genuine miss. (Poll-observed task absence is *not* resource absence —
    see Rule 4.)
 2. **Refusal raises.** A synchronous `USER_DISPLAYABLE_ERROR` propagates as the
-   `RateLimitError`/`RPCError` the transport layer raises. The kickoff methods
-   **currently swallow** it into `GenerationStatus(status="failed")`
-   (`_artifacts.py:1150-1158` `_call_generate`, `:541-549` `revise_slide`) and
-   `_parse_generation_result` synthesizes `failed` for a missing artifact id
-   (`:1251-1260`); v0.8.0 **removes** both, re-raising the refusal and raising
-   `DecodingError`/`ArtifactFeatureUnavailableError` for a missing/degenerate id.
+   `RateLimitError`/`RPCError` the transport layer raises. The old kickoff
+   behavior that swallowed refusal into `GenerationStatus(status="failed")` or
+   synthesized `failed` for a missing artifact id was removed in v0.8.0;
+   kickoff refusal now raises, and missing/degenerate ids raise
+   `DecodingError`/`ArtifactFeatureUnavailableError`.
 3. **Drift raises.** A malformed/unparseable RPC payload raises
    `DecodingError`/`UnknownRPCMethodError` ([ADR-0011](0011-schema-validation-policy.md));
    it is not collapsed to `None`/`""`/`[]`/a sentinel. v0.8.0 tightens the
    **positional shape-drift** collapse in the hand-rolled list helpers
-   (`_note_service.py:135`, `_artifact/listing.py:113`). The composite-lister
+   (`_note_service.py:135`, `_web/artifact/listing.py:123-137`). The composite-lister
    `except RPCError`/`HTTPError` that returns *partial* studio artifacts when the
-   mind-map sub-fetch is down (`_artifact/listing.py:126-138`) is a **deliberate
-   partial-availability** behavior, **not** drift-collapse — it is out of scope
-   for Rule 3 and decided separately (see Scope).
-4. **Lifecycle is data.** Async status handles carry `failed`/`not_found`/
-   `removed` as typed states; `wait_for_completion` returns a terminal `failed`
+   mind-map sub-fetch is down (`_web/artifact/listing.py:198-211`) is a **deliberate
+   partial-availability** behavior, **not** drift-collapse. The richer
+   `artifacts.list_with_status()` result now retains that secondary failure;
+   primary failures and every `DecodingError` still raise. Exact
+   `artifacts.lookup()` reports a positive hit as `FOUND`, complete absence as
+   `MISSING`, and a no-hit after a secondary outage as `UNKNOWN`. Legacy
+   `get()`/`get_or_none()` preserve their 0.x projections and emit a registered
+   warning only for the ambiguous `UNKNOWN` case.
+4. **Lifecycle is data.** Async status handles carry `failed`/`not_found`
+   as typed states; `wait_for_completion` returns a terminal `failed`
    and raises only on timeout or a cross-cutting fault. The poll-observed
    `not_found` (artifact not yet listed, or research task absent) is a typed
    sentinel — `GenerationStatus.is_not_found`, and a **new** `ResearchStatus.NOT_FOUND`
    member (distinct from the existing `NO_RESEARCH` "nothing in flight"). The
    *termination* guarantee for a task that never appears lives in
-   `wait_for_completion`, not `poll_status`: a sustained run of `not_found`
-   (`max_not_found`/`min_not_found_window`) escalates to a terminal `removed`
-   status (`_artifact/polling.py:366-384`). `poll_status` is a stateless
-   primitive where `not_found` is inherently *lag-or-bogus* ambiguous by design;
-   callers needing a terminal answer use `wait_for_completion`.
+   `wait_for_completion`, not `poll_status`: sustained `not_found` remains
+   unresolved until the original task reappears or the caller's timeout expires.
+   Absence cannot establish removal or quota rejection, and a completed sibling
+   cannot substitute for the requested task. `max_not_found` and
+   `min_not_found_window` are deprecated and ignored; the legacy `removed` state
+   remains accepted but is no longer emitted by polling. `poll_status` is a
+   stateless primitive where `not_found` is inherently *lag-or-bogus* ambiguous
+   by design; callers needing a bounded wait use `wait_for_completion`.
 5. **The facade owns the contract.** Per [ADR-0017](0017-public-facade-private-implementation.md)
    the public facade *surface* owns the compatibility contract (logic stays
-   private); breaks ship via [ADR-0018](0018-deprecation-strategy.md) — #1247/#1254/#1251
-   had a v0.7.0 deprecation runway, the refusal/`ValueError`/`update` changes are
-   deliberate clean breaks in the already-breaking 0.8.0 — are allowlisted
-   (`scripts/api-compat-allowlist.json`), and idempotency is unchanged
+   private); breaks ship via [ADR-0018](0018-deprecation-strategy.md). The
+   #1247/#1254/#1251 breaks had a v0.7.0 deprecation runway, while the
+   refusal/`ValueError`/`update` changes were deliberate clean breaks in the
+   already-breaking v0.8.0 and were allowlisted
+   (`scripts/api-compat-allowlist.json`). Idempotency is unchanged
    ([ADR-0005](0005-idempotency-taxonomy.md): kickoffs stay non-blind-replayable).
 
 `ValueError` remains valid for **input validation**; it is banned only for
@@ -161,8 +157,10 @@ In scope: the operation classes above across `notebooks`, `sources`,
 Explicitly **deferred / follow-existing-contract** (not changed in this ADR;
 tracked separately): bulk/derived helpers that today swallow drift to empty
 data (`notebooks.get_metadata`/`get_source_ids`/`get_raw`, the research-task
-parser fallbacks); `share`; export/download paths; and the chat surface. The
-composite-lister partial-availability policy (Rule 3) is decided in its own PR.
+parser fallbacks); `share`; export paths; and the chat surface. Aggregate
+artifact-list completeness and authoritative exact lookup are governed by the
+C3 amendment above. Studio polling remains deliberately Studio-only lifecycle
+data and does not acquire a notes dependency.
 
 ## Consequences
 
@@ -217,21 +215,16 @@ enforcement floor**:
   irreducibly per-namespace (`mind_maps.delete(..., kind=...)` is non-idempotent
   + kind-dispatched), so `delete` stays per-namespace.
 - **Tier 3 — sealed async result types (resolved #1345: rejected).** Replacing
-  the stringly-typed `GenerationStatus.status` with a sealed/discriminated result
-  was evaluated and **rejected**. The load-bearing overload it targeted — a
-  synchronous *couldn't-start* masquerading as `status="failed"` — was already
-  removed by Tier 1 (#1342 makes refusals raise), so a returned `failed` now
-  means only *started-then-failed*. The residual `not_found`/`removed`/rate-limit
-  juggling is poll-loop interpretation (`removed` is `wait_for_completion`'s
-  conclusion over a sustained run of missed polls, not a result property), cause
-  classification (`is_rate_limited` is a `Failed`/`Removed` detail, not a
-  lifecycle state), and a CLI-local DTO string (`cli/services/artifact_generation.py`
-  synthesizes `"rate_limited"`) — none of which a union dissolves; it relocates
-  them. This ADR keeps the typed-string states. The optional, *non-breaking*
-  follow-up is a `GenerationState(str, Enum)` for `GenerationStatus.status`
-  mirroring `ResearchStatus` (or a `Literal[...]` alias). If sealed types are ever
-  revisited, introduce them via parallel `poll_result()`/`wait_result()` APIs
-  rather than breaking the existing ones in place.
+  `GenerationStatus` with a sealed/discriminated result was evaluated and
+  **rejected**. The load-bearing overload it targeted — a synchronous
+  *couldn't-start* masquerading as `status="failed"` — was removed by Tier 1
+  (#1342 makes refusals raise), so a returned `failed` now means only
+  *started-then-failed*. The residual `not_found`/`removed`/rate-limit juggling
+  is poll-loop interpretation and adapter projection. The non-breaking follow-up
+  did land as `GenerationState(str, Enum)` for `GenerationStatus.status`,
+  mirroring `ResearchStatus`. If sealed types are ever revisited, introduce them
+  via parallel `poll_result()`/`wait_result()` APIs rather than breaking the
+  existing ones in place.
 
 Tier 1 + Tier 2 are required for 0.8.0; together they make this contract
 type/CI-enforced rather than review-enforced.

@@ -3,15 +3,19 @@
 import asyncio
 import json
 import re
+from unittest.mock import Mock
 
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
-import notebooklm._auth.keepalive as _auth_keepalive
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
+from tests._helpers.client_factory import build_client_shell_for_tests
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Non-default legacy NotebookLMClient.*tuning arguments are deprecated:DeprecationWarning"
+)
 
 ROTATE_URL_RE = re.compile(r"^https://accounts\.google\.com/RotateCookies$")
 
@@ -49,11 +53,15 @@ def _storage_auth(tmp_path) -> tuple[AuthTokens, "object"]:
             }
         )
     )
+    jar = httpx.Cookies()
+    jar.set("SID", "initial_sid", domain=".google.com", path="/")
+    jar.set("__Secure-1PSIDTS", "test_1psidts", domain=".google.com", path="/")
     auth = AuthTokens(
         cookies={"SID": "initial_sid", "__Secure-1PSIDTS": "test_1psidts"},
         csrf_token="test_csrf",
         session_id="test_session",
         storage_path=storage_path,
+        cookie_jar=jar,
     )
     return auth, storage_path
 
@@ -69,11 +77,43 @@ async def _read_storage_text_when_available(storage_path):
 
 
 async def _wait_until_storage_contains(storage_path, needle: str, failure_message: str) -> None:
-    for _ in range(50):
-        if needle in await _read_storage_text_when_available(storage_path):
-            return
-        await asyncio.sleep(0.05)
-    pytest.fail(failure_message)
+    """Allow background disk I/O to settle within one bounded wait on busy CI workers."""
+
+    async def wait_for_cookie() -> None:
+        """Observe the real storage file while the keepalive task runs."""
+        while True:
+            try:
+                if needle in storage_path.read_text():
+                    return
+            except PermissionError:
+                pass
+            await asyncio.sleep(0.05)
+
+    try:
+        # Thread scheduling and Windows file access can outlast the old 2.5s
+        # budget. Sharing-violation retries use this same overall deadline.
+        await asyncio.wait_for(wait_for_cookie(), timeout=10.0)
+    except asyncio.TimeoutError:
+        pytest.fail(f"{failure_message} within 10 seconds")
+
+
+@pytest.mark.asyncio
+async def test_storage_wait_retries_extended_sharing_violations(monkeypatch):
+    """A locked file can become readable after the per-read retry budget expires."""
+    storage_path = Mock()
+    storage_path.read_text.side_effect = [PermissionError("file locked") for _ in range(51)] + [
+        "rotated"
+    ]
+    real_sleep = asyncio.sleep
+
+    async def yield_without_delay(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", yield_without_delay)
+
+    await _wait_until_storage_contains(storage_path, "rotated", "Cookie was not persisted")
+
+    assert storage_path.read_text.call_count == 52
 
 
 def _rotate_requests(httpx_mock: HTTPXMock) -> list[httpx.Request]:
@@ -105,7 +145,7 @@ class TestKeepaliveDisabledByDefault:
         """No keepalive task is spawned and no extra HTTP calls fire by default."""
         client = NotebookLMClient(mock_auth)
         async with client:
-            assert client._collaborators.lifecycle._keepalive_task is None
+            assert client._web_runtime.web_transport._keepalive_task is None
             # Give the loop a chance to run; nothing should happen
             await asyncio.sleep(0.1)
 
@@ -133,12 +173,12 @@ class TestKeepaliveLifecycle:
         )
 
         async with client:
-            task = client._collaborators.lifecycle._keepalive_task
+            task = client._web_runtime.web_transport._keepalive_task
             assert task is not None
             assert not task.done()
 
         # Task should be cleaned up; no warnings should be raised.
-        assert client._collaborators.lifecycle._keepalive_task is None
+        assert client._web_runtime.web_transport._keepalive_task is None
         # Either cancelled or finished; never left dangling.
         assert task.done()
 
@@ -152,7 +192,7 @@ class TestKeepaliveFloor:
             keepalive=10.0,
             keepalive_min_interval=60.0,
         )
-        assert client._collaborators.lifecycle._keepalive_interval == 60.0
+        assert client._web_runtime.web_transport._keepalive_interval == 60.0
 
     @pytest.mark.asyncio
     async def test_floor_does_not_lower_higher_interval(self, mock_auth):
@@ -162,7 +202,7 @@ class TestKeepaliveFloor:
             keepalive=600.0,
             keepalive_min_interval=60.0,
         )
-        assert client._collaborators.lifecycle._keepalive_interval == 600.0
+        assert client._web_runtime.web_transport._keepalive_interval == 600.0
 
     @pytest.mark.asyncio
     async def test_none_keeps_disabled(self, mock_auth):
@@ -172,7 +212,7 @@ class TestKeepaliveFloor:
             keepalive=None,
             keepalive_min_interval=60.0,
         )
-        assert client._collaborators.lifecycle._keepalive_interval is None
+        assert client._web_runtime.web_transport._keepalive_interval is None
 
 
 class TestKeepaliveValidation:
@@ -191,80 +231,57 @@ class TestKeepaliveValidation:
 
 class TestKeepalivePokes:
     @pytest.mark.asyncio
-    @pytest.mark.no_default_keepalive_mock
-    async def test_pokes_at_interval(self, mock_auth, httpx_mock: HTTPXMock, monkeypatch):
-        """At least two RotateCookies pokes fire within a short window.
+    async def test_pokes_at_interval(self, mock_auth):
+        """The lifecycle invokes its injected rotator on successive intervals."""
+        calls = 0
+        second_call = asyncio.Event()
 
-        The test uses sub-second intervals to keep wall-clock cheap; the
-        in-process rate-limit window (60 s in production) would otherwise
-        suppress every iteration past the first. Patch the window down so
-        the loop's pacing is the only thing being tested here.
-        """
-
-        monkeypatch.setattr(_auth_keepalive, "_KEEPALIVE_RATE_LIMIT_SECONDS", 0.0)
-        httpx_mock.add_response(
-            url=ROTATE_URL_RE,
-            is_optional=True,
-            is_reusable=True,
-            status_code=204,
-        )
+        async def rotate(_client, storage_path):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            assert storage_path is None
+            calls += 1
+            if calls >= 2:
+                second_call.set()
 
         client = NotebookLMClient(
             mock_auth,
             keepalive=0.05,
             keepalive_min_interval=0.01,
+            cookie_rotator=rotate,
         )
 
         async with client:
-            await _wait_for_rotate_requests(
-                httpx_mock,
-                minimum=2,
-                failure_message="Expected at least 2 keepalive pokes",
-            )
+            await asyncio.wait_for(second_call.wait(), timeout=2.0)
+
+        assert calls >= 2
 
     @pytest.mark.asyncio
-    @pytest.mark.no_default_keepalive_mock
-    async def test_failure_does_not_crash_loop(self, mock_auth, httpx_mock: HTTPXMock, monkeypatch):
-        """A failing poke is swallowed and the loop continues.
+    async def test_failure_does_not_crash_loop(self, mock_auth):
+        """A failing injected rotator is swallowed and the loop continues."""
+        calls = 0
+        retried = asyncio.Event()
 
-        Same rate-limit-window patch as ``test_pokes_at_interval``: the
-        sub-second test interval would otherwise be debounced into a single
-        attempt by the in-process claim.
-        """
-
-        monkeypatch.setattr(_auth_keepalive, "_KEEPALIVE_RATE_LIMIT_SECONDS", 0.0)
-        # First poke: connection error. Subsequent pokes: 204.
-        httpx_mock.add_exception(
-            url=ROTATE_URL_RE,
-            exception=httpx.ConnectError("simulated network blip"),
-        )
-        httpx_mock.add_response(
-            url=ROTATE_URL_RE,
-            is_optional=True,
-            is_reusable=True,
-            status_code=204,
-        )
+        async def rotate(_client, storage_path):  # type: ignore[no-untyped-def]
+            nonlocal calls
+            assert storage_path is None
+            calls += 1
+            if calls == 1:
+                raise httpx.ConnectError("simulated network blip")
+            retried.set()
 
         client = NotebookLMClient(
             mock_auth,
             keepalive=0.05,
             keepalive_min_interval=0.01,
+            cookie_rotator=rotate,
         )
 
         async with client:
-            await _wait_for_rotate_requests(
-                httpx_mock,
-                minimum=1,
-                failure_message="Expected first keepalive poke",
-            )
+            await asyncio.wait_for(retried.wait(), timeout=2.0)
             # Task is still running after the failure
-            assert client._collaborators.lifecycle._keepalive_task is not None
-            assert not client._collaborators.lifecycle._keepalive_task.done()
-            await _wait_for_rotate_requests(
-                httpx_mock,
-                minimum=2,
-                failure_message="Loop should have retried after failure",
-            )
+            assert client._web_runtime.web_transport._keepalive_task is not None
+            assert not client._web_runtime.web_transport._keepalive_task.done()
+        assert calls >= 2
 
 
 class TestKeepalivePersistenceFailure:
@@ -334,12 +351,18 @@ class TestKeepaliveExplicitStoragePath:
                             "domain": ".google.com",
                             "path": "/",
                         },
+                        {
+                            "name": "__Secure-1PSIDTS",
+                            "value": "initial_1psidts",
+                            "domain": ".google.com",
+                            "path": "/",
+                        },
                     ]
                 }
             )
         )
         auth = AuthTokens(
-            cookies={"SID": "manual_sid"},
+            cookies={"SID": "manual_sid", "__Secure-1PSIDTS": "initial_1psidts"},
             csrf_token="t",
             session_id="s",
             # NOTE: storage_path is *not* set on auth
@@ -488,11 +511,15 @@ class TestSaveCookiesUnification:
         within the same process."""
         from notebooklm.client import NotebookLMClient
 
+        jar = httpx.Cookies()
+        jar.set("SID", "x", domain=".google.com", path="/")
+        jar.set("__Secure-1PSIDTS", "test_1psidts", domain=".google.com", path="/")
         auth = AuthTokens(
             cookies={"SID": "x", "__Secure-1PSIDTS": "test_1psidts"},
             csrf_token="t",
             session_id="s",
             storage_path=tmp_path / "storage_state.json",
+            cookie_jar=jar,
         )
         (tmp_path / "storage_state.json").write_text('{"cookies": []}')
 
@@ -509,7 +536,7 @@ class TestSaveCookiesUnification:
             before production silently reverts to legacy merge.
             """
             lock_held_during_save.append(
-                core_ref["core"]._collaborators.cookie_persistence.save_lock.locked()
+                core_ref["core"]._web_runtime.cookie_persistence.save_lock.locked()
             )
             call_kwargs.append(kwargs)
             return True
@@ -518,10 +545,7 @@ class TestSaveCookiesUnification:
         core = build_client_shell_for_tests(auth, cookie_saver=spy)
         core_ref["core"] = core
 
-        await core._collaborators.lifecycle.save_cookies(
-            core._collaborators.cookie_persistence,
-            httpx.Cookies(),
-        )
+        await core._web_runtime.web_transport.save_cookies(httpx.Cookies())
 
         assert lock_held_during_save == [True], (
             "save_cookies must hold _save_lock for the duration of "
@@ -561,16 +585,21 @@ class TestSaveCookiesUnification:
                 }
             )
         )
+        jar = httpx.Cookies()
+        jar.set("SID", "x", domain=".google.com", path="/")
+        jar.set("__Secure-1PSIDTS", "test_1psidts", domain=".google.com", path="/")
+        jar.set("HSID", "y", domain=".google.com", path="/")
         auth = AuthTokens(
             cookies={"SID": "x", "__Secure-1PSIDTS": "test_1psidts", "HSID": "y"},
             csrf_token="old_csrf",
             session_id="old_session",
             storage_path=storage_path,
+            cookie_jar=jar,
         )
 
         # NotebookLM homepage with new tokens (refresh_auth scrapes these)
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/",
+            url="https://notebook.google.com/",
             content=b'<html><script>window.WIZ_global_data={"SNlM0e":"new_csrf","FdrFJe":"new_sid"};</script></html>',
         )
 
@@ -587,7 +616,7 @@ class TestSaveCookiesUnification:
             full-merge path.
             """
             save_calls.append(
-                client_ref["client"]._collaborators.cookie_persistence.save_lock.locked()
+                client_ref["client"]._web_runtime.cookie_persistence.save_lock.locked()
             )
             snapshot_kwarg_present.append("original_snapshot" in kwargs)
             return True
@@ -627,7 +656,7 @@ class TestCrossProcessFileLock:
 
         import fcntl
 
-        from notebooklm.auth import save_cookies_to_storage
+        from notebooklm._auth.storage import save_cookies_to_storage
 
         storage_path = tmp_path / "storage_state.json"
         storage_path.write_text(
@@ -644,7 +673,7 @@ class TestCrossProcessFileLock:
 
         monkeypatch.setattr("fcntl.flock", spy_flock)
 
-        from notebooklm.auth import snapshot_cookie_jar
+        from notebooklm._auth.storage import snapshot_cookie_jar
 
         jar = httpx.Cookies()
         empty_snapshot = snapshot_cookie_jar(jar)
@@ -662,7 +691,7 @@ class TestCrossProcessFileLock:
     def test_save_cookies_to_storage_creates_lock_sentinel(self, tmp_path):
         """The lock file is a sibling of the storage file with a `.lock` suffix
         so the storage file itself is free for the atomic temp-rename."""
-        from notebooklm.auth import save_cookies_to_storage, snapshot_cookie_jar
+        from notebooklm._auth.storage import save_cookies_to_storage, snapshot_cookie_jar
 
         storage_path = tmp_path / "storage_state.json"
         storage_path.write_text(

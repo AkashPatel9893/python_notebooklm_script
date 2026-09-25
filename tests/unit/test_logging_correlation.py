@@ -10,7 +10,6 @@ from contextvars import Token
 
 import pytest
 
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm._logging import (
     RedactingFilter,
     RedactingFormatter,
@@ -18,6 +17,7 @@ from notebooklm._logging import (
     reset_request_id,
     set_request_id,
 )
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 @pytest.fixture(autouse=True)
@@ -237,6 +237,7 @@ async def test_retry_inherits_parent_request_id():
     """Recursive executor.rpc_call(_is_retry=True) must NOT mint a fresh id — the
     failure→refresh→retry sequence should appear under one prefix."""
     from notebooklm.auth import AuthTokens
+    from notebooklm.rpc import RPCMethod
 
     captured_ids: list[str | None] = []
 
@@ -249,8 +250,12 @@ async def test_retry_inherits_parent_request_id():
         *,
         disable_internal_retries: bool = False,
         operation_variant: str | None = None,
+        read_timeout: float | None = None,
+        raise_on_null_status: bool = False,
         _refresh_budget=None,
         _retry_deadline=None,
+        _retry_budget=None,
+        _resource_epoch: int | None = None,
     ):
         captured_ids.append(get_request_id())
         # First call: raise to trigger retry path; second call: succeed.
@@ -262,10 +267,11 @@ async def test_retry_inherits_parent_request_id():
                 source_path,
                 allow_null,
                 _is_retry=True,
+                _resource_epoch=_resource_epoch,
             )
         return "ok"
 
-    # Real Session — the executor's open-client guard
+    # Real NotebookLMClient shell — the executor's open-client guard
     # requires a truthy http_client, so we ``open()`` and let the lifecycle
     # construct one against the default httpx transport. ``fake_impl`` is
     # monkeypatched onto ``_execute_once`` so no actual HTTP call fires;
@@ -275,10 +281,10 @@ async def test_retry_inherits_parent_request_id():
     core = build_client_shell_for_tests(auth)
     await core.__aenter__()
     try:
-        executor = core._rpc_executor
+        executor = core._web_runtime.executor
         executor._execute_once = fake_impl  # type: ignore[method-assign]
 
-        result = await core._rpc_executor.rpc_call(method=object(), params=[])  # type: ignore[arg-type]
+        result = await core._web_runtime.executor.rpc_call(method=RPCMethod.GET_NOTEBOOK, params=[])
         assert result == "ok"
         assert len(captured_ids) == 2
         assert captured_ids[0] == captured_ids[1]

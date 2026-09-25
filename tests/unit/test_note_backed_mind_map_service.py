@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from notebooklm._mind_map import NoteBackedMindMapService
-from notebooklm._note_service import NoteRowKind, NoteService
+from notebooklm._web.mind_maps import NoteBackedMindMapService
+from notebooklm._web.notes import NoteRowKind, NoteService
 from notebooklm.exceptions import MindMapNotFoundError, NotFoundError
 
 
@@ -173,8 +173,8 @@ class TestEndToEndWithRealNoteService:
 
     @pytest.mark.asyncio
     async def test_real_note_service_round_trip(self) -> None:
-        from _fixtures.fake_core import make_fake_core
-        from notebooklm._note_service import NoteService as RealNoteService
+        from notebooklm._web.notes import NoteService as RealNoteService
+        from tests._fixtures.fake_core import make_fake_core
 
         mind_map_payload = json.dumps({"children": [{"name": "c"}]})
         session = make_fake_core(
@@ -189,7 +189,7 @@ class TestEndToEndWithRealNoteService:
             )
         )
 
-        notes = RealNoteService(session)
+        notes = RealNoteService(session, supervisor=session)
         svc = NoteBackedMindMapService(notes)
 
         rows = await svc.list_mind_maps("nb_x")

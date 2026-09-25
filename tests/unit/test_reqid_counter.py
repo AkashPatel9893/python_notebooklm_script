@@ -1,12 +1,10 @@
 """Unit tests for the standalone :class:`ReqidCounter` helper.
 
-Exercises the class in isolation from :class:`Session` so the
+Exercises the class in isolation from :class:`NotebookLMClient` so the
 counter's invariants (monotonicity, lazy lock allocation, type/value
 validation, mutator semantics, optional ``on_lock_wait`` hook) are pinned
-down without dragging in the full client surface. The ``Session``-shaped
-``DeprecationWarning`` contract continues to live in
-``tests/unit/test_reqid_counter.py``; the concurrent-contention pin continues
-to live in ``tests/unit/test_reqid_counter_concurrent.py``.
+down without dragging in the full client surface. The concurrent-contention
+pin continues to live in ``tests/unit/test_session_reqid_concurrent.py``.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import inspect
 
 import pytest
 
-from notebooklm._reqid_counter import DEFAULT_BASELINE, DEFAULT_STEP, ReqidCounter
+from notebooklm._web.transport.reqid_counter import DEFAULT_BASELINE, DEFAULT_STEP, ReqidCounter
 
 # ---------------------------------------------------------------------------
 # Construction / sync accessors
@@ -72,9 +70,9 @@ async def test_set_value_resets_baseline_for_next_reqid() -> None:
     """After ``set_value(N)``, the next ``next_reqid()`` returns ``N + step``.
 
     Pins the contract between the sync mutator and the async increment path:
-    test fixtures that seed the counter to a deterministic value (via
-    ``Session._reqid_counter_value = N``) expect subsequent reqids to
-    walk forward from there, not from the original baseline.
+    test fixtures that seed the counter to a deterministic value with
+    ``ReqidCounter.set_value(N)`` expect subsequent reqids to walk forward from
+    there, not from the original baseline.
     """
     counter = ReqidCounter()
     counter.set_value(42)
@@ -216,3 +214,92 @@ async def test_default_on_lock_wait_is_noop() -> None:
     # Must not raise.
     value = await counter.next_reqid()
     assert value == DEFAULT_BASELINE + DEFAULT_STEP
+
+
+# ---------------------------------------------------------------------------
+# set_bound_loop rebind hook + reset_after_open (#2106)
+# ---------------------------------------------------------------------------
+
+
+def test_set_bound_loop_different_loop_discards_stale_lock_preserves_value() -> None:
+    """A loop change via ``set_bound_loop`` alone discards the lazy lock.
+
+    Pins the clear-on-rebind self-consistency contract (#2106): even without
+    a matching ``reset_after_open`` call, rebinding to a different loop must
+    invalidate the lock allocated under the previous loop so it is never
+    reused — while ``_value`` survives, because reqid monotonicity must hold
+    across reopen. Latent-hazard hardening — ``next_reqid`` never awaits
+    under the lock, so a stale lock cannot be contended (and thus cannot
+    bind / raise cross-loop today); the discard keeps the counter consistent
+    with the clear-on-rebind siblings.
+    """
+    counter = ReqidCounter()
+
+    async def _bind_and_build_under_loop_a() -> None:
+        counter.set_bound_loop(asyncio.get_running_loop())
+        await counter.next_reqid()
+
+    asyncio.run(_bind_and_build_under_loop_a())
+    assert counter._lock is not None
+    value_after_loop_a = counter.value
+    assert value_after_loop_a == DEFAULT_BASELINE + DEFAULT_STEP
+
+    async def _rebind_under_loop_b() -> None:
+        # set_bound_loop to a genuinely different loop must drop the stale
+        # lock so the next next_reqid() rebuilds it on loop B...
+        counter.set_bound_loop(asyncio.get_running_loop())
+        assert counter._lock is None
+        # ...while the counter value keeps walking forward from where loop A
+        # left it — monotonicity across reopen is part of the chat contract.
+        assert counter.value == value_after_loop_a
+        assert await counter.next_reqid() == value_after_loop_a + DEFAULT_STEP
+        assert counter._lock is not None
+
+    asyncio.run(_rebind_under_loop_b())
+
+
+@pytest.mark.asyncio
+async def test_set_bound_loop_same_loop_keeps_cached_lock() -> None:
+    """Re-binding to the *same* loop must NOT discard the live lock.
+
+    Idempotent ``set_bound_loop`` calls with the unchanged loop are a no-op
+    on the cache — only a genuine loop change invalidates it (the
+    ``_on_loop_rebind`` hook fires only on a real change).
+    """
+    counter = ReqidCounter()
+    loop = asyncio.get_running_loop()
+    counter.set_bound_loop(loop)
+    await counter.next_reqid()
+    first_lock = counter._lock
+    assert first_lock is not None
+
+    # Same loop again — the cached lock survives.
+    counter.set_bound_loop(loop)
+    assert counter._lock is first_lock
+
+
+@pytest.mark.asyncio
+async def test_reset_after_open_discards_lock_preserves_value() -> None:
+    """``reset_after_open`` drops the lazy lock and nothing else.
+
+    The lock is rebuilt lazily on the next ``next_reqid`` call; ``_value``
+    MUST survive so reqids stay strictly monotonic across a close→reopen
+    cycle (Google's chat backend relies on it).
+    """
+    counter = ReqidCounter()
+    counter.set_bound_loop(asyncio.get_running_loop())
+    assert await counter.next_reqid() == DEFAULT_BASELINE + DEFAULT_STEP
+    first_lock = counter._lock
+    assert first_lock is not None
+
+    counter.reset_after_open()
+
+    assert counter._lock is None
+    assert counter.value == DEFAULT_BASELINE + DEFAULT_STEP, (
+        "reset_after_open must NOT reset _value — reqid monotonicity has to survive reopen."
+    )
+
+    # The next call rebuilds a fresh lock and keeps walking forward.
+    assert await counter.next_reqid() == DEFAULT_BASELINE + 2 * DEFAULT_STEP
+    assert counter._lock is not None
+    assert counter._lock is not first_lock

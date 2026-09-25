@@ -40,8 +40,8 @@ DOCSTRING_TARGETS = [
     "src/notebooklm/_notebooks.py",
     "src/notebooklm/_sources.py",
     "src/notebooklm/_artifacts.py",
-    "src/notebooklm/_chat/api.py",
-    "src/notebooklm/_research.py",
+    "src/notebooklm/_chat.py",
+    "src/notebooklm/_web/research.py",
     "src/notebooklm/_notes.py",
     "src/notebooklm/_settings.py",
     "src/notebooklm/_sharing.py",
@@ -179,12 +179,12 @@ async def test_from_storage_smoke_constructs_client(tmp_path: Path, httpx_mock: 
     }
     storage_file.write_text(json.dumps(storage_state))
 
-    # ``from_storage`` performs a token fetch against notebooklm.google.com
+    # ``from_storage`` performs a token fetch against the configured app host
     # during the wrapper's lazy ``_build``; serve a minimal stub so the
     # call resolves without touching the network.
     html = '"SNlM0e":"smoke_csrf" "FdrFJe":"smoke_session"'
     httpx_mock.add_response(
-        url="https://notebooklm.google.com/",
+        url="https://notebook.google.com/",
         content=html.encode(),
     )
 

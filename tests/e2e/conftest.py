@@ -1,14 +1,26 @@
 """E2E test fixtures and configuration."""
 
+import asyncio
+import contextlib
 import hashlib
 import logging
 import os
+import subprocess
 import sys
 import warnings
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable
+from contextvars import ContextVar
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import pytest
+
+from notebooklm._env import get_base_url
+
+if TYPE_CHECKING:
+    from notebooklm._web.rows.artifacts import QuizOptionPair
+    from notebooklm.client import NotebookLMClient
 
 # Load .env file if python-dotenv is available
 try:
@@ -19,40 +31,249 @@ except ImportError:
     pass  # python-dotenv not installed, rely on shell environment
 
 from notebooklm import NotebookLMClient
-from notebooklm.auth import AuthTokens, load_auth_from_storage
-from notebooklm.exceptions import ChatError
+
+# ``load_auth_from_storage`` was de-blessed from ``notebooklm.auth.__all__`` in
+# #1592 (still importable there for back-compat); first-party code — including
+# these e2e fixtures — imports it from its canonical ``_auth.tokens`` home.
+from notebooklm._auth.tokens import load_auth_from_storage
+from notebooklm.auth import AuthTokens
+from notebooklm.exceptions import ChatError, RateLimitError, RPCError
 from notebooklm.paths import get_profile_dir
+from notebooklm.types import GrpcStatusCode, normalize_grpc_status
+from tests.e2e._generation_helpers import _TYPED_RATE_LIMIT_ATTR
+from tests.e2e._generation_journal import (
+    JournalConfigurationError,
+    journal_from_environment,
+)
 
 # Substrings in ChatError / skip messages that mark a server-side rate-limit
 # or quota rejection rather than a client bug. Covers both the explicit
 # UserDisplayableError message and the HTTP-status-wrapped 429 path in
-# _chat/api.py:156, plus the generation skip phrase in assert_generation_started.
+# ``notebooklm._web.transport.chat.chat_aware_authed_post``, the generation skip
+# phrase in assert_generation_started, and the "Rate limit:" prefix
+# _install_generation_rate_limit_skip adds to typed RateLimitError skips.
 _RATE_LIMIT_PHRASES = (
     "rate limit",
     "rate limited",
+    "rate-limited",
     "rejected by the api",
     "429",
     "too many requests",
 )
+_LIVE_CHAT_ASK_MARKER = "live_chat_ask"
+_LIVE_GENERATION_MARKER = "live_generation"
+# Coverage-floor markers → human label. A floor "fails" when at least one marked
+# test was rate-limit-skipped and none passed (hollow-green coverage). Enforced
+# only when E2E_ENFORCE_COVERAGE_FLOOR=1 (the nightly), so a shared daily-quota
+# exhaustion never reds a release job — see #1819 / _coverage_floor_enforced.
+_COVERAGE_FLOOR_MARKERS = {
+    _LIVE_CHAT_ASK_MARKER: "live chat",
+    _LIVE_GENERATION_MARKER: "live generation",
+}
+
+# Every live entrypoint that issues CREATE_ARTIFACT and can raise a quota
+# RateLimitError *before* any GenerationStatus exists (so assert_generation_started's
+# skip never runs). Keyed by client-namespace attr → predicate over method name.
+# Quizzes/flashcards/audio/video/etc. ride client.artifacts.generate_*/revise_*; the
+# interactive mind map goes through the separate client.mind_maps.generate path (the
+# #1819 gap that hard-failed the suite). Add new generation namespaces here — the guard
+# test TestGenerationSkipRegistryCoverage.test_registry_covers_all_generate_and_revise_methods
+# fails if an unregistered generate_/revise_/retry_ method appears on a covered class.
+#
+# Note: wrapping a whole method means a RateLimitError from a *post-create* RPC (e.g.
+# mind_maps.generate(wait=True) polling, or its settling _find_interactive LIST, after
+# CREATE_ARTIFACT already made the artifact) also skips — before generate returns the id
+# to its caller, so the caller can't clean up and the artifact leaks. The #1819
+# create-time case raises before any artifact exists (no leak). Splitting create from
+# poll does NOT close this: even generate(wait=False) issues a post-create LIST. Callers
+# that need cleanup therefore guard with an unconditional teardown sweep of the created
+# artifact type (id capture is unreliable across the skip) — see
+# tests/e2e/test_interactive_mind_map.py's swept_interactive_mind_maps fixture (#1937).
+_GENERATION_SKIP_TARGETS = {
+    # ``retry_failed`` re-runs generation and raises RateLimitError on quota, same
+    # as generate_*/revise_* — cover it too so a future e2e test doesn't hard-fail.
+    "artifacts": lambda n: n.startswith(("generate_", "revise_")) or n == "retry_failed",
+    "mind_maps": lambda n: n == "generate",
+    # Deliberately NOT here: client.labels.generate (CREATE_LABEL, the AI Auto-label
+    # action) and client.research.start (Deep Research). These are separate limit
+    # classes, not the daily CREATE_ARTIFACT quota — labels has no documented quota,
+    # and research already tolerates throttling via @pytest.mark.xfail. Don't lump
+    # them in on theory; add here (with evidence) only if one actually hard-fails CI.
+}
+_RATE_LIMIT_METHOD_ATTR = "_notebooklm_rate_limit_method_id"
+
+
+def _typed_rate_limit_cause(error: BaseException) -> RPCError | None:
+    """Find exact quota evidence through explicit exception chaining only.
+
+    Android ``CreateArtifact`` is not replay-safe. Its adapter therefore replaces
+    transport-class failures with an unconfirmed generic ``RPCError`` so app
+    surfaces never advise callers to retry an ambiguous create. Preserve that
+    production contract while recognizing the one fully typed quota shape here:
+    a marked CreateArtifact error carrying gRPC ``RESOURCE_EXHAUSTED``.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, RateLimitError):
+            return current
+        if (
+            isinstance(current, RPCError)
+            and getattr(current, "unconfirmed", False) is True
+            and str(current.method_id).endswith("/CreateArtifact")
+            and normalize_grpc_status(current.rpc_code) is GrpcStatusCode.RESOURCE_EXHAUSTED
+        ):
+            return current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+    return None
+
+
+def _raise_typed_rate_limit_skip(rate_limit: RPCError) -> None:
+    """Raise pytest's skip signal while retaining machine-readable quota metadata."""
+    skipped = pytest.skip.Exception(f"Rate limit: {rate_limit}")
+    setattr(skipped, _TYPED_RATE_LIMIT_ATTR, True)
+    setattr(skipped, _RATE_LIMIT_METHOD_ATTR, rate_limit.method_id)
+    raise skipped
 
 
 def _install_chat_rate_limit_skip(client: NotebookLMClient) -> None:
-    """Wrap ``client.chat.ask`` so rate-limit ``ChatError``s become skips.
+    """Wrap ``client.chat.ask`` so typed or web rate-limit errors become skips.
 
-    Non-rate-limit ``ChatError``s (HTTP, auth, parse) still raise so real
-    defects stay visible.
+    Android surfaces gRPC ``RESOURCE_EXHAUSTED`` as ``RateLimitError`` while
+    web chat currently surfaces its quota response as a ``ChatError``. Other
+    ``ChatError``s (HTTP, auth, parse) still raise so real defects stay visible.
     """
     original_ask = client.chat.ask
 
     async def _ask_with_skip(*args, **kwargs):
         try:
             return await original_ask(*args, **kwargs)
-        except ChatError as e:
+        except (ChatError, RateLimitError) as e:
+            if isinstance(e, RateLimitError):
+                pytest.skip(f"Rate limit: {e}")
             if any(phrase in str(e).lower() for phrase in _RATE_LIMIT_PHRASES):
                 pytest.skip(str(e))
             raise
 
     client.chat.ask = _ask_with_skip
+
+
+async def reset_current_chat_conversation(
+    client: NotebookLMClient,
+    notebook_id: str,
+) -> None:
+    """Start a live chat test from an empty server-side conversation."""
+    conversation_id = await client.chat.get_conversation_id(notebook_id)
+    if conversation_id is not None:
+        await client.chat.delete_conversation(notebook_id, conversation_id)
+
+
+def _install_generation_rate_limit_skip(client: NotebookLMClient) -> None:
+    """Wrap every live CREATE_ARTIFACT entrypoint so ``RateLimitError`` becomes a skip.
+
+    The RPC layer raises a typed ``RateLimitError`` when Google rejects
+    CREATE_ARTIFACT with a quota error (e.g. upstream status 8, Resource
+    exhausted) — before any ``GenerationStatus`` exists, so the
+    ``is_rate_limited`` skip in ``assert_generation_started`` never runs.
+    Android's non-replay-safe create path instead preserves that status on an
+    unconfirmed generic ``RPCError``. That is server-side throttling, not a
+    client defect. Only those exact typed shapes skip; every other exception
+    still raises so real defects stay visible.
+
+    Covers every namespace in ``_GENERATION_SKIP_TARGETS`` — not just
+    ``client.artifacts`` — so paths like ``client.mind_maps.generate`` (the
+    interactive mind map, #1819) skip on quota exhaustion instead of hard-failing.
+    """
+
+    def _wrap(original):
+        async def _with_skip(*args, **kwargs):
+            try:
+                return await original(*args, **kwargs)
+            except Exception as error:
+                rate_limit = _typed_rate_limit_cause(error)
+                if rate_limit is None:
+                    raise
+                # The "Rate limit:" prefix guarantees a _RATE_LIMIT_PHRASES
+                # match regardless of the exception message wording, so the
+                # skip always lands in pytest_terminal_summary's section.
+                _raise_typed_rate_limit_skip(rate_limit)
+
+        return _with_skip
+
+    for ns_name, matches in _GENERATION_SKIP_TARGETS.items():
+        namespace = getattr(client, ns_name, None)
+        if namespace is None:
+            continue
+        for name in dir(namespace):
+            if not matches(name):
+                continue
+            original = getattr(namespace, name)
+            if not callable(original):
+                continue
+            setattr(namespace, name, _wrap(original))
+
+
+_JOURNALED_STUDIO_METHODS = {
+    "generate_audio": "audio",
+    "generate_video": "video",
+    "generate_cinematic_video": "video",
+    "generate_report": "report",
+    "generate_quiz": "quiz",
+    "generate_flashcards": "flashcards",
+    "generate_infographic": "infographic",
+    "generate_slide_deck": "slide_deck",
+    "generate_data_table": "data_table",
+    "generate_study_guide": "study_guide",
+}
+
+
+def _install_generation_journal(client: NotebookLMClient, journal) -> None:
+    """Journal direct Studio calls that target the managed generation role."""
+    managed_id = getattr(journal, "notebook_id", None)
+    if managed_id is None:
+        return
+    journal_call_active: ContextVar[bool] = ContextVar(
+        "notebooklm_e2e_generation_journal_call_active", default=False
+    )
+
+    for method_name, family in _JOURNALED_STUDIO_METHODS.items():
+        original = getattr(client.artifacts, method_name)
+
+        async def _journaled(*args, __original=original, __family=family, **kwargs):
+            notebook_id = args[0] if args else kwargs.get("notebook_id")
+            if notebook_id != managed_id:
+                return await __original(*args, **kwargs)
+            if journal_call_active.get():
+                return await __original(*args, **kwargs)
+            operation = journal.operation(
+                notebook_id=notebook_id,
+                family=__family,
+                surface=journal.surface,
+                id_kind="studio_task",
+                lifecycle="settle",
+            )
+            journal_token = journal_call_active.set(True)
+            try:
+                try:
+                    result = await __original(*args, **kwargs)
+                except BaseException as exc:
+                    if _typed_rate_limit_cause(exc) is not None:
+                        operation.quota_response_unconfirmed()
+                    raise
+                if result is not None and getattr(result, "task_id", None):
+                    operation.accepted(result.task_id)
+                elif result is not None and bool(getattr(result, "is_rate_limited", False)):
+                    operation.quota_response_unconfirmed()
+                return result
+            finally:
+                journal_call_active.reset(journal_token)
+
+        setattr(client.artifacts, method_name, _journaled)
 
 
 def _emit_auth_route_diagnostic(auth_tokens: AuthTokens) -> None:
@@ -154,6 +375,15 @@ GENERATION_TEST_DELAY = 15.0
 CHAT_TEST_DELAY = 5.0
 E2E_TEST_DIR = Path(__file__).resolve().parent
 
+_MANAGED_FLAG_ENV = "NOTEBOOKLM_E2E_MANAGED_COPIES"
+_MANAGED_MODE_ENV = "NOTEBOOKLM_E2E_MANAGED_MODE"
+_MANAGED_REFERENCE_READY_ENV = "NOTEBOOKLM_E2E_REFERENCE_PREPARED"
+_MANAGED_FULL_ROLE_ENVS = (
+    "NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID",
+    "NOTEBOOKLM_GENERATION_NOTEBOOK_ID",
+    "NOTEBOOKLM_MULTI_SOURCE_NOTEBOOK_ID",
+)
+
 
 def _is_path_under(path: Path, directory: Path) -> bool:
     """Return True when path resolves under directory."""
@@ -162,6 +392,50 @@ def _is_path_under(path: Path, directory: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _managed_bindings() -> dict[str, str] | None:
+    """Validate and return workflow-owned notebook bindings for the selected mode."""
+    activation = os.environ.get(_MANAGED_FLAG_ENV)
+    if activation is None:
+        if any(
+            os.environ.get(name) is not None
+            for name in (_MANAGED_MODE_ENV, _MANAGED_REFERENCE_READY_ENV)
+        ):
+            raise ValueError("managed controls are present without the activation flag")
+        return None
+    if activation != "1":
+        raise ValueError(f"{_MANAGED_FLAG_ENV} must be exactly 1 when present")
+    mode = os.environ.get(_MANAGED_MODE_ENV)
+    if mode == "full":
+        role_envs = _MANAGED_FULL_ROLE_ENVS
+    elif mode == "readonly":
+        role_envs = ("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID",)
+    else:
+        raise ValueError(f"{_MANAGED_MODE_ENV} must be full or readonly for pytest E2E")
+    bindings = {name: os.environ.get(name, "") for name in role_envs}
+    missing = [name for name, value in bindings.items() if not value]
+    if missing:
+        raise ValueError(f"managed {mode} mode is missing role bindings: " + ", ".join(missing))
+    if mode == "full":
+        reference = bindings["NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID"]
+        generation = bindings["NOTEBOOKLM_GENERATION_NOTEBOOK_ID"]
+        multi_source = bindings["NOTEBOOKLM_MULTI_SOURCE_NOTEBOOK_ID"]
+        if reference == generation or multi_source != generation:
+            raise ValueError(
+                "managed full-mode bindings require one distinct reference and one shared "
+                "generation/multi-source workspace"
+            )
+    if os.environ.get(_MANAGED_REFERENCE_READY_ENV) != "1":
+        raise ValueError("managed reference preparation marker is missing")
+    return bindings
+
+
+def skip_or_fail_missing_reference(message: str) -> None:
+    """Turn missing prepared reference state into a hard managed-mode failure."""
+    if _managed_bindings() is not None:
+        pytest.fail(f"managed reference contract violation: {message}", pytrace=False)
+    pytest.skip(message)
 
 
 def assert_generation_started(result, artifact_type: str = "Artifact") -> None:
@@ -187,6 +461,129 @@ def assert_generation_started(result, artifact_type: str = "Artifact") -> None:
         "pending",
         "in_progress",
     ), f"Unexpected {artifact_type.lower()} status: {result.status}"
+
+
+def journal_generation_started(result, operation, artifact_type: str = "Artifact") -> None:
+    """Validate a Studio generation response and persist its accepted ID first."""
+    assert result is not None, f"{artifact_type} generation returned None"
+    if result.task_id:
+        operation.accepted(result.task_id)
+    elif result.is_rate_limited:
+        operation.quota_response_unconfirmed()
+        pytest.skip("Rate limited by API")
+    assert_generation_started(result, artifact_type)
+
+
+async def journal_studio_generation(
+    generation_journal,
+    awaitable: Awaitable[Any],
+    *,
+    notebook_id: str,
+    family: str,
+    surface: str = "client",
+):
+    """Journal ``started`` before awaiting one Studio generation mutation."""
+    operation = generation_journal.operation(
+        notebook_id=notebook_id,
+        family=family,
+        surface=surface,
+        id_kind="studio_task",
+        lifecycle="settle",
+    )
+    try:
+        result = await awaitable
+    except BaseException as exc:
+        # A typed quota response can race with an asynchronous server-side
+        # commit, so the verifier must reconcile it against the quiet inventory.
+        if _typed_rate_limit_cause(exc) is not None:
+            operation.quota_response_unconfirmed()
+        raise
+    journal_generation_started(result, operation)
+    return result
+
+
+async def read_back_option_pair(
+    client: "NotebookLMClient",
+    notebook_id: str,
+    task_id: str,
+    *,
+    family: str,
+    attempts: int = 10,
+) -> "QuizOptionPair":
+    """Return the ``[quantity, difficulty]`` pair the SERVER stored for an artifact.
+
+    The backend echoes the generation options it persisted, which makes this the
+    only tier that can check a request against reality rather than against a
+    fixture we wrote (#2195). Unit tests pin the decode positions against
+    ``docs/android/schema.proto``; this closes the loop against a live
+    generation, and is what would have caught the transposed flashcards pair
+    (#2116) and the ``MORE``-as-``STANDARD`` alias (#2117) without anyone
+    thinking to look.
+
+    The echo is written when the artifact row is created, so this does not wait
+    for generation to finish — only for the row to become listable.
+
+    Args:
+        client: Live client.
+        notebook_id: Notebook the artifact was generated in.
+        task_id: ``GenerationStatus.task_id`` (also the artifact id).
+        family: ``"quiz"`` or ``"flashcards"`` — which option slot to read.
+        attempts: Listing retries before failing.
+
+    Raises:
+        AssertionError: If the row never appears or carries no option pair.
+    """
+    from notebooklm._web.rows.artifacts import ArtifactRow, QuizOptionPair
+    from notebooklm.exceptions import RPCError
+
+    assert family in ("quiz", "flashcards"), family
+    if client.backends["artifacts"] == "android":
+        for attempt in range(attempts):
+            try:
+                async with client.artifacts._transport.operation_scope(
+                    f"e2e read-back {family} options"
+                ) as lease:
+                    raw = await client.artifacts._get_raw_studio_artifact(
+                        notebook_id,
+                        task_id,
+                        expected_epoch=lease.epoch,
+                    )
+            except RPCError as error:
+                if error.rpc_code != 5 or attempt >= attempts - 1:
+                    raise
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            assert raw.HasField("app"), f"Android {family} artifact has no app payload"
+            options = raw.app.generation_options
+            field = f"{family}_generation_options"
+            assert options.HasField(field), (
+                f"Android {family} artifact carries no stored protobuf option pair"
+            )
+            stored = getattr(options, field)
+            quantity = stored.question_quantity if family == "quiz" else stored.card_quantity
+            difficulty = (
+                stored.quiz_difficulty if family == "quiz" else stored.flashcards_difficulty
+            )
+            return QuizOptionPair(quantity=int(quantity), difficulty=int(difficulty))
+        raise AssertionError(f"artifact {task_id} never appeared in Android GetArtifact")
+
+    for attempt in range(attempts):
+        # ``_list_for_download`` is the sanctioned internal seam for the raw
+        # rows (#1488); no public API exposes the stored options today.
+        _, raw_rows, _ = await client.artifacts._list_for_download(notebook_id)
+        for raw in raw_rows:
+            if isinstance(raw, list) and raw and raw[0] == task_id:
+                row = ArtifactRow(raw)
+                options = row.quiz_options if family == "quiz" else row.flashcards_options
+                assert options is not None, (
+                    f"{family} artifact {task_id} carries no stored option pair; "
+                    f"variant={row.variant}, options block={raw[ArtifactRow._OPTIONS_POS]!r}"
+                )
+                return options
+        if attempt < attempts - 1:
+            await asyncio.sleep(POLL_INTERVAL)
+    raise AssertionError(f"artifact {task_id} never appeared in {notebook_id}'s listing")
 
 
 def has_auth() -> bool:
@@ -233,11 +630,24 @@ def pytest_configure(config):
     profile = config.getoption("--profile")
     if profile:
         _apply_profile(profile)
+    if os.environ.get("CI_E2E_PROGRESS") == "1":
+        from tests.e2e._progress import E2EProgress
+
+        config.pluginmanager.register(E2EProgress(), "ci-e2e-progress")
+    try:
+        _managed_bindings()
+        # Validate journal policy before collection. A per-test helper reopens
+        # the same append-only file with that test's node ID.
+        journal_from_environment(node_id="collection-preflight")
+    except (ValueError, JournalConfigurationError) as exc:
+        raise pytest.UsageError(f"invalid managed E2E configuration: {exc}") from exc
 
 
 def pytest_unconfigure(config):
     """Restore the original ``NOTEBOOKLM_PROFILE`` if we mutated it."""
-    global _PROFILE_PRIOR
+    global _PROFILE_PRIOR, _generation_cleanup_done, _multi_source_cleanup_done
+    _generation_cleanup_done = False
+    _multi_source_cleanup_done = False
     if _PROFILE_PRIOR is None:
         return
     was_set, prev = _PROFILE_PRIOR
@@ -261,6 +671,177 @@ def _skip_reason(report) -> str:
     return str(longrepr) if longrepr else ""
 
 
+def _is_call_report(report) -> bool:
+    # Unit fakes may omit ``when``; real pytest reports always include it.
+    return getattr(report, "when", "call") == "call"
+
+
+def _has_marker(report, marker: str) -> bool:
+    return marker in (getattr(report, "keywords", {}) or {})
+
+
+def _is_rate_limit_skip(report) -> bool:
+    return any(phrase in _skip_reason(report).lower() for phrase in _RATE_LIMIT_PHRASES)
+
+
+def _rate_limit_skip_reports(terminalreporter) -> list[Any]:
+    return [
+        report
+        for report in terminalreporter.stats.get("skipped", [])
+        if _is_rate_limit_skip(report)
+    ]
+
+
+def _coverage_floor_enforced() -> bool:
+    """Whether execution floors escalate to a suite failure.
+
+    Off by default so a shared daily-quota exhaustion can never red a release job
+    (e.g. Verify Package, #1819) — the release path skips rate-limited
+    generation/chat freely. The nightly sets ``E2E_ENFORCE_COVERAGE_FLOOR=1`` to
+    turn hollow-green (every marked test skipped, none passed) into a red where
+    the quota is fresh and the signal is real.
+    """
+    return os.environ.get("E2E_ENFORCE_COVERAGE_FLOOR") == "1"
+
+
+def _coverage_floor_failures(terminalreporter, exitstatus, marker: str) -> list[Any]:
+    """Rate-limit skips that breach the execution floor for ``marker``.
+
+    Non-empty only when at least one ``marker`` test was rate-limit-skipped and no
+    ``marker`` test passed — i.e. that live surface produced zero real coverage.
+    """
+    # Only meaningful for a *completed* run: everything passed (OK) or some tests
+    # failed (TESTS_FAILED). A broken run (usage/internal/interrupt/no-tests) is its
+    # own signal — don't evaluate the floor or rewrite that exit code.
+    #
+    # We deliberately do NOT bail on TESTS_FAILED. Under the nightly's
+    # ``continue-on-error`` main step + ``--last-failed`` retry, an *unrelated* test
+    # that fails on the main run and then passes on retry lands the job green — so a
+    # blanket ``exitstatus != OK`` bail would let that transient failure MASK a
+    # genuinely hollow generation/chat surface (all rate-limited, none passed). We
+    # still record the breach; only a failure of a test *with this marker* defers,
+    # since the retry may re-run it into a pass (real coverage). Caught by
+    # test_generation_floor_records_breach_despite_unrelated_failure (#1819).
+    if exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
+        return []
+
+    marked_skips = [
+        report
+        for report in _rate_limit_skip_reports(terminalreporter)
+        if _has_marker(report, marker)
+    ]
+    if not marked_skips:
+        return []
+
+    marked_passes = [
+        report
+        for report in terminalreporter.stats.get("passed", [])
+        if _is_call_report(report) and _has_marker(report, marker)
+    ]
+    if marked_passes:
+        return []
+
+    # No marked test passed and some were rate-limited. A marked *failure* has its
+    # real outcome deferred to the retry (may pass there → coverage), so hold off;
+    # otherwise this is a final zero-coverage breach — record it even when other,
+    # unmarked tests failed. Count a failure in ANY phase (setup/call/teardown):
+    # ``--last-failed`` retries a test that failed in any phase, so a setup-phase
+    # failure of a marked test is just as deferrable as a call-phase one (gemini/codex).
+    marked_failures = [
+        report for report in terminalreporter.stats.get("failed", []) if _has_marker(report, marker)
+    ]
+    if marked_failures:
+        return []
+
+    return marked_skips
+
+
+def _coverage_events(terminalreporter, exitstatus) -> list[str]:
+    """Per-marker ``PASS``/``SKIP`` events for cross-run coverage-floor accumulation.
+
+    One tab-separated line per monitored surface that produced a signal this run:
+    ``PASS\t<label>`` when a marked test passed (real coverage), else
+    ``SKIP\t<label>`` when a marked test was rate-limit-skipped (candidate breach).
+    A surface that neither passed nor skipped emits nothing.
+    """
+    if exitstatus not in (pytest.ExitCode.OK, pytest.ExitCode.TESTS_FAILED):
+        return []
+    skip_reports = _rate_limit_skip_reports(terminalreporter)
+    events: list[str] = []
+    for marker, label in _COVERAGE_FLOOR_MARKERS.items():
+        passed = any(
+            _is_call_report(r) and _has_marker(r, marker)
+            for r in terminalreporter.stats.get("passed", [])
+        )
+        if passed:
+            events.append(f"PASS\t{label}")
+        elif any(_has_marker(r, marker) for r in skip_reports):
+            events.append(f"SKIP\t{label}")
+    return events
+
+
+def pytest_sessionfinish(session, exitstatus):
+    terminalreporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if terminalreporter is None:
+        return
+
+    # Execution floors are advisory unless the nightly opts in (see
+    # _coverage_floor_enforced), so a rate-limited release job stays green (#1819).
+    if not _coverage_floor_enforced():
+        return
+
+    sentinel = os.environ.get("E2E_COVERAGE_FLOOR_SENTINEL")
+    if sentinel:
+        # Sentinel delivery (nightly). The main e2e step is ``continue-on-error`` and
+        # its ``--last-failed`` retry re-runs only failures, so a ``session.exitstatus``
+        # override would be masked. Instead every enforcing run (main AND retry)
+        # appends PASS/SKIP events; the "Enforce execution floors" step breaches a
+        # surface seen SKIP but never PASS across all runs. This closes the retry gap
+        # (a marked test that fails on main then skips on retry) WITHOUT false-breaching
+        # when coverage was achieved in another run (codex/coderabbit). Exit status is
+        # left alone so a pure-skip run stays exit 0 and doesn't trip a spurious retry;
+        # a write failure falls back to the inline exit code (best-effort).
+        events = _coverage_events(terminalreporter, exitstatus)
+        if not events or _append_sentinel(sentinel, events):
+            return
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        return
+
+    # Inline delivery (local runs, simple jobs, unit tests): no retry, so decide from
+    # this single run.
+    breached = any(
+        _coverage_floor_failures(terminalreporter, exitstatus, marker)
+        for marker in _COVERAGE_FLOOR_MARKERS
+    )
+    if breached:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def _append_sentinel(path: str, lines: list[str]) -> bool:
+    """Append lines to the coverage-floor sentinel. Returns True on success.
+
+    Creates the parent directory first so a missing directory can't turn the
+    enforcement signal into a silent no-op (gemini).
+    """
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+        return True
+    except OSError as exc:
+        # The sentinel IS the enforcement signal — a silent write failure would let a
+        # hollow-green nightly pass. Fail loud AND signal the caller to fall back to
+        # the inline exit-code path.
+        print(
+            f"::error::could not write coverage-floor sentinel {path!r} ({exc})",
+            file=sys.stderr,
+        )
+        return False
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Surface chat rate-limit skips so they're visible despite green CI.
 
@@ -269,11 +850,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     silently degrades. Emit a pytest summary section plus, on GitHub Actions,
     a warning annotation and step-summary entry.
     """
-    nodeids = [
-        report.nodeid
-        for report in terminalreporter.stats.get("skipped", [])
-        if any(phrase in _skip_reason(report).lower() for phrase in _RATE_LIMIT_PHRASES)
-    ]
+    rate_limit_skips = _rate_limit_skip_reports(terminalreporter)
+    nodeids = [report.nodeid for report in rate_limit_skips]
     if not nodeids:
         return
 
@@ -295,6 +873,26 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         joined = ", ".join(nodeids)
         print(f"::warning::{len(nodeids)} test(s) skipped due to rate-limit: {joined}")
 
+    enforced = _coverage_floor_enforced()
+    for marker, label in _COVERAGE_FLOOR_MARKERS.items():
+        breaches = _coverage_floor_failures(terminalreporter, exitstatus, marker)
+        if not breaches:
+            continue
+        if enforced:
+            terminalreporter.write_sep("=", f"{label} execution floor failed", red=True)
+            terminalreporter.write_line(
+                f"No marked {label} test completed successfully (all rate-limited)."
+            )
+        else:
+            terminalreporter.write_sep(
+                "=", f"{label} execution floor breached (not enforced)", yellow=True
+            )
+            terminalreporter.write_line(
+                f"No marked {label} test passed; not failing (E2E_ENFORCE_COVERAGE_FLOOR unset)."
+            )
+        for report in breaches:
+            terminalreporter.write_line(f"  {report.nodeid}")
+
 
 def pytest_collection_modifyitems(config, items):
     """Skip variant tests by default unless --include-variants is passed."""
@@ -314,7 +912,7 @@ def pytest_runtest_teardown(item, nextitem):
 
     This hook runs after each test. Adds delays for:
     - test_generation.py: 15s between generation tests (artifact quotas)
-    - test_chat.py: 5s between chat tests (ask() rate limits)
+    - live_chat_ask-marked tests: 5s between chat tests (ask() rate limits)
     """
     import time
 
@@ -330,7 +928,7 @@ def pytest_runtest_teardown(item, nextitem):
         time.sleep(GENERATION_TEST_DELAY)
         return
 
-    if item.path.name == "test_chat.py":
+    if item.get_closest_marker(_LIVE_CHAT_ASK_MARKER) is not None:
         if "multi_source_notebook_id" not in item.fixturenames:
             return
         logging.info("Delaying %ss between chat tests to avoid rate limiting", CHAT_TEST_DELAY)
@@ -345,45 +943,65 @@ def pytest_runtest_teardown(item, nextitem):
 @pytest.fixture(scope="session")
 def auth_tokens() -> AuthTokens:
     """Load domain-preserving auth tokens from storage (session-scoped)."""
-    import asyncio
 
-    tokens = asyncio.run(AuthTokens.from_storage())
+    async def load() -> AuthTokens:
+        async with NotebookLMClient.from_storage() as loaded_client:
+            return loaded_client.auth
+
+    tokens = asyncio.run(load())
     _emit_auth_route_diagnostic(tokens)
     return tokens
 
 
 @pytest.fixture
-async def client(auth_tokens) -> AsyncGenerator[NotebookLMClient, None]:
+async def client(auth_tokens, generation_journal) -> AsyncGenerator[NotebookLMClient, None]:
     async with NotebookLMClient(auth_tokens, storage_path=auth_tokens.storage_path) as c:
         _install_chat_rate_limit_skip(c)
+        _install_generation_journal(c, generation_journal)
+        _install_generation_rate_limit_skip(c)
         yield c
 
 
 @pytest.fixture
-def read_only_notebook_id():
-    """Get notebook ID from NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID env var.
+def generation_journal(request):
+    """Return a node-bound operation journal (a no-op unless explicitly enabled)."""
+    try:
+        return journal_from_environment(node_id=request.node.nodeid)
+    except JournalConfigurationError as exc:
+        pytest.fail(f"invalid generation journal configuration: {exc}", pytrace=False)
 
-    This env var is REQUIRED for E2E tests. You must create your own
-    read-only test notebook with sources and artifacts.
+
+@pytest.fixture
+def read_only_notebook_id():
+    """Return the disposable reference copy or the legacy local binding.
+
+    Managed CI uses the workflow-owned ``reference`` copy and never exposes
+    the immutable canonical template to pytest. Without managed activation,
+    the historical environment-variable behavior is unchanged.
 
     This fixture provides a notebook ID for READ-ONLY tests - tests that
     list, get, or query but do NOT modify the notebook. Do not use this
     fixture for tests that create, update, or delete resources.
 
-    See docs/contributing/testing.md for setup instructions.
+    See docs/development.md for setup instructions.
     """
-    notebook_id = os.environ.get("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID")
+    managed = _managed_bindings()
+    notebook_id = (
+        managed["NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID"]
+        if managed is not None
+        else os.environ.get("NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID")
+    )
     if not notebook_id:
         pytest.exit(
             "\n\nERROR: NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID environment variable is not set.\n\n"
             "E2E tests require YOUR OWN test notebook with content.\n\n"
             "Setup instructions:\n"
-            "  1. Create a notebook at https://notebooklm.google.com\n"
+            f"  1. Create a notebook at {get_base_url()}\n"
             "  2. Add sources (text, URL, PDF, etc.)\n"
             "  3. Generate some artifacts (audio, quiz, etc.)\n"
             "  4. Copy notebook ID from URL and run:\n"
             "     export NOTEBOOKLM_READ_ONLY_NOTEBOOK_ID='your-notebook-id'\n\n"
-            "See docs/contributing/testing.md for details.\n",
+            "See docs/development.md for details.\n",
             returncode=1,
         )
     return notebook_id
@@ -595,9 +1213,11 @@ async def _verify_notebook_exists(client, notebook_id: str) -> bool:
 
 @pytest.fixture
 async def generation_notebook_id(client):
-    """Get or create a notebook for generation tests.
+    """Return the disposable generation copy or use the legacy local lifecycle.
 
-    This fixture uses a hybrid approach:
+    Managed CI yields the workflow-owned prepared copy without cache access,
+    first-use cleanup, creation, or teardown deletion. Unmanaged local runs
+    preserve the hybrid fallback:
     1. Check NOTEBOOKLM_GENERATION_NOTEBOOK_ID env var
     2. If not set, check for a stored ID in the active profile cache
        (~/.notebooklm/profiles/<name>/generation_notebook_id)
@@ -614,6 +1234,13 @@ async def generation_notebook_id(client):
     Use for: artifact generation tests (audio, video, quiz, etc.)
     Do NOT use for: CRUD tests (use temp_notebook instead)
     """
+    managed = _managed_bindings()
+    if managed is not None:
+        # Provision already verified existence, source readiness, and a clean
+        # child inventory. Workflow cleanup owns the notebook across retries.
+        yield managed["NOTEBOOKLM_GENERATION_NOTEBOOK_ID"]
+        return
+
     auto_created = False
     source = None  # Track where notebook ID came from for debugging
 
@@ -800,9 +1427,11 @@ async def _cleanup_multi_source_notebook(client: NotebookLMClient, notebook_id: 
 
 @pytest.fixture
 async def multi_source_notebook_id(client):
-    """Get or create a notebook with multiple sources for source selection tests.
+    """Return the disposable multi-source copy or use the legacy local lifecycle.
 
-    This fixture uses a hybrid approach similar to generation_notebook_id:
+    Managed CI yields the workflow-owned prepared copy without cache access,
+    first-use cleanup, creation, or teardown deletion. Unmanaged local runs
+    preserve the hybrid fallback:
     1. Check NOTEBOOKLM_MULTI_SOURCE_NOTEBOOK_ID env var
     2. If not set, check for a stored ID in the active profile cache
        (~/.notebooklm/profiles/<name>/multi_source_notebook_id)
@@ -811,6 +1440,11 @@ async def multi_source_notebook_id(client):
     All IDs are verified to exist before use.
     Artifacts are cleaned before tests. Sources are preserved.
     """
+    managed = _managed_bindings()
+    if managed is not None:
+        yield managed["NOTEBOOKLM_MULTI_SOURCE_NOTEBOOK_ID"]
+        return
+
     auto_created = False
     source = None
 
@@ -858,3 +1492,164 @@ async def multi_source_notebook_id(client):
             warnings.warn(
                 f"Failed to delete multi-source notebook {notebook_id}: {e}", stacklevel=2
             )
+
+
+# =============================================================================
+# Layer B — in-process MCP HTTP transport (ASGI, no socket)
+# =============================================================================
+# These helpers build the FastMCP http app bound to the LIVE e2e client (via the
+# ``client_factory`` seam) and drive it entirely in-process over
+# ``httpx.ASGITransport`` — the proven pattern from
+# ``tests/unit/mcp/test_remote_auth.py``. No port, no subprocess. fastmcp is
+# imported LAZILY inside these helpers so the shared e2e conftest still loads
+# cleanly when the ``mcp`` extra is absent (non-MCP e2e suites must not break).
+
+#: Bearer token the Layer-B tests authenticate the in-process http transport
+#: with. Arbitrary (the server compares against whatever ``build_auth`` was given).
+MCP_TEST_BEARER = "e2e-test-bearer-token"
+
+#: Base URL the in-process ASGI app answers on. Requests are routed by
+#: ``httpx.ASGITransport`` straight to the app object, so the host is cosmetic.
+_ASGI_BASE_URL = "http://app"
+
+
+class InProcessMcp:
+    """Handle to an in-process MCP http app for the Layer-B e2e tests.
+
+    Exposes both transports the tests need within one app lifespan:
+
+    * :meth:`mcp_client` — a ``fastmcp.Client`` over ``StreamableHttpTransport``
+      that drives MCP tool calls through the bearer-gated ``/mcp`` route.
+    * :meth:`raw_client` — a plain ``httpx.AsyncClient`` for the raw custom
+      routes (``/files/*``, ``/.well-known/*``, and the unauth ``/mcp`` probe).
+    """
+
+    def __init__(self, app: Any, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    def mcp_client(self, token: str | None = None) -> Any:
+        """Return a (not-yet-entered) ``fastmcp.Client`` bearer-authed to the app."""
+        import httpx
+        from fastmcp import Client
+        from fastmcp.client.transports import StreamableHttpTransport
+
+        bearer = self.token if token is None else token
+
+        def httpx_factory(**kwargs: Any) -> httpx.AsyncClient:
+            # fastmcp passes its own transport; drive the app in-process via ASGI.
+            kwargs.pop("transport", None)
+            return httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=self.app), base_url=_ASGI_BASE_URL, **kwargs
+            )
+
+        return Client(
+            StreamableHttpTransport(
+                f"{_ASGI_BASE_URL}/mcp",
+                headers={"Authorization": f"Bearer {bearer}"},
+                httpx_client_factory=httpx_factory,
+            )
+        )
+
+    def raw_client(self) -> Any:
+        """Return a (not-yet-entered) plain ``httpx.AsyncClient`` over the ASGI app."""
+        import httpx
+
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app), base_url=_ASGI_BASE_URL
+        )
+
+
+def asgi_path(url: str) -> str:
+    """Strip a minted signed URL down to the path the in-process ASGI client hits.
+
+    Minted ``/files/*`` URLs carry the configured public origin
+    (``https://127.0.0.1``); the in-process httpx client routes by path, so only
+    the path segment matters. Preserves any query string (none today, but cheap).
+    """
+    parts = urlsplit(url)
+    return parts.path + (f"?{parts.query}" if parts.query else "")
+
+
+@contextlib.asynccontextmanager
+async def inprocess_mcp_server(
+    real_client: "NotebookLMClient",
+    *,
+    token: str | None = MCP_TEST_BEARER,
+    oauth: Any = None,
+    file_transfer: Any = None,
+) -> AsyncIterator[InProcessMcp]:
+    """Build the MCP http app bound to ``real_client`` and enter its lifespan.
+
+    Mirrors ``tests/unit/mcp/test_remote_auth.py`` exactly, but the
+    ``client_factory`` yields the already-open LIVE e2e client (the fixture owns
+    its lifecycle, so the factory must NOT close it). Entering
+    ``app.router.lifespan_context`` is REQUIRED — the ``/files/*`` handlers read
+    the lifespan-bound client off ``app.state`` and 500 without it.
+    """
+    from notebooklm.mcp._auth import build_auth
+    from notebooklm.mcp.server import create_server
+
+    @contextlib.asynccontextmanager
+    async def factory() -> AsyncIterator["NotebookLMClient"]:
+        yield real_client
+
+    server = create_server(
+        client_factory=factory,
+        auth=build_auth(token, oauth),
+        file_transfer=file_transfer,
+    )
+    app = server.http_app()
+    async with app.router.lifespan_context(app):
+        yield InProcessMcp(app, token or MCP_TEST_BEARER)
+
+
+# =============================================================================
+# CLI subprocess helper (deliverable 4)
+# =============================================================================
+
+
+def run_cli(
+    *args: str,
+    notebook: str | None = None,
+    extra_env: dict[str, str] | None = None,
+    timeout: float = 180.0,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the CLI as ``sys.executable -m notebooklm.notebooklm_cli``.
+
+    Runs the real installed CLI in a child process so the binary entry point,
+    argument parsing, and ``--json`` stdout/stderr split are exercised end to
+    end. The child inherits the parent environment (so ``NOTEBOOKLM_AUTH_JSON`` /
+    storage materialized for the e2e client carries over) — never ``--profile``,
+    which would make the CLI ignore an inline ``NOTEBOOKLM_AUTH_JSON`` secret.
+
+    Pass the target notebook via ``notebook=`` (exported as
+    ``NOTEBOOKLM_NOTEBOOK``) or an explicit ``-n <id>`` in ``args`` — NEVER
+    ``notebooklm use`` (that mutates shared profile state).
+    """
+    env = os.environ.copy()
+    # Belt for the child's *encode* side: force UTF-8 stdout so a non-Latin-1
+    # char in a live answer can't crash the child on a non-UTF-8-locale runner.
+    # (On Windows the CLI already does this itself via
+    # ``notebooklm_cli._configure_windows_runtime``; this mirrors it for any
+    # other locale.) Set as a base default so ``extra_env`` can override it.
+    env.setdefault("PYTHONUTF8", "1")
+    if notebook is not None:
+        env["NOTEBOOKLM_NOTEBOOK"] = notebook
+    if extra_env:
+        env.update(extra_env)
+    # The load-bearing fix is our *decode* side: without ``encoding=``,
+    # ``text=True`` decodes the child's UTF-8 stdout with the locale codec
+    # (cp1252 on Windows), which raises ``UnicodeDecodeError`` on an undefined
+    # byte (e.g. 0x9d, the tail of a closing curly quote U+201D → ``E2 80 9D``);
+    # the reader thread dies, ``proc.stdout`` becomes ``None``, and
+    # ``json.loads(None)`` fails with a misleading ``TypeError``. Pin the decode
+    # to UTF-8; ``errors="replace"`` guarantees a ``str`` (never ``None``).
+    return subprocess.run(
+        [sys.executable, "-m", "notebooklm.notebooklm_cli", *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=timeout,
+    )

@@ -8,17 +8,18 @@ when 429 arrives without a parseable ``Retry-After`` header. Setting
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from tests.unit.conftest import install_post_as_stream
 
 import notebooklm._deadline as _deadline
-from _fixtures.kernel_test_helpers import install_http_client_for_test
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm.rpc import RateLimitError, RPCError, RPCMethod
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
+from tests._helpers.client_factory import build_client_shell_for_tests
+from tests.unit.conftest import install_post_as_stream
 
 
 @pytest.fixture
@@ -49,6 +50,23 @@ def _build_200(payload: list) -> MagicMock:
     return resp
 
 
+def _activate_call_supervisor(core: object) -> None:
+    """Commit admission for tests that install Kernel state without ``open``."""
+    supervisor = core._collaborators.call_supervisor  # type: ignore[attr-defined]
+    supervisor.set_bound_loop(asyncio.get_running_loop())
+    supervisor.reset_after_open()
+    supervisor.prepare_generation(1)
+    supervisor.start_accepting(1)
+    kernel = core._web_runtime.kernel  # type: ignore[attr-defined]
+    installed_client = kernel.http_client
+    if installed_client is not None:
+        install_http_client_for_test(kernel, None)
+    kernel.activate(1)
+    if installed_client is not None:
+        install_http_client_for_test(kernel, installed_client)
+    core._web_runtime.auth_coord.activate_epoch(1)  # type: ignore[attr-defined]
+
+
 @pytest.mark.asyncio
 async def test_rate_limit_retry_success_with_budget(auth_tokens):
     """With budget>0 and a parseable Retry-After, the second call succeeds."""
@@ -56,7 +74,8 @@ async def test_rate_limit_retry_success_with_budget(auth_tokens):
     mock_client.post.side_effect = [_build_429("1"), _build_200([["result"]])]
 
     core = build_client_shell_for_tests(auth_tokens, rate_limit_max_retries=2)
-    install_http_client_for_test(core._collaborators.kernel, mock_client)
+    install_http_client_for_test(core._web_runtime.kernel, mock_client)
+    _activate_call_supervisor(core)
     install_post_as_stream(None, mock_client, mock_client.post)
 
     # Decode may fail on the synthetic 200 — that's fine, what we care about
@@ -64,7 +83,7 @@ async def test_rate_limit_retry_success_with_budget(auth_tokens):
     # RPCError-tree decode failure, but the retry MUST have fired. Narrowed
     # from `except Exception` to keep unrelated programming errors visible.
     with patch("asyncio.sleep", AsyncMock()) as mock_sleep, contextlib.suppress(RPCError):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
 
     assert mock_client.post.call_count == 2, (
         f"Expected initial 429 then 1 retry, got {mock_client.post.call_count}"
@@ -92,7 +111,8 @@ async def test_rate_limit_retry_after_larger_than_client_timeout_does_not_sleep(
     mock_client.post.return_value = _build_429("1")
 
     core = build_client_shell_for_tests(auth_tokens, timeout=10.0, rate_limit_max_retries=2)
-    install_http_client_for_test(core._collaborators.kernel, mock_client)
+    install_http_client_for_test(core._web_runtime.kernel, mock_client)
+    _activate_call_supervisor(core)
     install_post_as_stream(None, mock_client, mock_client.post)
 
     sleeps: list[float] = []
@@ -127,7 +147,7 @@ async def test_rate_limit_retry_after_larger_than_client_timeout_does_not_sleep(
         patch("asyncio.sleep", side_effect=_record_sleep),
         pytest.raises(RateLimitError),
     ):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
 
     # The controlled clock exhausted the budget before any retry sleep fired.
     assert mock_client.post.call_count == 1
@@ -143,11 +163,12 @@ async def test_rate_limit_retry_exhausted_with_budget(auth_tokens):
     mock_client.post.return_value = _build_429("1")
 
     core = build_client_shell_for_tests(auth_tokens, rate_limit_max_retries=2)
-    install_http_client_for_test(core._collaborators.kernel, mock_client)
+    install_http_client_for_test(core._web_runtime.kernel, mock_client)
+    _activate_call_supervisor(core)
     install_post_as_stream(None, mock_client, mock_client.post)
 
     with patch("asyncio.sleep", AsyncMock()) as mock_sleep, pytest.raises(RateLimitError):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
 
     assert mock_client.post.call_count == 3
     assert mock_sleep.call_count == 2
@@ -170,11 +191,12 @@ async def test_rate_limit_no_retry_if_disabled(auth_tokens):
 
     # Explicitly disable retries
     core = build_client_shell_for_tests(auth_tokens, rate_limit_max_retries=0)
-    install_http_client_for_test(core._collaborators.kernel, mock_client)
+    install_http_client_for_test(core._web_runtime.kernel, mock_client)
+    _activate_call_supervisor(core)
     install_post_as_stream(None, mock_client, mock_client.post)
 
     with pytest.raises(RateLimitError):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
 
     assert mock_client.post.call_count == 1
 
@@ -193,7 +215,8 @@ async def test_rate_limit_exp_backoff_fallback_without_header(auth_tokens):
     mock_client.post.return_value = _build_429(retry_after=None)
 
     core = build_client_shell_for_tests(auth_tokens, rate_limit_max_retries=2)
-    install_http_client_for_test(core._collaborators.kernel, mock_client)
+    install_http_client_for_test(core._web_runtime.kernel, mock_client)
+    _activate_call_supervisor(core)
     install_post_as_stream(None, mock_client, mock_client.post)
 
     sleeps: list[float] = []
@@ -202,7 +225,7 @@ async def test_rate_limit_exp_backoff_fallback_without_header(auth_tokens):
         sleeps.append(seconds)
 
     with patch("asyncio.sleep", side_effect=_record_sleep), pytest.raises(RateLimitError):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
 
     # Initial + 2 retries = 3 POSTs before RateLimitError raises.
     assert mock_client.post.call_count == 3
@@ -219,11 +242,12 @@ async def test_rate_limit_no_retry_without_header_when_disabled(auth_tokens):
     mock_client.post.return_value = _build_429(retry_after=None)
 
     core = build_client_shell_for_tests(auth_tokens, rate_limit_max_retries=0)
-    install_http_client_for_test(core._collaborators.kernel, mock_client)
+    install_http_client_for_test(core._web_runtime.kernel, mock_client)
+    _activate_call_supervisor(core)
     install_post_as_stream(None, mock_client, mock_client.post)
 
     with pytest.raises(RateLimitError):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb1"])
 
     assert mock_client.post.call_count == 1
 

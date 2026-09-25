@@ -1,21 +1,18 @@
-"""Tests for auth account profile + multi-account switching (split from tests/unit/test_auth.py for D1 PR-2).
+"""Tests for auth account profile + multi-account switching (split in D1 PR-2).
 
 This file owns one concern from the auth subpackage. The original
-``tests/unit/test_auth.py`` (4090 LOC) was split into six concern-aligned
-files alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
+monolithic auth test module was split into six concern-aligned files
+alongside the deletion of ``_AuthFacadeModule``; see ADR-0003
 (superseded) and ADR-0007 (test-monkeypatch policy) for the rationale.
 """
 
 import json
-from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
 from notebooklm import auth as auth_module
-from notebooklm._auth import account as _auth_account
 from notebooklm.auth import (
     Account,
     enumerate_accounts,
@@ -65,11 +62,11 @@ class TestEnumerateAccounts:
         """One signed-in account: authuser=0 returns it, authuser=1 falls back to it."""
         default_html = _wiz_html_with_email("alice@example.com")
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=0", content=default_html.encode()
+            url="https://notebook.google.com/?authuser=0", content=default_html.encode()
         )
         # Silent fallback: authuser=1 returns the same email; loop must stop.
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=1", content=default_html.encode()
+            url="https://notebook.google.com/?authuser=1", content=default_html.encode()
         )
 
         jar = httpx.Cookies()
@@ -82,20 +79,20 @@ class TestEnumerateAccounts:
     async def test_multiple_accounts_stops_on_silent_fallback(self, httpx_mock: HTTPXMock):
         """Three real accounts; authuser=3 silently returns account 0's email."""
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=0",
+            url="https://notebook.google.com/?authuser=0",
             content=_wiz_html_with_email("alice@example.com").encode(),
         )
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=1",
+            url="https://notebook.google.com/?authuser=1",
             content=_wiz_html_with_email("bob@gmail.com").encode(),
         )
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=2",
+            url="https://notebook.google.com/?authuser=2",
             content=_wiz_html_with_email("carol@workspace.com").encode(),
         )
         # Silent fallback at index 3: matches default email → enumeration stops.
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=3",
+            url="https://notebook.google.com/?authuser=3",
             content=_wiz_html_with_email("alice@example.com").encode(),
         )
 
@@ -113,7 +110,7 @@ class TestEnumerateAccounts:
     async def test_raises_when_authuser_zero_unauthenticated(self, httpx_mock: HTTPXMock):
         """Bare cookies → authuser=0 redirects to login → ValueError."""
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=0",
+            url="https://notebook.google.com/?authuser=0",
             status_code=302,
             headers={"Location": "https://accounts.google.com/signin"},
         )
@@ -129,11 +126,11 @@ class TestEnumerateAccounts:
     async def test_stops_when_subsequent_index_unparseable(self, httpx_mock: HTTPXMock):
         """authuser=N>0 with no parseable email → end-of-list, not error."""
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=0",
+            url="https://notebook.google.com/?authuser=0",
             content=_wiz_html_with_email("alice@example.com").encode(),
         )
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=1", content=b"<html>nothing</html>"
+            url="https://notebook.google.com/?authuser=1", content=b"<html>nothing</html>"
         )
 
         jar = httpx.Cookies()
@@ -149,7 +146,7 @@ class TestEnumerateAccounts:
         # Each index has a unique email so the silent-fallback check never trips.
         for n in range(0, 3):
             httpx_mock.add_response(
-                url=f"https://notebooklm.google.com/?authuser={n}",
+                url=f"https://notebook.google.com/?authuser={n}",
                 content=_wiz_html_with_email(f"user{n}@example.com").encode(),
             )
 
@@ -180,17 +177,10 @@ class TestAccountMetadata:
         storage = tmp_path / "storage_state.json"
         assert get_authuser_for_storage(storage) == 0
 
-    def test_seam_aliased_patch_to_account_helpers(self, monkeypatch, tmp_path):
-        """``get_authuser_for_storage`` resolves ``read_account_metadata`` via bare-name lookup."""
+    def test_seam_aliased_patch_to_account_helpers(self, tmp_path):
+        """The account helpers project the same persisted record."""
         storage = tmp_path / "storage_state.json"
-
-        def fake_read_account_metadata(storage_path: Path | None) -> dict[str, Any]:
-            assert storage_path == storage
-            return {"authuser": 3, "email": "carol@example.com"}
-
-        # Seam-aliased object-attribute patch (ADR-0007): patches the owning
-        # module so bare-name lookups inside ``_auth.account`` observe the fake.
-        monkeypatch.setattr(_auth_account, "read_account_metadata", fake_read_account_metadata)
+        auth_module.write_account_metadata(storage, authuser=3, email="carol@example.com")
 
         assert auth_module.get_authuser_for_storage(storage) == 3
         assert auth_module.get_account_email_for_storage(storage) == "carol@example.com"
@@ -302,11 +292,12 @@ class TestAuthuserPlumbing:
         )
 
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=bob%40example.com",
+            url="https://notebook.google.com/?authuser=bob%40example.com",
             content=b'"SNlM0e":"csrf_env" "FdrFJe":"sess_env"',
         )
 
-        auth = await AuthTokens.from_storage()
+        with pytest.warns(DeprecationWarning, match="AuthTokens.from_storage"):
+            auth = await AuthTokens.from_storage()
 
         assert auth.storage_path is None
         assert auth.authuser == 2
@@ -340,7 +331,7 @@ class TestAuthuserPlumbing:
         # Token fetch must use the stable email route, not the reorder-prone
         # integer index.
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=bob%40example.com",
+            url="https://notebook.google.com/?authuser=bob%40example.com",
             content=b'"SNlM0e":"csrf_v2" "FdrFJe":"sess_v2"',
         )
 
@@ -371,7 +362,7 @@ class TestAuthuserPlumbing:
             )
         )
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=2",
+            url="https://notebook.google.com/?authuser=2",
             content=b'"SNlM0e":"csrf_v2" "FdrFJe":"sess_v2"',
         )
 
@@ -402,7 +393,7 @@ class TestAuthuserPlumbing:
         )
         write_account_metadata(storage, authuser=2, email="bob@example.com")
         httpx_mock.add_response(
-            url="https://notebooklm.google.com/?authuser=0",
+            url="https://notebook.google.com/?authuser=0",
             content=b'"SNlM0e":"csrf_v2" "FdrFJe":"sess_v2"',
         )
 

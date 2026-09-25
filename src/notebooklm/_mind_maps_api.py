@@ -1,161 +1,57 @@
-"""Unified mind-map API (``client.mind_maps``).
-
-Hides the two backends (note-backed JSON vs interactive studio-artifact) behind a
-single surface that dispatches each operation to the correct RPC family
-(issue #1256). Note-backed maps use the note RPCs (``GENERATE_MIND_MAP`` /
-``UPDATE_NOTE`` / ``DELETE_NOTE``); interactive maps use the studio-artifact RPCs
-(``CREATE_ARTIFACT`` type-4/variant-4 / ``RENAME_ARTIFACT`` / ``DELETE_ARTIFACT`` /
-``GET_INTERACTIVE_HTML``).
-"""
+"""Backend-neutral unified mind-map namespace contract."""
 
 from __future__ import annotations
 
 import builtins
-import json
+import contextlib
 import logging
-import reprlib
-from typing import TYPE_CHECKING, Any
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Literal
 
-from ._artifact.payloads import build_interactive_mind_map_artifact_params
+from ._deprecation import warn_registered_deprecation
 from ._lookup import unwrap_or_raise
-from ._row_adapters.notes import NoteRow
+from ._runtime.call_supervisor import OperationLease
 from ._types.mind_maps import MindMap, MindMapKind
-from .exceptions import (
-    ArtifactFeatureUnavailableError,
-    MindMapNotFoundError,
-    UnknownRPCMethodError,
-)
-from .rpc import RPCMethod, safe_index
-from .types import ArtifactType
-
-if TYPE_CHECKING:
-    from ._artifacts import ArtifactsAPI
-    from ._mind_map import NoteBackedMindMapService
-    from ._notebooks import NotebooksAPI
-    from ._runtime.contracts import RpcCaller
+from .exceptions import ArtifactNotReadyError, MindMapNotFoundError
+from .types import Artifact
 
 logger = logging.getLogger(__name__)
 
-# The interactive (studio-artifact) mind map exposes its ``{"name", "children"}``
-# node tree at ``[0][9][3]`` of the ``GET_INTERACTIVE_HTML`` response (vs the HTML
-# body at ``[0][9][0]``). The leaf at ``[3]`` is the only position that may be
-# legitimately absent during the brief window after completion before the
-# options block is fully populated.
-_INTERACTIVE_TREE_LEAF_POS = 3
+if TYPE_CHECKING:
+    from ._artifacts import ArtifactsAPI
+    from ._notes import NotesAPI
 
 
-def extract_interactive_tree_leaf(result: Any, *, source: str) -> Any | None:
-    """Return the raw ``[0][9][3]`` interactive mind-map tree leaf, or ``None``.
-
-    Distinguishes a *genuinely absent leaf* (the options block is a list but
-    its ``[3]`` tree slot is not populated yet — the legitimate "not ready"
-    window) from *real shape drift* (``[0]`` or ``[0][9]`` moved out from under
-    us, or ``[0][9]`` is no longer a list). Drift re-raises
-    ``UnknownRPCMethodError`` so the library fails loud like the sibling HTML
-    accessor ``_get_artifact_content`` (issue #1270); only the missing ``[3]``
-    leaf within a present *list* options block is tolerated. A tolerated-but-
-    absent leaf emits a WARNING with the rpcid/source so a reshape that drops
-    just the leaf position still leaves a drift signal in the logs.
-    """
-    if result is None:
-        return None
-    # Descend to the options block (``[0][9]``) strictly: if Google moves the
-    # interactive payload off ``[0][9]`` entirely, this raises and surfaces the
-    # drift instead of masquerading as "not ready".
-    options_block = safe_index(
-        result,
-        0,
-        9,
-        method_id=RPCMethod.GET_INTERACTIVE_HTML.value,
-        source=source,
-    )
-    # Only a *list* options block too short for index 3 is the legitimate
-    # "tree not populated yet" window — a non-list ``[0][9]`` is genuine drift,
-    # so fail loud rather than masking it as not-ready. (We raise explicitly
-    # rather than via ``safe_index`` because some non-list types — e.g. ``str``
-    # — are subscriptable and would not trip ``safe_index``'s descent guard.)
-    if not isinstance(options_block, list):
-        raise UnknownRPCMethodError(
-            f"safe_index drift at path (0, 9): options block is "
-            f"{type(options_block).__name__}, not a list",
-            method_id=RPCMethod.GET_INTERACTIVE_HTML.value,
-            path=(0, 9),
-            source=source,
-            # ``reprlib.repr`` bounds the diagnostic preview without first
-            # materialising the full repr of a pathologically large/deep
-            # ``options_block`` (mirrors ``safe_index``'s own ``_truncate``).
-            data_at_failure=reprlib.repr(options_block),
-        )
-    if len(options_block) <= _INTERACTIVE_TREE_LEAF_POS:
-        logger.warning(
-            "Interactive mind-map tree leaf absent at [0][9][%d] (rpcid=%s, source=%s); "
-            "treating as not-yet-populated. If this persists, Google may have reshaped "
-            "the %s response.",
-            _INTERACTIVE_TREE_LEAF_POS,
-            RPCMethod.GET_INTERACTIVE_HTML.value,
-            source,
-            RPCMethod.GET_INTERACTIVE_HTML.name,
-        )
-        return None
-    return options_block[_INTERACTIVE_TREE_LEAF_POS]
-
-
-def _tree_title(tree: dict[str, Any] | None, default: str = "Mind Map") -> str:
-    """Return a mind-map title from ``tree["name"]`` only when it is a non-empty ``str``.
-
-    The frozen :class:`MindMap.title` is typed ``str``; a malformed tree with a
-    ``null``/numeric ``name`` would otherwise smuggle a non-``str`` into it
-    (issue #1270). Falls back to ``default`` for any non-string / empty name.
-    """
-    if tree is not None:
-        name = tree.get("name")
-        if isinstance(name, str) and name:
-            return name
-    return default
-
-
-def _parse_tree(content: Any) -> dict[str, Any] | None:
-    """Parse a mind-map JSON node tree, or ``None`` when not a JSON object."""
-    if not isinstance(content, str) or not content:
-        return None
-    try:
-        data = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _new_artifact_id(create_response: Any) -> str | None:
-    """Pull the new artifact id out of a ``CREATE_ARTIFACT`` response (``[[id, …]]``).
-
-    Returns ``None`` for a null/degenerate response (no generation task created);
-    the caller turns that into ``ArtifactFeatureUnavailableError``. Bind the inner
-    row to a local so the id read is a single-level ``inner[0]`` index rather than
-    a chained ``create_response[0][0]`` descent.
-    """
-    if not isinstance(create_response, list) or not create_response:
-        return None
-    inner = create_response[0]
-    if isinstance(inner, list) and inner and isinstance(inner[0], str):
-        return inner[0]
-    return None
-
-
-class MindMapsAPI:
+class MindMapsAPI(ABC):
     """``client.mind_maps`` — one surface over both mind-map backends."""
 
-    def __init__(
-        self,
-        *,
-        rpc: RpcCaller,
-        mind_maps: NoteBackedMindMapService,
-        artifacts: ArtifactsAPI,
-        notebooks: NotebooksAPI,
-    ) -> None:
-        self._rpc = rpc
-        self._mind_maps = mind_maps
+    _reject_unsuccessful_interactive_wait = False
+
+    @abstractmethod
+    def _operation_scope(
+        self, label: str
+    ) -> contextlib.AbstractAsyncContextManager[OperationLease | None]:
+        """Return the backend's scope for one multi-call workflow."""
+        raise NotImplementedError
+
+    def __init__(self, *, artifacts: ArtifactsAPI, notes: NotesAPI) -> None:
         self._artifacts = artifacts
-        self._notebooks = notebooks
+        self._notes = notes
+
+    @abstractmethod
+    async def list_note_backed(self, notebook_id: str) -> builtins.list[MindMap]:
+        """List only the **note-backed** mind maps in a notebook.
+
+        A single ``GET_NOTES_AND_MIND_MAPS`` RPC — no ``LIST_ARTIFACTS`` — so
+        callers that only need the note-backed membership (e.g. the artifact
+        ``delete`` carve-out probe) pay exactly one round-trip. Returns
+        note-backed entries only (every ``kind`` is
+        :attr:`MindMapKind.NOTE_BACKED`); interactive (studio-artifact) maps
+        never appear here — use :meth:`list` for the union. Deleted rows
+        (status ``2``) are already excluded by the underlying
+        ``list_mind_maps`` classification, and ``MindMap.tree`` is populated
+        for free from the already-listed note content.
+        """
 
     async def list(self, notebook_id: str) -> builtins.list[MindMap]:
         """List all mind maps in a notebook — both backings, as distinct entries.
@@ -168,30 +64,22 @@ class MindMapsAPI:
         not "empty" — call :meth:`get_tree` with ``kind=INTERACTIVE`` to fetch
         an individual interactive tree.
         """
-        result: builtins.list[MindMap] = []
-        for row in await self._mind_maps.list_mind_maps(notebook_id):
-            note_row = NoteRow(row)
-            result.append(
-                MindMap(
-                    id=note_row.id,
-                    notebook_id=notebook_id,
-                    title=note_row.title,
-                    kind=MindMapKind.NOTE_BACKED,
-                    tree=_parse_tree(self._mind_maps.extract_content(row)),
-                )
-            )
-        for art in await self._artifacts.list(notebook_id, ArtifactType.MIND_MAP):
-            if art.is_interactive_mind_map:
-                result.append(
-                    MindMap(
-                        id=art.id,
-                        notebook_id=notebook_id,
-                        title=art.title,
-                        kind=MindMapKind.INTERACTIVE,
-                        created_at=art.created_at,
+        async with self._operation_scope("mind_maps.list"):
+            # Shallow-copy so appending interactive entries can never mutate a list
+            # a (future) caching/overriding list_note_backed might share.
+            result: builtins.list[MindMap] = list(await self.list_note_backed(notebook_id))
+            for art in await self._list_studio_mind_map_rows(notebook_id):
+                if art.is_interactive_mind_map:
+                    result.append(
+                        MindMap(
+                            id=art.id,
+                            notebook_id=notebook_id,
+                            title=art.title,
+                            kind=MindMapKind.INTERACTIVE,
+                            created_at=art.created_at,
+                        )
                     )
-                )
-        return result
+            return result
 
     async def get(self, notebook_id: str, mind_map_id: str) -> MindMap:
         """Return the mind map with ``mind_map_id``.
@@ -253,6 +141,7 @@ class MindMapsAPI:
         language: str | None = "en",
         instructions: str | None = None,
         wait: bool = True,
+        failure_policy: Literal["legacy", "raise"] = "legacy",
     ) -> MindMap:
         """Generate a mind map of the requested ``kind``.
 
@@ -263,9 +152,20 @@ class MindMapsAPI:
         a uniform surface). With ``wait=False`` it returns a pending
         :class:`MindMap` whose ``tree`` is ``None`` until completed.
 
-        ``language`` and ``instructions`` only apply to ``NOTE_BACKED`` maps; the
-        interactive ``CREATE_ARTIFACT`` payload does not accept them, so they are
-        ignored when ``kind=INTERACTIVE``.
+        ``failure_policy="raise"`` makes a waited interactive terminal failure
+        raise :class:`ArtifactNotReadyError` before hydration. The default keeps
+        the established backend-specific behavior:
+        Android raises :class:`ArtifactNotReadyError` when a waited interactive
+        task finishes failed or removed, while web continues hydration after
+        its completion wait without adding that extra rejection.
+
+        ``instructions`` is a free-text prompt that steers generation; it is sent
+        for both kinds — note-backed via ``GENERATE_MIND_MAP`` and interactive at
+        the ``[9][1][2]`` prompt slot of ``CREATE_ARTIFACT`` (the same slot
+        quiz/flashcards use; the server honours it for variant 4, verified live).
+        ``language`` applies to note-backed payloads on both backends and to
+        Android interactive generation; the web interactive payload has no
+        language slot and ignores it.
 
         Raises:
             ArtifactFeatureUnavailableError: if the interactive
@@ -276,77 +176,60 @@ class MindMapsAPI:
                 async kickoff with the sibling ``generate_*`` / ``retry_failed``
                 null-create contract (ADR-0019; issue #1359).
         """
-        if kind == MindMapKind.NOTE_BACKED:
-            res = await self._artifacts.generate_mind_map(
-                notebook_id, source_ids, language, instructions
-            )
-            tree = res.mind_map if isinstance(res.mind_map, dict) else None
-            title = _tree_title(tree)
-            return MindMap(
-                id=res.note_id or "",
-                notebook_id=notebook_id,
-                title=title,
-                kind=MindMapKind.NOTE_BACKED,
-                tree=tree,
-            )
+        async with self._operation_scope("mind_maps.generate"):
+            if kind == MindMapKind.NOTE_BACKED:
+                result = await self._artifacts.generate_mind_map(
+                    notebook_id,
+                    source_ids,
+                    language,
+                    instructions,
+                )
+                tree = result.mind_map if isinstance(result.mind_map, dict) else None
+                return MindMap(
+                    id=result.note_id or "",
+                    notebook_id=notebook_id,
+                    title=_tree_title(tree),
+                    kind=MindMapKind.NOTE_BACKED,
+                    created_at=result.created_at,
+                    tree=tree,
+                )
 
-        if source_ids is None:
-            source_ids = await self._notebooks.get_source_ids(notebook_id)
-        # CREATE_ARTIFACT is classified in ``_idempotency.py``. ``operation_variant=None``
-        # is passed explicitly to match the other CREATE_ARTIFACT / GENERATE_MIND_MAP
-        # call sites (the registry resolves the same entry either way; the explicit
-        # kwarg documents the no-variant default).
-        create_response = await self._rpc.rpc_call(
-            RPCMethod.CREATE_ARTIFACT,
-            build_interactive_mind_map_artifact_params(notebook_id, source_ids),
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-            operation_variant=None,
-        )
-        new_id = _new_artifact_id(create_response)
-        if new_id is None:
-            # ADR-0019 async-kickoff null contract: a null/degenerate
-            # CREATE_ARTIFACT means no generation task was created, so raise
-            # ArtifactFeatureUnavailableError (a subclass of ArtifactError, so
-            # ``except ArtifactError`` still catches it) rather than the bare
-            # ArtifactError, matching the sibling generate_* / retry_failed
-            # null-create paths (issue #1359).
-            raise ArtifactFeatureUnavailableError(
-                ArtifactType.MIND_MAP.value,
-                method_id=RPCMethod.CREATE_ARTIFACT.value,
+            new_id = await self._start_interactive_mind_map(
+                notebook_id,
+                source_ids,
+                language=language,
+                instructions=instructions,
             )
-        if wait:
-            await self._artifacts.wait_for_completion(notebook_id, new_id)
-        # ``allow_unclassified=True``: we hold the concrete id from
-        # CREATE_ARTIFACT, so id-match a settling type-4 row whose variant slot
-        # has not yet filled rather than degrading to the placeholder MindMap.
-        art = await self._find_interactive(notebook_id, new_id, allow_unclassified=True)
-        # After completion, fetch the tree so interactive maps return the same
-        # populated ``MindMap.tree`` as note-backed ones. Skip when not waiting
-        # (still pending) — ``get_tree`` would have nothing to read yet.
-        tree = (
-            await self.get_tree(
-                notebook_id, art.id if art is not None else new_id, kind=MindMapKind.INTERACTIVE
+            if wait:
+                terminal = await self._artifacts.wait_for_completion(notebook_id, new_id)
+                if terminal.is_failed or terminal.is_removed:
+                    if failure_policy == "raise" or self._reject_unsuccessful_interactive_wait:
+                        raise ArtifactNotReadyError(
+                            "mind_map", artifact_id=new_id, status=str(terminal.status)
+                        )
+                    warn_registered_deprecation("mind_map_legacy_terminal_hydration")
+            artifact = await self._find_interactive(
+                notebook_id,
+                new_id,
+                allow_unclassified=True,
             )
-            if wait
-            else None
-        )
-        if art is not None:
+            tree = (
+                await self.get_tree(
+                    notebook_id,
+                    new_id,
+                    kind=MindMapKind.INTERACTIVE,
+                )
+                if wait
+                else None
+            )
             return MindMap(
-                id=art.id,
+                id=new_id,
                 notebook_id=notebook_id,
-                title=art.title,
+                title=artifact.title if artifact is not None else "Mind Map",
                 kind=MindMapKind.INTERACTIVE,
-                created_at=art.created_at,
+                created_at=artifact.created_at if artifact is not None else None,
                 tree=tree,
             )
-        return MindMap(
-            id=new_id,
-            notebook_id=notebook_id,
-            title="Mind Map",
-            kind=MindMapKind.INTERACTIVE,
-            tree=tree,
-        )
 
     async def rename(
         self,
@@ -379,26 +262,41 @@ class MindMapsAPI:
                 across namespaces (ADR-0019; issues #1255, #1291).
 
         .. note::
-            Unlike ``notebooks``/``sources``/``artifacts`` rename — whose
-            absence detection rides on the hydrate re-fetch and is therefore
-            skipped under ``return_object=False`` — mind maps detect absence via
-            a content/list lookup *before* dispatching the rename RPC, so this
-            raises ``MindMapNotFoundError`` on a missing target **even with**
-            ``return_object=False``.
+            Mind maps detect absence via a content/list lookup before
+            dispatching the rename RPC, matching the v0.8.0 existence-preflight
+            contract for sources/artifacts rename.
 
         .. versionchanged:: 0.7.0
             **Breaking change:** previously returned ``None`` even on success.
             Now re-fetches and returns the renamed ``MindMap`` (issue #1255).
             Added the ``return_object`` opt-out.
         """
+        async with self._operation_scope("mind_maps.rename"):
+            return await self._rename_in_scope(
+                notebook_id,
+                mind_map_id,
+                new_title,
+                kind=kind,
+                return_object=return_object,
+            )
+
+    async def _rename_in_scope(
+        self,
+        notebook_id: str,
+        mind_map_id: str,
+        new_title: str,
+        *,
+        kind: MindMapKind | None = None,
+        return_object: bool = True,
+    ) -> MindMap | None:
         if kind is None:
             # Auto-detect inline so the note-backed list is fetched once rather
             # than twice (a separate ``_detect_kind`` call would re-issue
             # ``list_mind_maps``). Error precedence matches ``_detect_kind``:
             # note-backed first, then interactive, then ``MindMapNotFoundError``.
-            for row in await self._mind_maps.list_mind_maps(notebook_id):
-                if NoteRow(row).id == mind_map_id:
-                    await self._mind_maps.rename_mind_map(notebook_id, mind_map_id, new_title)
+            for mind_map in await self.list_note_backed(notebook_id):
+                if mind_map.id == mind_map_id:
+                    await self._send_rename_note_backed(notebook_id, mind_map_id, new_title)
                     return await self._hydrate_renamed(notebook_id, mind_map_id, return_object)
             if await self._find_interactive(notebook_id, mind_map_id) is not None:
                 # ``return_object=False`` on the artifact rename: hydration (if
@@ -410,7 +308,7 @@ class MindMapsAPI:
                 return await self._hydrate_renamed(notebook_id, mind_map_id, return_object)
             raise MindMapNotFoundError(mind_map_id)
         if kind == MindMapKind.NOTE_BACKED:
-            await self._mind_maps.rename_mind_map(notebook_id, mind_map_id, new_title)
+            await self._send_rename_note_backed(notebook_id, mind_map_id, new_title)
         else:
             # Pre-validate the id on the explicit-interactive path. Without this,
             # ``RENAME_ARTIFACT`` silently no-ops on a wrong id (the RPC returns
@@ -428,7 +326,7 @@ class MindMapsAPI:
     ) -> MindMap | None:
         """Re-fetch the renamed map (or skip when ``return_object=False``).
 
-        A ``None`` from ``get`` here means the map is absent — surface it as
+        A ``None`` from ``_get_or_none`` here means the map is absent — surface it as
         the same ``MindMapNotFoundError`` the missing-target dispatch paths
         raise rather than returning a stale/absent object. For paths that
         pre-validate the id (auto-detect and explicit-interactive) this is a
@@ -438,9 +336,8 @@ class MindMapsAPI:
         """
         if not return_object:
             return None
-        # ``_get_or_none`` (not the public ``get``) so the internal re-fetch
-        # never trips ``get()``'s own None-on-miss deprecation warning when the
-        # map vanished between rename and re-fetch (issue #1358).
+        # ``_get_or_none`` is used so the internal re-fetch can convert a
+        # vanished map into ``MindMapNotFoundError`` itself.
         mind_map = await self._get_or_none(notebook_id, mind_map_id)
         if mind_map is None:
             raise MindMapNotFoundError(mind_map_id)
@@ -469,6 +366,16 @@ class MindMapsAPI:
             now returns ``None`` (issue #1211). Auto-detect (``kind=None``) is
             now idempotent on a missing target rather than raising (issue #1291).
         """
+        async with self._operation_scope("mind_maps.delete"):
+            await self._delete_in_scope(notebook_id, mind_map_id, kind=kind)
+
+    async def _delete_in_scope(
+        self,
+        notebook_id: str,
+        mind_map_id: str,
+        *,
+        kind: MindMapKind | None = None,
+    ) -> None:
         if kind is None:
             try:
                 kind = await self._detect_kind(notebook_id, mind_map_id)
@@ -478,7 +385,7 @@ class MindMapsAPI:
                 # missing id) and the sibling sources/artifacts/notes deletes.
                 return None
         if kind == MindMapKind.NOTE_BACKED:
-            await self._mind_maps.delete_mind_map(notebook_id, mind_map_id)
+            await self._notes.delete_mind_map(notebook_id, mind_map_id)
         else:
             await self._artifacts.delete(notebook_id, mind_map_id)
 
@@ -516,35 +423,19 @@ class MindMapsAPI:
             ``LIST_ARTIFACTS`` round-trip on the explicit-kind fast path (issue
             #1355).
         """
-        if kind is None:
-            # Auto-detect inline so the note-backed list is fetched once rather
-            # than twice (a separate ``_detect_kind`` call would re-issue
-            # ``list_mind_maps``). Precedence matches ``_detect_kind``: note-backed
-            # first (return its parsed tree), then interactive (fall through to the
-            # RPC). A miss in both backings returns ``None`` rather than raising —
-            # derived reads return the uniform-empty value on a missing parent.
-            for row in await self._mind_maps.list_mind_maps(notebook_id):
-                if NoteRow(row).id == mind_map_id:
-                    return _parse_tree(self._mind_maps.extract_content(row))
-            if await self._find_interactive(notebook_id, mind_map_id) is None:
+        async with self._operation_scope("mind_maps.get_tree"):
+            if kind is MindMapKind.INTERACTIVE:
+                return await self._read_interactive_tree(notebook_id, mind_map_id)
+
+            for mind_map in await self.list_note_backed(notebook_id):
+                if mind_map.id == mind_map_id:
+                    return mind_map.tree
+            if kind is MindMapKind.NOTE_BACKED:
                 return None
-        elif kind == MindMapKind.NOTE_BACKED:
-            for row in await self._mind_maps.list_mind_maps(notebook_id):
-                if NoteRow(row).id == mind_map_id:
-                    return _parse_tree(self._mind_maps.extract_content(row))
+
+            if await self._find_interactive(notebook_id, mind_map_id) is not None:
+                return await self._read_interactive_tree(notebook_id, mind_map_id)
             return None
-        result = await self._rpc.rpc_call(
-            RPCMethod.GET_INTERACTIVE_HTML,
-            [mind_map_id],
-            source_path=f"/notebook/{notebook_id}",
-            allow_null=True,
-        )
-        # ``extract_interactive_tree_leaf`` re-raises ``UnknownRPCMethodError``
-        # on genuine ``[0][9]`` shape drift (failing loud like the sibling HTML
-        # accessor) while tolerating an absent ``[3]`` leaf as the legitimate
-        # "tree not populated yet" window (issue #1270).
-        tree_json = extract_interactive_tree_leaf(result, source="_mind_maps_api.get_tree")
-        return _parse_tree(tree_json)
 
     async def _detect_kind(self, notebook_id: str, mind_map_id: str) -> MindMapKind:
         """Resolve a bare id to its backing (note collection first, then studio).
@@ -558,12 +449,13 @@ class MindMapsAPI:
         mutate-existing re-raises, derived reads return the uniform-empty
         value, idempotent delete swallows it).
         """
-        for row in await self._mind_maps.list_mind_maps(notebook_id):
-            if NoteRow(row).id == mind_map_id:
-                return MindMapKind.NOTE_BACKED
-        if await self._find_interactive(notebook_id, mind_map_id) is not None:
-            return MindMapKind.INTERACTIVE
-        raise MindMapNotFoundError(mind_map_id)
+        async with self._operation_scope("mind_maps._detect_kind"):
+            for mind_map in await self.list_note_backed(notebook_id):
+                if mind_map.id == mind_map_id:
+                    return MindMapKind.NOTE_BACKED
+            if await self._find_interactive(notebook_id, mind_map_id) is not None:
+                return MindMapKind.INTERACTIVE
+            raise MindMapNotFoundError(mind_map_id)
 
     async def _find_interactive(
         self,
@@ -593,9 +485,50 @@ class MindMapsAPI:
         ``variant=None`` type-4 row is *excluded* from the ``MIND_MAP`` filter
         and would otherwise be invisible during the settling window.
         """
-        for art in await self._artifacts.list(notebook_id):
+        for art in await self._list_studio_mind_map_rows(notebook_id):
             if art.id != artifact_id:
                 continue
             if art.is_interactive_mind_map or (allow_unclassified and art.is_unclassified_type4):
                 return art
         return None
+
+    @abstractmethod
+    async def _list_studio_mind_map_rows(self, notebook_id: str) -> builtins.list[Artifact]:
+        """Return unfiltered Studio rows used to classify interactive maps."""
+
+    @abstractmethod
+    async def _start_interactive_mind_map(
+        self,
+        notebook_id: str,
+        source_ids: builtins.list[str] | None,
+        *,
+        language: str | None,
+        instructions: str | None,
+    ) -> str:
+        """Start an interactive mind map and return its artifact id."""
+
+    @abstractmethod
+    async def _read_interactive_tree(
+        self,
+        notebook_id: str,
+        mind_map_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one interactive mind map's tree."""
+
+    @abstractmethod
+    async def _send_rename_note_backed(
+        self,
+        notebook_id: str,
+        mind_map_id: str,
+        new_title: str,
+    ) -> None:
+        """Rename a note-backed mind map through the active backend."""
+
+
+def _tree_title(tree: dict[str, Any] | None, default: str = "Mind Map") -> str:
+    """Return the non-empty string title from a decoded tree."""
+    if tree is not None:
+        name = tree.get("name")
+        if isinstance(name, str) and name:
+            return name
+    return default

@@ -4,25 +4,65 @@ These tests require valid NotebookLM authentication.
 Run with: pytest tests/e2e/test_chat.py -m e2e
 """
 
+from copy import deepcopy
+
 import pytest
 
 from notebooklm import AskResult, ChatReference
 
-from .conftest import requires_auth
+from .conftest import (
+    requires_auth,
+    reset_current_chat_conversation,
+    skip_or_fail_missing_reference,
+)
+
+
+@pytest.fixture(scope="module")
+def _cited_chat_samples():
+    # Store response values only, never an async client tied to another test's loop.
+    return {}
+
+
+@pytest.fixture
+async def cited_chat_sample(client, multi_source_notebook_id, _cited_chat_samples, request):
+    """One real cited answer for independent response-shape assertions.
+
+    These consumers inspect the returned value, not current conversation state.
+    Mutation/follow-up tests keep their own fresh conversations and live calls.
+    A rerun gets a fresh sample, as does a different notebook or backend.
+    """
+    key = (
+        client.backends["chat"],
+        multi_source_notebook_id,
+        getattr(request.node, "execution_count", 1),
+    )
+    if key not in _cited_chat_samples:
+        await reset_current_chat_conversation(client, multi_source_notebook_id)
+        sources = await client.sources.list(multi_source_notebook_id)
+        result = await client.chat.ask(
+            multi_source_notebook_id,
+            "Summarize the main concepts with specific citations and quote a passage from the sources.",
+        )
+        _cited_chat_samples[key] = (result, {source.id for source in sources})
+    return deepcopy(_cited_chat_samples[key])
 
 
 @pytest.mark.e2e
+@pytest.mark.live_chat_ask
+@pytest.mark.timeout(300)
 @requires_auth
 class TestChatE2E:
     """E2E tests for chat API."""
 
+    @pytest.fixture(autouse=True)
+    async def _start_with_fresh_conversation(self, client, multi_source_notebook_id, request):
+        if "cited_chat_sample" not in request.fixturenames:
+            await reset_current_chat_conversation(client, multi_source_notebook_id)
+
     @pytest.mark.asyncio
-    async def test_ask_question_returns_answer(self, client, multi_source_notebook_id):
+    async def test_ask_question_returns_answer(self, cited_chat_sample):
         """Test asking a question returns a valid answer."""
-        result = await client.chat.ask(
-            multi_source_notebook_id,
-            "What is the main topic of these sources?",
-        )
+        result, _source_ids = cited_chat_sample
 
         assert isinstance(result, AskResult)
         assert result.answer
@@ -31,16 +71,13 @@ class TestChatE2E:
         assert result.turn_number >= 1
 
     @pytest.mark.asyncio
-    async def test_ask_returns_references_with_source_ids(self, client, multi_source_notebook_id):
+    async def test_ask_returns_references_with_source_ids(self, cited_chat_sample):
         """Test that ask returns references with valid source IDs."""
-        # Ask a question likely to generate citations
-        result = await client.chat.ask(
-            multi_source_notebook_id,
-            "Summarize the key points with specific citations.",
-        )
+        result, _source_ids = cited_chat_sample
 
         assert isinstance(result, AskResult)
         assert result.answer
+        assert result.references, "The shared cited answer must exercise citation decoding"
 
         # If the answer contains citations [1], [2], etc., there should be references
         if "[1]" in result.answer:
@@ -55,25 +92,23 @@ class TestChatE2E:
                 assert ref.source_id.count("-") == 4
 
     @pytest.mark.asyncio
-    async def test_ask_returns_references_with_cited_text(self, client, multi_source_notebook_id):
+    async def test_ask_returns_references_with_cited_text(self, cited_chat_sample):
         """Test that references include cited text when available."""
-        result = await client.chat.ask(
-            multi_source_notebook_id,
-            "Quote specific passages that explain the main concept.",
-        )
+        result, _source_ids = cited_chat_sample
 
         assert isinstance(result, AskResult)
 
         # Check if any references have cited_text
         refs_with_text = [ref for ref in result.references if ref.cited_text]
+        assert refs_with_text, "The shared quoted answer must exercise cited-text decoding"
 
-        # Note: Not all citations may have cited_text depending on the response
-        # So we just verify the structure is correct when present
+        # Individual structural citations may still omit their text.
         for ref in refs_with_text:
             assert isinstance(ref.cited_text, str)
             assert len(ref.cited_text) > 0
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(480)
     async def test_ask_follow_up_conversation(self, client, multi_source_notebook_id):
         """Test follow-up questions use the same conversation."""
         # First question
@@ -95,6 +130,7 @@ class TestChatE2E:
         assert result2.turn_number > result1.turn_number
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(480)
     async def test_delete_conversation_forces_fresh_next_ask(
         self, client, multi_source_notebook_id
     ):
@@ -157,12 +193,9 @@ class TestChatE2E:
         assert result.answer
 
     @pytest.mark.asyncio
-    async def test_references_have_citation_numbers(self, client, multi_source_notebook_id):
+    async def test_references_have_citation_numbers(self, cited_chat_sample):
         """Test that references have sequential citation numbers."""
-        result = await client.chat.ask(
-            multi_source_notebook_id,
-            "List the key points with citations.",
-        )
+        result, _source_ids = cited_chat_sample
 
         if result.references:
             # Citation numbers should be assigned sequentially
@@ -187,7 +220,9 @@ class TestChatHistoryE2E:
         """get_conversation_turns returns Q&A turns for an existing conversation."""
         conv_id = await client.chat.get_conversation_id(read_only_notebook_id)
         if not conv_id:
-            pytest.skip("No conversation history available in read-only notebook")
+            skip_or_fail_missing_reference(
+                "No conversation history available in read-only notebook"
+            )
 
         turns_data = await client.chat.get_conversation_turns(
             read_only_notebook_id,
@@ -196,16 +231,31 @@ class TestChatHistoryE2E:
         )
 
         assert turns_data is not None
-        if not turns_data:
-            pytest.skip(
+        if client.backends["chat"] == "android":
+            from notebooklm._android.proto.google.internal.labs.tailwind.orchestration.v1 import (
+                chat_pb2,
+            )
+
+            assert isinstance(turns_data, chat_pb2.ListChatTurnsResponse)
+            turns = list(turns_data.chat_turns)
+            turn_types = [turn.observed_event_type for turn in turns]
+        else:
+            if not turns_data:
+                skip_or_fail_missing_reference(
+                    "Read-only notebook has a conversation but no chat turns — "
+                    "cannot verify turn structure. Seed the notebook with chat messages to enable this test."
+                )
+            assert isinstance(turns_data[0], list)
+            turns = turns_data[0]
+            turn_types = [turn[2] for turn in turns if isinstance(turn, list) and len(turn) > 2]
+        if not turns and client.backends["chat"] == "android":
+            pytest.fail("Seeded conversation exists but Android ListChatTurns decoded no turns")
+        if not turns:
+            skip_or_fail_missing_reference(
                 "Read-only notebook has a conversation but no chat turns — "
                 "cannot verify turn structure. Seed the notebook with chat messages to enable this test."
             )
-        assert isinstance(turns_data[0], list)
-        turns = turns_data[0]
         assert len(turns) >= 1
-
-        turn_types = [turn[2] for turn in turns if isinstance(turn, list) and len(turn) > 2]
         assert any(t in (1, 2) for t in turn_types), "Expected question or answer turns"
 
     @pytest.mark.asyncio
@@ -214,7 +264,9 @@ class TestChatHistoryE2E:
         """get_conversation_turns includes question text in an existing conversation."""
         conv_id = await client.chat.get_conversation_id(read_only_notebook_id)
         if not conv_id:
-            pytest.skip("No conversation history available in read-only notebook")
+            skip_or_fail_missing_reference(
+                "No conversation history available in read-only notebook"
+            )
 
         turns_data = await client.chat.get_conversation_turns(
             read_only_notebook_id,
@@ -223,16 +275,36 @@ class TestChatHistoryE2E:
         )
 
         assert turns_data is not None
-        if not turns_data:
-            pytest.skip(
+        if client.backends["chat"] == "android":
+            from notebooklm._android.proto.google.internal.labs.tailwind.orchestration.v1 import (
+                chat_pb2,
+            )
+
+            assert isinstance(turns_data, chat_pb2.ListChatTurnsResponse)
+            turns = list(turns_data.chat_turns)
+            questions = [turn.user_query_text for turn in turns if turn.user_query_text]
+        else:
+            if not turns_data:
+                skip_or_fail_missing_reference(
+                    "Read-only notebook has a conversation but no chat turns — "
+                    "cannot verify question text. Seed the notebook with chat messages to enable this test."
+                )
+            turns = turns_data[0]
+            questions = [
+                turn[3]
+                for turn in turns
+                if isinstance(turn, list) and len(turn) > 3 and turn[2] == 1
+            ]
+        if not turns and client.backends["chat"] == "android":
+            pytest.fail("Seeded conversation exists but Android ListChatTurns decoded no turns")
+        if not turns:
+            skip_or_fail_missing_reference(
                 "Read-only notebook has a conversation but no chat turns — "
                 "cannot verify question text. Seed the notebook with chat messages to enable this test."
             )
-        turns = turns_data[0]
-        question_turns = [t for t in turns if isinstance(t, list) and len(t) > 3 and t[2] == 1]
-        assert question_turns, "No question turn found in response"
-        assert isinstance(question_turns[0][3], str)
-        assert len(question_turns[0][3]) > 0
+        assert questions, "No question turn found in response"
+        assert isinstance(questions[0], str)
+        assert len(questions[0]) > 0
 
     @pytest.mark.asyncio
     @pytest.mark.readonly
@@ -240,24 +312,58 @@ class TestChatHistoryE2E:
         """get_conversation_turns includes AI answer text in an existing conversation."""
         conv_id = await client.chat.get_conversation_id(read_only_notebook_id)
         if not conv_id:
-            pytest.skip("No conversation history available in read-only notebook")
+            skip_or_fail_missing_reference(
+                "No conversation history available in read-only notebook"
+            )
 
         turns_data = await client.chat.get_conversation_turns(
             read_only_notebook_id,
             conv_id,
-            limit=2,
+            limit=20,
         )
 
         assert turns_data is not None
-        if not turns_data:
-            pytest.skip(
+        if client.backends["chat"] == "android":
+            from notebooklm._android.codecs.documents import tailwind_doc_plain_text
+            from notebooklm._android.proto.google.internal.labs.tailwind.orchestration.v1 import (
+                chat_pb2,
+            )
+
+            assert isinstance(turns_data, chat_pb2.ListChatTurnsResponse)
+            turns = list(turns_data.chat_turns)
+            answers = [
+                turn.act_on_sources_response.response.response
+                or tailwind_doc_plain_text(turn.act_on_sources_response.response.response_doc)
+                for turn in turns
+                if turn.HasField("act_on_sources_response")
+                and turn.act_on_sources_response.HasField("response")
+            ]
+        else:
+            if not turns_data:
+                skip_or_fail_missing_reference(
+                    "Read-only notebook has a conversation but no chat turns — "
+                    "cannot verify answer text. Seed the notebook with chat messages to enable this test."
+                )
+            turns = turns_data[0]
+            answer_turns = [
+                turn for turn in turns if isinstance(turn, list) and len(turn) > 4 and turn[2] == 2
+            ]
+            answers = [turn[4][0][0] for turn in answer_turns]
+        if not turns and client.backends["chat"] == "android":
+            pytest.fail("Seeded conversation exists but Android ListChatTurns decoded no turns")
+        if not turns:
+            skip_or_fail_missing_reference(
                 "Read-only notebook has a conversation but no chat turns — "
                 "cannot verify answer text. Seed the notebook with chat messages to enable this test."
             )
-        turns = turns_data[0]
-        answer_turns = [t for t in turns if isinstance(t, list) and len(t) > 4 and t[2] == 2]
-        assert answer_turns, "No answer turn found in response"
-        answer_text = answer_turns[0][4][0][0]
+        assert answers, "No answer turn found in response"
+        answer_text = next((answer for answer in answers if answer), "")
+        if not answer_text:
+            skip_or_fail_missing_reference(
+                "Conversation history has answer turns but no completed answer text — "
+                "cannot verify answer content. Quota-rejected asks can leave this partial "
+                "record; seed a completed chat response to enable this test."
+            )
         assert isinstance(answer_text, str)
         assert len(answer_text) > 0
 
@@ -267,7 +373,9 @@ class TestChatHistoryE2E:
         """get_conversation_id returns an existing conversation ID."""
         conv_id = await client.chat.get_conversation_id(read_only_notebook_id)
         if not conv_id:
-            pytest.skip("No conversation history available in read-only notebook")
+            skip_or_fail_missing_reference(
+                "No conversation history available in read-only notebook"
+            )
 
         assert isinstance(conv_id, str)
         assert len(conv_id) > 0
@@ -277,32 +385,35 @@ class TestChatHistoryE2E:
     async def test_get_history_returns_qa_pairs(self, client, read_only_notebook_id):
         """get_history returns Q&A pairs from existing conversation history."""
         qa_pairs = await client.chat.get_history(read_only_notebook_id)
+        if not qa_pairs and client.backends["chat"] == "android":
+            pytest.fail("Seeded Android conversation decoded no Q&A pairs")
         if not qa_pairs:
-            pytest.skip("No conversation history available in read-only notebook")
+            skip_or_fail_missing_reference(
+                "No conversation history available in read-only notebook"
+            )
 
-        # Each entry is a (question, answer) tuple
-        q, a = qa_pairs[-1]  # most recent Q&A
+        # Quota-rejected asks can leave an incomplete question with an empty
+        # answer in server history. Verify the most recent completed pair
+        # instead of treating that expected partial record as decoder drift.
+        completed = next(((q, a) for q, a in reversed(qa_pairs) if q and a), None)
+        if completed is None:
+            skip_or_fail_missing_reference("Conversation history has no completed Q&A pair")
+        q, a = completed
         assert isinstance(q, str) and q, "Question should be non-empty string"
         assert isinstance(a, str) and a, "Answer should be non-empty string"
 
 
 @pytest.mark.e2e
+@pytest.mark.live_chat_ask
+@pytest.mark.timeout(300)
 @requires_auth
 class TestChatReferencesE2E:
     """E2E tests specifically for chat references and citations."""
 
     @pytest.mark.asyncio
-    async def test_reference_source_ids_exist_in_notebook(self, client, multi_source_notebook_id):
+    async def test_reference_source_ids_exist_in_notebook(self, cited_chat_sample):
         """Test that reference source IDs correspond to actual sources."""
-        # Get all sources in the notebook
-        sources = await client.sources.list(multi_source_notebook_id)
-        source_ids = {s.id for s in sources}
-
-        # Ask a question that generates citations
-        result = await client.chat.ask(
-            multi_source_notebook_id,
-            "Explain the main concepts with references to sources.",
-        )
+        result, source_ids = cited_chat_sample
 
         # All reference source IDs should exist in the notebook
         for ref in result.references:
@@ -311,12 +422,9 @@ class TestChatReferencesE2E:
             )
 
     @pytest.mark.asyncio
-    async def test_cited_text_matches_source_content(self, client, multi_source_notebook_id):
+    async def test_cited_text_matches_source_content(self, cited_chat_sample):
         """Test that cited text comes from the actual source content."""
-        result = await client.chat.ask(
-            multi_source_notebook_id,
-            "Quote a specific passage from the sources.",
-        )
+        result, _source_ids = cited_chat_sample
 
         # For references with cited_text, verify it's non-empty
         for ref in result.references:

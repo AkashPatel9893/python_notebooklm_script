@@ -25,12 +25,12 @@ import os
 from pathlib import Path
 
 import pytest
-from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
-from tests.vcr_config import notebooklm_vcr
 
 from notebooklm import NotebookLMClient
 from notebooklm.rpc.types import RPCMethod
 from notebooklm.types import MindMapKind
+from tests.integration.conftest import get_vcr_auth, skip_no_cassettes
+from tests.vcr_config import notebooklm_vcr
 
 pytestmark = [pytest.mark.vcr, skip_no_cassettes]
 
@@ -40,7 +40,7 @@ NOTEBOOK_ID = os.environ.get(
 )
 
 CASSETTE_NAME = "mind_maps_interactive.yaml"
-CASSETTE_PATH = Path(__file__).parent.parent / "cassettes" / CASSETTE_NAME
+CASSETTE_PATH = Path(__file__).parent.parent / "cassettes" / "web" / CASSETTE_NAME
 
 
 class TestMindMapsInteractive:

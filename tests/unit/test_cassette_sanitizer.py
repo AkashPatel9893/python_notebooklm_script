@@ -24,11 +24,15 @@ with the deletion of ``tests/check_cassettes_clean.sh``.
 
 from __future__ import annotations
 
+import base64
+import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
 from tests.cassette_patterns import (
     find_cookie_leaks,
     find_credential_leaks,
@@ -36,7 +40,7 @@ from tests.cassette_patterns import (
     scrub_cookie_header,
     scrub_set_cookie,
 )
-from tests.vcr_config import scrub_string
+from tests.vcr_config import ResourceIdCassetteScrubber, scrub_string
 
 pytestmark = pytest.mark.repo_lint
 
@@ -45,6 +49,36 @@ TESTS_DIR = REPO_ROOT / "tests"
 
 GUARD_SCRIPT = TESTS_DIR / "scripts" / "check_cassettes_clean.py"
 REGRESSION_FIXTURE = TESTS_DIR / "fixtures" / "bad_cassettes" / "bad_sid_starting_with_s.yaml"
+
+
+def test_resource_id_cassette_scrubber_is_stable_distinct_and_idempotent() -> None:
+    scrubber = ResourceIdCassetteScrubber()
+    first = "11111111-1111-4111-8111-111111111111"
+    second = "22222222-2222-4222-8222-222222222222"
+
+    scrubbed = scrubber.scrub_text(f"{first}/{second}/{first}")
+
+    assert first not in scrubbed
+    assert second not in scrubbed
+    first_placeholder, second_placeholder, repeated_placeholder = scrubbed.split("/")
+    assert first_placeholder == repeated_placeholder
+    assert first_placeholder != second_placeholder
+    assert first_placeholder == "00000000-0000-4000-8000-000000000001"
+    assert second_placeholder == "00000000-0000-4000-8000-000000000002"
+    assert scrubber.scrub_text(scrubbed) == scrubbed
+
+
+def test_notebook_copy_cassette_commits_only_reserved_resource_uuids() -> None:
+    cassette = TESTS_DIR / "cassettes" / "web" / "notebooks_copy.yaml"
+    resource_ids = set(
+        re.findall(
+            r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b",
+            cassette.read_text(encoding="utf-8"),
+        )
+    )
+
+    assert len(resource_ids) >= 2, "copy replay must preserve distinct source and copy IDs"
+    assert all(value.startswith("00000000-0000-4000-8000-") for value in resource_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +592,108 @@ def test_python_guard_secrets_only_ignores_placeholder_content(tmp_path: Path) -
     res = _run_guard("--secrets-only", str(cassette))
     assert res.returncode == 0, res.stdout + res.stderr
     assert "0 leaks found" in res.stdout
+
+
+def _write_android_grpc_cassette(
+    path: Path,
+    response_wire: bytes,
+    *,
+    application_metadata_keys: list[str] | None = None,
+) -> None:
+    empty_wire = base64.b64encode(b"").decode("ascii")
+    response_b64 = base64.b64encode(response_wire).decode("ascii")
+    interaction = {
+        "method": "/example.Service/GetValue",
+        "request": {
+            "protobuf_b64": empty_wire,
+            "protobuf_type": "example.GetValueRequest",
+        },
+        "response_protobuf_type": "example.GetValueResponse",
+        "responses": [
+            {
+                "protobuf_b64": response_b64,
+                "protobuf_type": "example.GetValueResponse",
+            }
+        ],
+        "shape": "unary_unary",
+    }
+    if application_metadata_keys is not None:
+        interaction["application_metadata_keys"] = application_metadata_keys
+    path.write_text(
+        json.dumps(
+            {
+                "format": "notebooklm.android.grpc-cassette",
+                "interactions": [interaction],
+                "version": 1,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_python_guard_scans_grpc_payload_instead_of_base64_envelope(tmp_path: Path) -> None:
+    cassette = tmp_path / "clean_synthetic.grpc.json"
+    _write_android_grpc_cassette(cassette, b"\x0a\x14SCRUBBED_STRING_0001")
+
+    result = _run_guard("--secrets-only", str(cassette))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "0 leaks found" in result.stdout
+
+
+def test_python_guard_allows_only_pinned_grpc_application_metadata_keys(
+    tmp_path: Path,
+) -> None:
+    cassette = tmp_path / "metadata_synthetic.grpc.json"
+    _write_android_grpc_cassette(
+        cassette,
+        b"",
+        application_metadata_keys=[
+            "x-goog-ext-174067345-bin",
+            "x-goog-ext-202964622-bin",
+        ],
+    )
+
+    clean = _run_guard(str(cassette))
+
+    assert clean.returncode == 0, clean.stdout + clean.stderr
+
+    _write_android_grpc_cassette(
+        cassette,
+        b"",
+        application_metadata_keys=["authorization"],
+    )
+    unsafe = _run_guard(str(cassette))
+
+    assert unsafe.returncode == 1
+    assert "unsafe application metadata keys" in unsafe.stdout
+
+    data = json.loads(cassette.read_text(encoding="utf-8"))
+    data["interactions"][0]["application_metadata_keys"] = None
+    cassette.write_text(json.dumps(data), encoding="utf-8")
+    explicit_null = _run_guard(str(cassette))
+
+    assert explicit_null.returncode == 1
+    assert "unsafe application metadata keys" in explicit_null.stdout
+
+
+def test_python_guard_detects_novel_token_inside_grpc_protobuf(tmp_path: Path) -> None:
+    novel = "kJ8sLm2NpQr5" + "TvWxYz0AbCdEf" + "GhIjKlMnOpQrSt" + "UvWxYz12345678"
+    nested = tmp_path / "android"
+    nested.mkdir()
+    cassette = nested / "leaky_synthetic.grpc.json"
+    token_bytes = novel.encode("ascii")
+    _write_android_grpc_cassette(cassette, b"\x0a" + bytes([len(token_bytes)]) + token_bytes)
+
+    # This is the same default ``--strict --recursive`` discovery path used by
+    # CI, not only an explicit-file secrets-only scan.
+    result = _run_guard("--recursive", str(tmp_path))
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "high-entropy token" in result.stdout
 
 
 def test_python_guard_exits_zero_when_no_cassettes_found(tmp_path: Path) -> None:

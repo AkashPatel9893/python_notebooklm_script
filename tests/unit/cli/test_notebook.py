@@ -8,10 +8,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+import notebooklm.auth as auth_module
+import notebooklm.cli.context as context_module
+import notebooklm.cli.helpers as helpers_module
+import notebooklm.cli.notebook_cmd as notebook_cmd_module
+import notebooklm.cli.resolve as resolve_module
 from notebooklm.exceptions import NotebookLimitError, RPCError
 from notebooklm.notebooklm_cli import cli
 from notebooklm.rpc import RPCMethod
-from notebooklm.types import AskResult, Notebook
+from notebooklm.types import AskResult, Notebook, SharePermission
 
 from .conftest import (
     create_mock_client,
@@ -28,7 +33,7 @@ def runner():
 
 @pytest.fixture
 def mock_auth():
-    with patch("notebooklm.cli.helpers.load_auth_from_storage") as mock:
+    with patch.object(helpers_module, "load_auth_from_storage") as mock:
         mock.return_value = {
             "SID": "test",
             "HSID": "test",
@@ -49,8 +54,8 @@ class TestNotebookList:
         mock_client = create_mock_client()
         mock_client.notebooks.list = AsyncMock(return_value=[])
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["list"], obj=inject_client(mock_client))
@@ -77,8 +82,8 @@ class TestNotebookList:
             ]
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["list"], obj=inject_client(mock_client))
@@ -89,6 +94,49 @@ class TestNotebookList:
         assert "First Notebook" in result.output
         assert "Second Notebook" in result.output
 
+    def test_notebook_list_renders_each_role_distinctly(self, runner, mock_auth):
+        """#2125: owner / editor / viewer must be distinguishable in the table.
+
+        Pre-fix, all three collapsed onto "Owner" vs "Shared", so a read-only
+        collaborator looked identical to a full editor.
+        """
+        mock_client = create_mock_client()
+        mock_client.notebooks.list = AsyncMock(
+            return_value=[
+                Notebook(id="nb_own", title="Mine", role=SharePermission.OWNER),
+                Notebook(id="nb_edit", title="Theirs (edit)", role=SharePermission.EDITOR),
+                Notebook(id="nb_view", title="Theirs (read)", role=SharePermission.VIEWER),
+            ]
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, ["list", "--no-truncate"], obj=inject_client(mock_client))
+
+        assert result.exit_code == 0
+        assert "Access" in result.output
+        for label in ("Owner", "Editor", "Viewer"):
+            assert label in result.output, f"{label!r} missing from:\n{result.output}"
+        assert "Shared" not in result.output
+
+    def test_notebook_list_unknown_role_renders_as_owner(self, runner, mock_auth):
+        """An unstated role renders "Owner", matching ``is_owner``'s soft-degrade."""
+        mock_client = create_mock_client()
+        mock_client.notebooks.list = AsyncMock(
+            return_value=[Notebook(id="nb_x", title="No Role Stated")]
+        )
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(cli, ["list"], obj=inject_client(mock_client))
+
+        assert result.exit_code == 0
+        assert "Owner" in result.output
+
     def test_notebook_list_json_output(self, runner, mock_auth):
         mock_client = create_mock_client()
         mock_client.notebooks.list = AsyncMock(
@@ -98,12 +146,13 @@ class TestNotebookList:
                     title="Test Notebook",
                     created_at=datetime(2024, 1, 1),
                     is_owner=True,
+                    role=SharePermission.OWNER,
                 ),
             ]
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["list", "--json"], obj=inject_client(mock_client))
@@ -118,9 +167,13 @@ class TestNotebookList:
             "id",
             "title",
             "is_owner",
+            "role",
             "created_at",
+            "last_viewed_at",
+            "modified_at",
         ]
         assert data["notebooks"][0]["id"] == "nb_1"
+        assert data["notebooks"][0]["role"] == "owner"
 
     def test_notebook_list_limit_caps_rows(self, runner, mock_auth):
         """`--limit N` returns at most N data rows in text output."""
@@ -136,8 +189,8 @@ class TestNotebookList:
         mock_client = create_mock_client()
         mock_client.notebooks.list = AsyncMock(return_value=many)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["list", "--limit", "5"], obj=inject_client(mock_client))
@@ -163,8 +216,8 @@ class TestNotebookList:
         mock_client = create_mock_client()
         mock_client.notebooks.list = AsyncMock(return_value=many)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -198,8 +251,8 @@ class TestNotebookList:
             ]
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["list", "--no-truncate"], obj=inject_client(mock_client))
@@ -230,8 +283,8 @@ class TestNotebookList:
             ]
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["list"], obj=inject_client(mock_client))
@@ -257,8 +310,8 @@ class TestNotebookCreate:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["create", "Test Notebook"], obj=inject_client(mock_client))
@@ -281,8 +334,8 @@ class TestNotebookCreate:
             return_value=Notebook(id="new_nb_id", title="Fresh", created_at=datetime(2024, 1, 1))
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["create", "Fresh"], obj=inject_client(mock_client))
@@ -296,12 +349,15 @@ class TestNotebookCreate:
         mock_client = create_mock_client()
         mock_client.notebooks.create = AsyncMock(
             return_value=Notebook(
-                id="new_nb_id", title="Test Notebook", created_at=datetime(2024, 1, 1)
+                id="new_nb_id",
+                title="Test Notebook",
+                created_at=datetime(2024, 1, 1),
+                role=SharePermission.OWNER,
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -311,6 +367,19 @@ class TestNotebookCreate:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data["notebook"]["id"] == "new_nb_id"
+        # One notebook shape across `create` / `list` / `use` --json (#2125).
+        assert data["notebook"]["role"] == "owner"
+        # Exact key set, like the `list` and `use` envelopes: this is the third
+        # ``notebook_viewed_keys`` call site, and without a pin the splat could
+        # be dropped here with the whole suite still green (#2126).
+        assert set(data["notebook"]) == {
+            "id",
+            "title",
+            "role",
+            "created_at",
+            "last_viewed_at",
+            "modified_at",
+        }
         assert not mock_context_file.exists()
 
     def test_notebook_create_with_use_flag(self, runner, mock_auth, mock_context_file):
@@ -322,8 +391,8 @@ class TestNotebookCreate:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -343,8 +412,8 @@ class TestNotebookCreate:
             return_value=Notebook(id="short_id", title="Short", created_at=datetime(2024, 1, 1))
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["create", "Short", "-u"], obj=inject_client(mock_client))
@@ -368,8 +437,8 @@ class TestNotebookCreate:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -400,8 +469,8 @@ class TestNotebookCreate:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -418,7 +487,7 @@ class TestNotebookCreate:
         """Create emits structured JSON when notebook quota is detected."""
         mock_client = create_mock_client()
         original = RPCError(
-            "RPC CCqFvf returned null result with status code 3 (Invalid argument).",
+            "The server rejected this request (invalid argument).",
             method_id=RPCMethod.CREATE_NOTEBOOK.value,
             rpc_code=3,
         )
@@ -426,8 +495,8 @@ class TestNotebookCreate:
             side_effect=NotebookLimitError(499, limit=500, original_error=original)
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -448,8 +517,8 @@ class TestNotebookCreate:
         mock_client = create_mock_client()
         mock_client.notebooks.create = AsyncMock(side_effect=NotebookLimitError(499, limit=500))
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["create", "Test Notebook"], obj=inject_client(mock_client))
@@ -457,6 +526,132 @@ class TestNotebookCreate:
         assert result.exit_code == 1
         assert "notebook limit" in result.output.lower()
         assert "499/500" in result.output
+
+
+# =============================================================================
+# NOTEBOOK COPY TESTS
+# =============================================================================
+
+
+class TestNotebookCopy:
+    def _client(self) -> MagicMock:
+        mock_client = create_mock_client()
+        mock_client.notebooks.list = AsyncMock(
+            return_value=[Notebook(id="nb_source_full", title="Source notebook")]
+        )
+        mock_client.notebooks.copy = AsyncMock(
+            return_value=Notebook(
+                id="nb_copy",
+                title="Copied notebook",
+                created_at=datetime(2024, 1, 2),
+                role=SharePermission.OWNER,
+            )
+        )
+        return mock_client
+
+    def test_notebook_copy_uses_and_preserves_current_context(
+        self, runner, mock_auth, mock_context_file
+    ):
+        mock_context_file.write_text(
+            json.dumps({"notebook_id": "nb_source", "title": "Source notebook"})
+        )
+        mock_client = self._client()
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["copy", "Copied notebook"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Copied notebook" in result.output
+        assert "nb_source_full -> nb_copy" in result.output
+        mock_client.notebooks.copy.assert_awaited_once_with("nb_source_full", "Copied notebook")
+        assert json.loads(mock_context_file.read_text())["notebook_id"] == "nb_source"
+
+    def test_notebook_copy_json_output(self, runner, mock_auth, mock_context_file):
+        mock_client = self._client()
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["copy", "Copied notebook", "-n", "nb_source", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert "Matched:" not in result.stdout
+        assert "Matched:" in result.stderr
+        assert data["source_notebook_id"] == "nb_source_full"
+        assert data["notebook"] == {
+            "id": "nb_copy",
+            "title": "Copied notebook",
+            "role": "owner",
+            "created_at": "2024-01-02T00:00:00",
+            "last_viewed_at": None,
+            "modified_at": None,
+        }
+        assert "active_notebook_id" not in data
+        assert not mock_context_file.exists()
+
+    def test_notebook_copy_json_missing_source_returns_structured_error(
+        self, runner, mock_auth, mock_context_file, monkeypatch
+    ):
+        monkeypatch.delenv("NOTEBOOKLM_NOTEBOOK", raising=False)
+        mock_client = self._client()
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["copy", "Copied notebook", "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 1
+        assert json.loads(result.stdout) == {
+            "error": True,
+            "code": "VALIDATION_ERROR",
+            "message": (
+                "No notebook specified. Use 'notebooklm use <id>' to set context, "
+                "pass -n/--notebook, or set NOTEBOOKLM_NOTEBOOK."
+            ),
+        }
+        assert result.stderr == ""
+        mock_client.notebooks.copy.assert_not_awaited()
+
+    @pytest.mark.parametrize("use_flag", ["--use", "-u"])
+    def test_notebook_copy_use_switches_context(
+        self, runner, mock_auth, mock_context_file, use_flag
+    ):
+        mock_client = self._client()
+
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.return_value = ("csrf", "session")
+            result = runner.invoke(
+                cli,
+                ["copy", "Copied notebook", "-n", "nb_source", use_flag, "--json"],
+                obj=inject_client(mock_client),
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert data["active_notebook_id"] == "nb_copy"
+        context = json.loads(mock_context_file.read_text())
+        assert context["notebook_id"] == "nb_copy"
+        assert context["title"] == "Copied notebook"
 
 
 # =============================================================================
@@ -480,8 +675,8 @@ class TestNotebookDelete:
         )
         mock_client.notebooks.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -506,8 +701,8 @@ class TestNotebookDelete:
         )
         mock_client.notebooks.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -537,13 +732,13 @@ class TestNotebookDelete:
         mock_client.notebooks.delete = AsyncMock(return_value=True)
 
         with (
-            patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
-            patch("notebooklm.cli.context.get_context_path", return_value=context_file),
-            patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
-            patch("notebooklm.cli.notebook_cmd.get_current_notebook", return_value="nb_to_delete"),
-            patch("notebooklm.cli.notebook_cmd.clear_context"),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(helpers_module, "get_context_path", return_value=context_file),
+            patch.object(context_module, "get_context_path", return_value=context_file),
+            patch.object(resolve_module, "get_context_path", return_value=context_file),
+            patch.object(notebook_cmd_module, "get_current_notebook", return_value="nb_to_delete"),
+            patch.object(notebook_cmd_module, "clear_context"),
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -572,8 +767,8 @@ class TestNotebookDelete:
         )
         mock_client.notebooks.delete = AsyncMock(side_effect=RPCError("delete blew up"))
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -597,8 +792,8 @@ class TestNotebookDelete:
         )
         mock_client.notebooks.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -627,8 +822,8 @@ class TestNotebookDelete:
         )
         mock_client.notebooks.delete = AsyncMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -662,13 +857,13 @@ class TestNotebookDelete:
         mock_client.notebooks.delete = AsyncMock(return_value=True)
 
         with (
-            patch("notebooklm.cli.helpers.get_context_path", return_value=context_file),
-            patch("notebooklm.cli.context.get_context_path", return_value=context_file),
-            patch("notebooklm.cli.resolve.get_context_path", return_value=context_file),
-            patch("notebooklm.cli.notebook_cmd.get_current_notebook", return_value="nb_to_delete"),
-            patch("notebooklm.cli.notebook_cmd.clear_context") as mock_clear,
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(helpers_module, "get_context_path", return_value=context_file),
+            patch.object(context_module, "get_context_path", return_value=context_file),
+            patch.object(resolve_module, "get_context_path", return_value=context_file),
+            patch.object(notebook_cmd_module, "get_current_notebook", return_value="nb_to_delete"),
+            patch.object(notebook_cmd_module, "clear_context") as mock_clear,
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -709,8 +904,8 @@ class TestNotebookRename:
         )
         mock_client.notebooks.rename = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -735,8 +930,8 @@ class TestNotebookRename:
         )
         mock_client.notebooks.rename = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -787,8 +982,8 @@ class TestNotebookSummary:
         mock_desc.suggested_topics = []
         mock_client.notebooks.get_description = AsyncMock(return_value=mock_desc)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["summary", "-n", "nb_123"], obj=inject_client(mock_client))
@@ -817,8 +1012,8 @@ class TestNotebookSummary:
         mock_desc.suggested_topics = [mock_topic]
         mock_client.notebooks.get_description = AsyncMock(return_value=mock_desc)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -848,8 +1043,8 @@ class TestNotebookSummary:
         mock_desc.suggested_topics = [mock_topic]
         mock_client.notebooks.get_description = AsyncMock(return_value=mock_desc)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -885,8 +1080,8 @@ class TestNotebookSummary:
         mock_desc.suggested_topics = [mock_topic]
         mock_client.notebooks.get_description = AsyncMock(return_value=mock_desc)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -915,8 +1110,8 @@ class TestNotebookSummary:
         )
         mock_client.notebooks.get_description = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["summary", "-n", "nb_123"], obj=inject_client(mock_client))
@@ -936,8 +1131,8 @@ class TestNotebookHistory:
         mock_client.chat.get_history = AsyncMock(return_value=[("Q1?", "A1"), ("Q2?", "A2")])
         mock_client.chat.get_conversation_id = AsyncMock(return_value="conv_001")
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["history", "-n", "nb_123"], obj=inject_client(mock_client))
@@ -950,8 +1145,8 @@ class TestNotebookHistory:
         mock_client.chat.get_conversation_id = AsyncMock(return_value=None)
         mock_client.chat.get_history = AsyncMock(return_value=[])
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["history", "-n", "nb_123"], obj=inject_client(mock_client))
@@ -963,8 +1158,8 @@ class TestNotebookHistory:
         mock_client = create_mock_client()
         mock_client.chat.clear_cache = MagicMock(return_value=True)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(cli, ["history", "--clear"], obj=inject_client(mock_client))
@@ -992,16 +1187,18 @@ class TestNotebookAsk:
         mock_client.chat.get_conversation_id = AsyncMock(return_value=None)
 
         with (
-            patch(
-                "notebooklm.cli.helpers.get_context_path",
+            patch.object(
+                helpers_module,
+                "get_context_path",
                 return_value=Path("/nonexistent/context.json"),
             ),
-            patch(
-                "notebooklm.cli.context.get_context_path",
+            patch.object(
+                context_module,
+                "get_context_path",
                 return_value=Path("/nonexistent/context.json"),
             ),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -1023,8 +1220,8 @@ class TestNotebookAsk:
             )
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1047,8 +1244,8 @@ class TestNotebookConfigure:
         mock_client = create_mock_client()
         mock_client.chat.set_mode = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1061,11 +1258,21 @@ class TestNotebookConfigure:
         assert "Chat mode set to: learning-guide" in result.output
 
     def test_notebook_configure_persona(self, runner, mock_auth):
+        from notebooklm.types import ChatGoal, ChatResponseLength, ChatSettings
+
         mock_client = create_mock_client()
         mock_client.chat.configure = AsyncMock(return_value=None)
+        # persona-only is a partial merge → the core reads current settings first.
+        mock_client.chat.get_settings = AsyncMock(
+            return_value=ChatSettings(
+                goal=ChatGoal.DEFAULT,
+                response_length=ChatResponseLength.DEFAULT,
+                custom_prompt=None,
+            )
+        )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1079,11 +1286,21 @@ class TestNotebookConfigure:
         assert "persona" in result.output
 
     def test_notebook_configure_response_length(self, runner, mock_auth):
+        from notebooklm.types import ChatGoal, ChatResponseLength, ChatSettings
+
         mock_client = create_mock_client()
         mock_client.chat.configure = AsyncMock(return_value=None)
+        # response-length-only is a partial merge → the core reads current settings first.
+        mock_client.chat.get_settings = AsyncMock(
+            return_value=ChatSettings(
+                goal=ChatGoal.DEFAULT,
+                response_length=ChatResponseLength.DEFAULT,
+                custom_prompt=None,
+            )
+        )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1109,8 +1326,8 @@ class TestSourceAddResearch:
             return_value=research_task({"status": "completed", "sources": [{"title": "Source 1"}]})
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1126,8 +1343,8 @@ class TestSourceAddResearch:
         mock_client = create_mock_client()
         mock_client.research.start = AsyncMock(return_value=None)
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1151,8 +1368,8 @@ class TestSourceAddResearch:
             return_value=[{"id": "src_1"}]
         )
 
-        with patch(
-            "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+        with patch.object(
+            auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
         ) as mock_fetch:
             mock_fetch.return_value = ("csrf", "session")
             result = runner.invoke(
@@ -1231,6 +1448,7 @@ class TestNotebookMetadata:
             id="nb_1",
             title="Test Notebook",
             created_at=datetime(2024, 1, 1),
+            role=SharePermission.EDITOR,
         )
         # Override notebooks.list to return only our test notebook (avoid partial ID conflicts)
         mock_client.notebooks.list = AsyncMock(return_value=[notebook])
@@ -1250,12 +1468,13 @@ class TestNotebookMetadata:
         mock_client.notebooks.get = AsyncMock(return_value=notebook)
 
         with (
-            patch(
-                "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+            patch.object(
+                resolve_module.context_helpers,
+                "get_current_notebook",
                 return_value="nb_1",
             ),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -1265,6 +1484,9 @@ class TestNotebookMetadata:
         assert "Test Notebook" in result.output
         assert "[pdf]" in result.output
         assert "nb_1" in result.output
+        # The Access line reports the caller's real role, not Owner/Shared (#2125).
+        assert "Access:" in result.output
+        assert "Editor" in result.output
 
     def test_metadata_json_output(self, runner, mock_auth):
         """Test JSON output with --json flag."""
@@ -1280,6 +1502,7 @@ class TestNotebookMetadata:
             notebook=notebook,
             sources=[SourceSummary(kind=SourceType.PDF, title="test.pdf")],
         )
+        assert metadata.to_dict()["role"] is None  # unstated role stays null in JSON
 
         # Use side_effect to avoid potential pickling issues with enums
         async def return_metadata(nb_id):
@@ -1289,12 +1512,13 @@ class TestNotebookMetadata:
         mock_client.notebooks.get = AsyncMock(return_value=notebook)
 
         with (
-            patch(
-                "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+            patch.object(
+                resolve_module.context_helpers,
+                "get_current_notebook",
                 return_value="nb_1",
             ),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -1321,12 +1545,13 @@ class TestNotebookMetadata:
         mock_client.notebooks.get = AsyncMock(return_value=notebook)
 
         with (
-            patch(
-                "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+            patch.object(
+                resolve_module.context_helpers,
+                "get_current_notebook",
                 return_value="nb_empty",
             ),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")
@@ -1358,12 +1583,13 @@ class TestNotebookMetadata:
         mock_client.notebooks.get = AsyncMock(return_value=notebook)
 
         with (
-            patch(
-                "notebooklm.cli.resolve.context_helpers.get_current_notebook",
+            patch.object(
+                resolve_module.context_helpers,
+                "get_current_notebook",
                 return_value="nb_url",
             ),
-            patch(
-                "notebooklm.auth.fetch_tokens_with_domains", new_callable=AsyncMock
+            patch.object(
+                auth_module, "fetch_tokens_with_domains", new_callable=AsyncMock
             ) as mock_fetch,
         ):
             mock_fetch.return_value = ("csrf", "session")

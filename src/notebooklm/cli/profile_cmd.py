@@ -17,13 +17,12 @@ from pathlib import Path
 import click
 from rich.table import Table
 
+from .._app.profile import gather_profile_accounts as gather_profile_list
 from .._app.profile import (
-    gather_profile_list,
     is_protected_profile,
     retarget_default_profile_mutator,
     set_default_profile_mutator,
 )
-from ..auth import read_account_metadata
 from ..io import atomic_update_json
 from ..paths import (
     get_config_path,
@@ -112,7 +111,17 @@ def list_cmd(json_output):
         with handle_errors(json_output=True):
             _run_list_cmd(json_output=True)
         return
-    _run_list_cmd(json_output=False)
+    # The text path was previously unwrapped, so a filesystem failure while
+    # enumerating profiles escaped as a raw traceback. Mirror ``switch_cmd``'s
+    # OSError handling for a friendly message + exit 1. (The ``--json`` path
+    # above keeps its ``handle_errors`` envelope, which classifies an unexpected
+    # OSError as the exit-2 ``UNEXPECTED_ERROR`` contract automation relies on.)
+    try:
+        _run_list_cmd(json_output=False)
+    except OSError as e:
+        raise click.ClickException(  # cli-input-validation: profile list filesystem failure
+            f"Failed to list profiles: {e}"
+        ) from None
 
 
 def _run_list_cmd(*, json_output: bool) -> None:
@@ -124,7 +133,6 @@ def _run_list_cmd(*, json_output: bool) -> None:
         list_profiles=list_profiles,
         resolve_profile=resolve_profile,
         get_storage_path=get_storage_path,
-        read_account_metadata=read_account_metadata,
     )
 
     if not entries:
@@ -168,7 +176,8 @@ def _run_list_cmd(*, json_output: bool) -> None:
 
 @profile.command("create")
 @click.argument("name")
-def create_cmd(name):
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def create_cmd(name, json_output):
     """Create a new profile.
 
     Creates an empty profile directory. Use 'notebooklm -p NAME login' to authenticate.
@@ -191,14 +200,26 @@ def create_cmd(name):
             f"Profile '{name}' already exists."
         )
 
-    get_profile_dir(name, create=True)
+    # Mirror ``switch_cmd``'s OSError handling: a filesystem failure while
+    # materializing the profile directory (read-only mount, permissions) yields
+    # a friendly message + exit 1 via Click, never a raw traceback.
+    try:
+        get_profile_dir(name, create=True)
+    except OSError as e:
+        raise click.ClickException(  # cli-input-validation: profile create filesystem failure
+            f"Failed to create profile '{name}': {e}"
+        ) from None
+    if json_output:
+        json_output_response({"profile": name, "status": "created"})
+        return
     console.print(f"[green]Profile '{name}' created.[/green]")
     console.print(f"[dim]Run 'notebooklm -p {name} login' to authenticate.[/dim]")
 
 
 @profile.command("switch")
 @click.argument("name")
-def switch_cmd(name):
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def switch_cmd(name, json_output):
     """Set the default profile.
 
     \b
@@ -220,8 +241,9 @@ def switch_cmd(name):
         )
 
     config_path = get_config_path()
-    # Capture the previous value for the status message before mutating.
-    # The lock-protected mutator below is the source of truth for the write.
+    # Best-effort prior value for the human status line only. It is read outside
+    # the lock, so a concurrent ``profile switch`` could make it stale — which is
+    # why it is NOT exposed in the machine-readable ``--json`` contract.
     old_profile = _read_config(config_path).get("default_profile", "default")
 
     try:
@@ -231,6 +253,9 @@ def switch_cmd(name):
             f"Failed to update config.json: {e}"
         ) from None
 
+    if json_output:
+        json_output_response({"profile": name, "status": "switched"})
+        return
     console.print(f"[green]Switched default profile: {old_profile} → {name}[/green]")
 
 
@@ -254,7 +279,8 @@ def switch_cmd(name):
     hidden=True,
     help="[Deprecated] Alias for --yes/-y.",
 )
-def delete_cmd(name, yes, confirm):
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def delete_cmd(name, yes, confirm, json_output):
     """Delete a profile and its data.
 
     Removes the profile directory including auth cookies, context, and browser profile.
@@ -288,19 +314,34 @@ def delete_cmd(name, yes, confirm):
             f"Profile '{name}' not found."
         )
 
-    if not yes:
+    # ``--json`` implies non-interactive: skip the prompt (matching the
+    # confirming-mutation contract that ``run_confirmed_mutation`` enforces).
+    if not yes and not json_output:
         if not click.confirm(f"Delete profile '{name}' and all its data?"):
             console.print("[dim]Cancelled.[/dim]")
             return
 
-    shutil.rmtree(profile_dir)
+    # Mirror ``switch_cmd``'s OSError handling: a pure-filesystem failure (a
+    # locked or half-deleted profile directory — common on Windows when the
+    # browser profile is held by AV/the browser) yields a friendly message +
+    # exit 1 via Click, never a raw traceback.
+    try:
+        shutil.rmtree(profile_dir)
+    except OSError as e:
+        raise click.ClickException(  # cli-input-validation: profile delete filesystem failure
+            f"Failed to delete profile '{name}': {e}"
+        ) from None
+    if json_output:
+        json_output_response({"profile": name, "status": "deleted"})
+        return
     console.print(f"[green]Profile '{name}' deleted.[/green]")
 
 
 @profile.command("rename")
 @click.argument("old_name")
 @click.argument("new_name")
-def rename_cmd(old_name, new_name):
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def rename_cmd(old_name, new_name, json_output):
     """Rename a profile.
 
     \b
@@ -326,7 +367,18 @@ def rename_cmd(old_name, new_name):
             f"Profile '{new_name}' already exists."
         )
 
-    os.rename(old_dir, new_dir)
+    # Mirror ``switch_cmd``'s OSError handling: a failure moving the profile
+    # directory (a locked browser-profile file held by AV/the browser on
+    # Windows, a cross-device rename) yields a friendly message + exit 1 via
+    # Click, never a raw traceback. The config retarget below only runs once the
+    # directory move succeeded, so a failed rename never leaves a dangling
+    # ``default_profile`` pointer.
+    try:
+        os.rename(old_dir, new_dir)
+    except OSError as e:
+        raise click.ClickException(  # cli-input-validation: profile rename filesystem failure
+            f"Failed to rename profile '{old_name}': {e}"
+        ) from None
 
     # Update config if renamed profile was the effective default. This is
     # always serialized through the locked mutator — there is NO pre-read
@@ -346,15 +398,39 @@ def rename_cmd(old_name, new_name):
         old_name=old_name, new_name=new_name
     )
 
+    config_error: str | None = None
+    default_updated = False
     try:
         _atomic_write_config(config_path, retarget_mutator)
     except OSError as e:
+        config_error = str(e)
+    else:
+        default_updated = was_updated()
+
+    if json_output:
+        # The directory move (the rename itself) has already succeeded; exit 0 +
+        # ``status: renamed`` reflects that, matching the text-mode contract. A
+        # failed default-pointer retarget is a recoverable secondary failure
+        # surfaced via ``config_warning`` (always present — null when clean — so
+        # automation can detect it with ``payload["config_warning"]`` without a
+        # KeyError).
+        json_output_response(
+            {
+                "old_name": old_name,
+                "new_name": new_name,
+                "default_updated": default_updated,
+                "status": "renamed",
+                "config_warning": config_error,
+            }
+        )
+        return
+
+    if config_error is not None:
         console.print(
-            f"[yellow]Warning: profile renamed but config.json update failed: {e}[/yellow]\n"
+            f"[yellow]Warning: profile renamed but config.json update failed: {config_error}[/yellow]\n"
             f"[yellow]Run 'notebooklm profile switch {new_name}' to fix.[/yellow]"
         )
-    else:
-        if was_updated():
-            console.print(f"[dim]Updated default profile in config: {old_name} → {new_name}[/dim]")
+    elif default_updated:
+        console.print(f"[dim]Updated default profile in config: {old_name} → {new_name}[/dim]")
 
     console.print(f"[green]Profile renamed: {old_name} → {new_name}[/green]")

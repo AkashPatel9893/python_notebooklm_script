@@ -17,7 +17,10 @@ from unittest.mock import patch
 
 import pytest
 
-from notebooklm.cli.services.playwright_login import (
+from notebooklm._browser.browser_capture import (
+    sync_playwright_context as _sync_playwright_context,
+)
+from notebooklm._browser.browser_capture import (
     windows_playwright_event_loop as _windows_playwright_event_loop,
 )
 
@@ -38,10 +41,7 @@ class TestPlaywrightSmokeTest:
         sync_playwright() raises NotImplementedError on Windows because
         WindowsSelectorEventLoopPolicy doesn't support subprocess spawning.
         """
-        from playwright.sync_api import sync_playwright
-
-        # This would fail without the context manager fix
-        with _windows_playwright_event_loop(), sync_playwright() as p:
+        with _sync_playwright_context() as p:
             # Just verify Playwright initializes - don't launch a browser
             assert p.chromium is not None
             assert p.firefox is not None
@@ -55,10 +55,7 @@ class TestPlaywrightSmokeTest:
         if sys.platform == "win32":
             pytest.skip("Non-Windows test")
 
-        from playwright.sync_api import sync_playwright
-
-        # Context manager is no-op on non-Windows, Playwright should still work
-        with _windows_playwright_event_loop(), sync_playwright() as p:
+        with _sync_playwright_context() as p:
             assert p.chromium is not None
 
 
@@ -77,10 +74,9 @@ class TestPlaywrightEventLoopFix:
 
     def test_context_manager_is_noop_on_non_windows(self):
         """Verify context manager is a no-op on non-Windows platforms."""
-        # Mock sys.platform to non-Windows. ``windows_playwright_event_loop``
-        # now lives in :mod:`cli.services.playwright_login`, so the patch
-        # target follows the import (rev-1 CodeRabbit feedback on #962).
-        with patch("notebooklm.cli.services.playwright_login.sys.platform", "linux"):
+        # Mock ``sys.platform`` to non-Windows; the service reads the same
+        # process-wide ``sys`` module object.
+        with patch.object(sys, "platform", "linux"):
             original_policy = asyncio.get_event_loop_policy()
             with _windows_playwright_event_loop():
                 # Policy should remain unchanged on non-Windows

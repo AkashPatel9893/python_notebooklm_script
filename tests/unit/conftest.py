@@ -1,8 +1,8 @@
 """Shared fixtures and helpers for tests/unit/.
 
 The ``make_core`` async context manager is imported directly by sibling
-test modules (e.g. ``from conftest import make_core``) — pytest adds the
-test directory to ``sys.path`` so the sibling import works.
+test modules (e.g. ``from tests.unit.conftest import make_core``) now that
+the ``tests`` package chain is complete and fully qualified.
 """
 
 from collections.abc import Awaitable, Callable
@@ -12,9 +12,9 @@ from typing import Any
 import httpx
 import pytest
 
-from _fixtures.kernel_test_helpers import install_http_client_for_test
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm.auth import AuthTokens
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 def install_post_as_stream(
@@ -25,7 +25,7 @@ def install_post_as_stream(
     """Adapt a ``fake_post(...) -> Response`` mock to the streaming API.
 
     The RPC POST path uses :meth:`httpx.AsyncClient.stream` (so a running
-    size guard can enforce :data:`notebooklm._streaming_post.MAX_RPC_RESPONSE_BYTES`).
+    size guard can enforce :data:`notebooklm._web.transport.streaming_post.MAX_RPC_RESPONSE_BYTES`).
     The bulk of the unit suite predates that switch and still expresses test
     intent as ``monkeypatch.setattr(client, "post", fake_post)``. This helper
     bridges the gap: it installs an ``async with client.stream(...)``-compatible
@@ -154,10 +154,10 @@ async def make_core(refresh_callback=None, transport=None, refresh_retry_delay=0
         # can observe real httpx.Request construction (cookie merge, headers).
         # Capture the cookie jar BEFORE aclose() — reading attributes off a
         # closed AsyncClient is brittle across httpx versions.
-        prior_cookies = core._collaborators.kernel.get_http_client().cookies
-        await core._collaborators.kernel.get_http_client().aclose()
+        prior_cookies = core._web_runtime.kernel.get_http_client().cookies
+        await core._web_runtime.kernel.get_http_client().aclose()
         install_http_client_for_test(
-            core._collaborators.kernel,
+            core._web_runtime.kernel,
             httpx.AsyncClient(
                 cookies=prior_cookies,
                 transport=transport,

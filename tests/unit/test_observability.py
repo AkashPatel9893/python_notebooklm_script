@@ -6,8 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from _fixtures.kernel_test_helpers import install_http_client_for_test
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm import (
     ClientMetricsSnapshot,
     NotebookLMClient,
@@ -15,27 +13,25 @@ from notebooklm import (
     correlation_id,
     get_request_id,
 )
-from notebooklm._artifacts import ArtifactsAPI
-from notebooklm._mind_map import NoteBackedMindMapService
-from notebooklm._note_service import NoteService
-from notebooklm._source.upload import SourceUploadPipeline
-from notebooklm._sources import SourcesAPI
+from notebooklm._web.artifacts import WebArtifactsAPI
+from notebooklm._web.mind_maps import NoteBackedMindMapService
+from notebooklm._web.notes import NoteService
+from notebooklm._web.sources import WebSourcesAPI
 from notebooklm.auth import AuthTokens
 from notebooklm.rpc import RPCMethod
 from notebooklm.types import GenerationStatus
+from tests._fixtures.kernel_test_helpers import install_http_client_for_test
+from tests._helpers.client_factory import build_client_shell_for_tests
 
 
 @pytest.mark.asyncio
 async def test_rpc_metrics_event_and_correlation_scope(auth_tokens: AuthTokens) -> None:
     """Public contract: ``rpc_call`` bumps counters + emits ``RpcTelemetryEvent``.
 
-    As of Tier-12 PR 12.4 the per-RPC success/failure counters and the
-    ``on_rpc_event`` fire live inside ``MetricsMiddleware`` (which sits
-    in the chain around ``_perform_authed_post``), not inside
-    ``RpcExecutor.rpc_call``. The seam the test mocks therefore has to
-    live below the chain. We mock the chain terminal so the chain runs
-    end-to-end, and we return a wire-format payload that the real decoder
-    accepts.
+    The protocol-neutral ``CallSupervisor`` owns per-RPC success/failure
+    counters and ``on_rpc_event`` outside the shared web middleware chain.
+    We mock the chain terminal and return a wire-format payload that the real
+    decoder accepts.
 
     The test still asserts the same five public-contract invariants it
     always has: result value, correlation-id propagation INTO the chain,
@@ -44,28 +40,34 @@ async def test_rpc_metrics_event_and_correlation_scope(auth_tokens: AuthTokens) 
     """
     events: list[RpcTelemetryEvent] = []
 
-    # Inject the decoder at construction time (Session DI seam — see
-    # ``docs/improvement.md`` §4.1). The real decoder requires a wire
+    # Inject the decoder at construction time (NotebookLMClient test seam; see
+    # ``docs/architecture.md``'s ClientSeams wiring). The real decoder requires a wire
     # payload that matches the method's RPC ID; constructing one makes
     # the test brittle to RPC-ID changes. Stubbing keeps the test focused
     # on observability semantics (counters + events + correlation) rather
     # than wire-format details.
-    def fake_decode(raw: str, rpc_id: str, *, allow_null: bool = False) -> dict:
+    def fake_decode(
+        raw: str, rpc_id: str, *, allow_null: bool = False, raise_on_null_status: bool = False
+    ) -> dict:
         return {"ok": True}
 
     core = build_client_shell_for_tests(
         auth_tokens, on_rpc_event=events.append, decode_response=fake_decode
     )
-    install_http_client_for_test(core._collaborators.kernel, AsyncMock(spec=httpx.AsyncClient))
+    core._web_runtime.kernel.activate(1)
+    install_http_client_for_test(core._web_runtime.kernel, AsyncMock(spec=httpx.AsyncClient))
+    supervisor = core._collaborators.call_supervisor
+    supervisor.set_bound_loop(asyncio.get_running_loop())
+    supervisor.reset_after_open()
+    supervisor.prepare_generation(1)
+    supervisor.start_accepting(1)
+    core._web_runtime.auth_coord.activate_epoch(1)
     seen_request_ids: list[str | None] = []
 
     # Mock the chain LEAF (innermost wrapper around
     # ``Kernel.post``) so the real chain runs
-    # end-to-end and ``MetricsMiddleware`` sees the call. Mocking
-    # ``_perform_authed_post`` itself would bypass the chain entirely
-    # and silence the counters this test exists to assert. Mocking above
-    # the chain would do the same.
-    from notebooklm._middleware.core import RpcResponse
+    # end-to-end while ``CallSupervisor`` observes the logical call.
+    from notebooklm._web.transport.middleware.core import RpcResponse
 
     async def fake_terminal(request: object) -> RpcResponse:
         # Read the correlation id INSIDE the chain so the assertion
@@ -76,17 +78,17 @@ async def test_rpc_metrics_event_and_correlation_scope(auth_tokens: AuthTokens) 
             context=request.context,  # type: ignore[attr-defined]
         )
 
-    core._composed.chain_host._authed_post_chain_terminal = fake_terminal  # type: ignore[method-assign]
+    core._web_runtime.composed.chain_host._authed_post_chain_terminal = fake_terminal  # type: ignore[method-assign]
     # Rebuild the chain so it wraps the new terminal (the original chain
     # was built in the composition root against the original bound method).
-    from notebooklm._middleware.core import build_chain
+    from notebooklm._web.transport.middleware.core import build_chain
 
-    core._composed.chain_host._authed_post_chain = build_chain(
-        core._composed.middlewares, fake_terminal
+    core._web_runtime.composed.chain_host._authed_post_chain = build_chain(
+        core._web_runtime.composed.middlewares, fake_terminal
     )
 
     with correlation_id("batch-42"):
-        result = await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb_123"])
+        result = await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb_123"])
 
     assert result == {"ok": True}
     assert seen_request_ids == ["batch-42"]
@@ -120,13 +122,22 @@ async def test_rpc_decode_error_bumps_drift_counter(auth_tokens: AuthTokens) -> 
     """
     from notebooklm.exceptions import DecodingError
 
-    def drifting_decode(raw: str, rpc_id: str, *, allow_null: bool = False) -> dict:
+    def drifting_decode(
+        raw: str, rpc_id: str, *, allow_null: bool = False, raise_on_null_status: bool = False
+    ) -> dict:
         raise DecodingError("Google reshaped the response", method_id=rpc_id)
 
     core = build_client_shell_for_tests(auth_tokens, decode_response=drifting_decode)
-    install_http_client_for_test(core._collaborators.kernel, AsyncMock(spec=httpx.AsyncClient))
+    core._web_runtime.kernel.activate(1)
+    install_http_client_for_test(core._web_runtime.kernel, AsyncMock(spec=httpx.AsyncClient))
+    supervisor = core._collaborators.call_supervisor
+    supervisor.set_bound_loop(asyncio.get_running_loop())
+    supervisor.reset_after_open()
+    supervisor.prepare_generation(1)
+    supervisor.start_accepting(1)
+    core._web_runtime.auth_coord.activate_epoch(1)
 
-    from notebooklm._middleware.core import RpcResponse, build_chain
+    from notebooklm._web.transport.middleware.core import RpcResponse, build_chain
 
     async def fake_terminal(request: object) -> RpcResponse:
         return RpcResponse(
@@ -134,13 +145,13 @@ async def test_rpc_decode_error_bumps_drift_counter(auth_tokens: AuthTokens) -> 
             context=request.context,  # type: ignore[attr-defined]
         )
 
-    core._composed.chain_host._authed_post_chain_terminal = fake_terminal  # type: ignore[method-assign]
-    core._composed.chain_host._authed_post_chain = build_chain(
-        core._composed.middlewares, fake_terminal
+    core._web_runtime.composed.chain_host._authed_post_chain_terminal = fake_terminal  # type: ignore[method-assign]
+    core._web_runtime.composed.chain_host._authed_post_chain = build_chain(
+        core._web_runtime.composed.middlewares, fake_terminal
     )
 
     with pytest.raises(DecodingError):
-        await core._rpc_executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb_123"])
+        await core._web_runtime.executor.rpc_call(RPCMethod.GET_NOTEBOOK, ["nb_123"])
 
     snapshot = core._collaborators.metrics.snapshot()
     assert snapshot.rpc_decode_errors == 1
@@ -151,102 +162,13 @@ async def test_rpc_decode_error_bumps_drift_counter(auth_tokens: AuthTokens) -> 
 
 
 @pytest.mark.asyncio
-async def test_drain_rejects_new_work_and_waits_for_in_flight(auth_tokens: AuthTokens) -> None:
-    core = build_client_shell_for_tests(auth_tokens)
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def in_flight() -> None:
-        operation_token = await core._collaborators.drain_tracker.begin_transport_post("test")
-        started.set()
-        try:
-            await release.wait()
-        finally:
-            await core._collaborators.drain_tracker.finish_transport_post(operation_token)
-
-    task = asyncio.create_task(in_flight())
-    await started.wait()
-
-    drain_task = asyncio.create_task(core._collaborators.drain_tracker.drain(timeout=1.0))
-    await asyncio.sleep(0)
-
-    assert not drain_task.done()
-    with pytest.raises(RuntimeError, match="draining"):
-        await core._collaborators.drain_tracker.begin_transport_post("new")
-
-    release.set()
-    await drain_task
-    await task
-
-
-@pytest.mark.asyncio
-async def test_drain_allows_nested_work_inside_accepted_operation(
-    auth_tokens: AuthTokens,
-) -> None:
-    core = build_client_shell_for_tests(auth_tokens)
-    outer_token = await core._collaborators.drain_tracker.begin_transport_post("source upload")
-    try:
-        drain_task = asyncio.create_task(core._collaborators.drain_tracker.drain(timeout=1.0))
-        await asyncio.sleep(0)
-
-        nested_token = await core._collaborators.drain_tracker.begin_transport_post(
-            "RPC ADD_SOURCE"
-        )
-        await core._collaborators.drain_tracker.finish_transport_post(nested_token)
-
-        assert not drain_task.done()
-    finally:
-        await core._collaborators.drain_tracker.finish_transport_post(outer_token)
-
-    await drain_task
-
-
-@pytest.mark.asyncio
-async def test_operation_scope_tracks_drain_without_upload_semaphore(
-    auth_tokens: AuthTokens,
-) -> None:
-    core = build_client_shell_for_tests(auth_tokens)
-
-    async with core._collaborators.drain_tracker.operation_scope("plain-operation"):
-        assert core._collaborators.drain_tracker._in_flight_posts == 1
-        assert not hasattr(core, "get_upload_semaphore")
-
-    assert core._collaborators.drain_tracker._in_flight_posts == 0
-    assert "_upload_semaphore" not in core.__dict__
-
-
-@pytest.mark.asyncio
-async def test_drain_rejects_child_task_spawned_from_accepted_operation(
-    auth_tokens: AuthTokens,
-) -> None:
-    core = build_client_shell_for_tests(auth_tokens)
-    outer_token = await core._collaborators.drain_tracker.begin_transport_post("source upload")
-    try:
-        drain_task = asyncio.create_task(core._collaborators.drain_tracker.drain(timeout=1.0))
-        await asyncio.sleep(0)
-
-        async def child_work() -> None:
-            child_token = await core._collaborators.drain_tracker.begin_transport_post("child task")
-            await core._collaborators.drain_tracker.finish_transport_post(child_token)
-
-        with pytest.raises(RuntimeError, match="draining"):
-            await asyncio.create_task(child_work())
-    finally:
-        await core._collaborators.drain_tracker.finish_transport_post(outer_token)
-
-    await drain_task
-
-
-@pytest.mark.asyncio
 async def test_drain_waits_for_artifact_poll_task(auth_tokens: AuthTokens) -> None:
     core = build_client_shell_for_tests(auth_tokens)
-    # ``ArtifactsAPI`` consumes its three runtime collaborators
-    # (``rpc`` + ``drain`` + ``lifecycle``) directly — mirrors production
-    # wiring in ``NotebookLMClient.__init__``.
-    api = ArtifactsAPI(
-        rpc=core._rpc_executor,
-        drain=core._collaborators.drain_tracker,
-        lifecycle=core._collaborators.lifecycle,
+    await core.__aenter__()
+    # Artifact polling receives the same call supervisor as production.
+    api = WebArtifactsAPI(
+        rpc=core._web_runtime.executor,
+        supervisor=core._collaborators.call_supervisor,
         notebooks=MagicMock(),
         mind_maps=MagicMock(spec=NoteBackedMindMapService),
         note_service=MagicMock(spec=NoteService),
@@ -257,18 +179,12 @@ async def test_drain_waits_for_artifact_poll_task(auth_tokens: AuthTokens) -> No
 
     async def fake_poll_status(notebook_id: str, task_id: str) -> GenerationStatus:
         nonlocal poll_count
-        operation_token = await core._collaborators.drain_tracker.begin_transport_post(
-            "poll_status"
-        )
-        try:
-            poll_count += 1
-            if poll_count == 1:
-                first_poll_started.set()
-                await release_first_poll.wait()
-                return GenerationStatus(task_id=task_id, status="in_progress")
-            return GenerationStatus(task_id=task_id, status="completed")
-        finally:
-            await core._collaborators.drain_tracker.finish_transport_post(operation_token)
+        poll_count += 1
+        if poll_count == 1:
+            first_poll_started.set()
+            await release_first_poll.wait()
+            return GenerationStatus(task_id=task_id, status="in_progress")
+        return GenerationStatus(task_id=task_id, status="completed")
 
     api.poll_status = fake_poll_status  # type: ignore[method-assign]
 
@@ -283,7 +199,7 @@ async def test_drain_waits_for_artifact_poll_task(auth_tokens: AuthTokens) -> No
     )
     await first_poll_started.wait()
 
-    drain_task = asyncio.create_task(core._collaborators.drain_tracker.drain(timeout=1.0))
+    drain_task = asyncio.create_task(core.drain(timeout=1.0))
     await asyncio.sleep(0)
     assert not drain_task.done()
 
@@ -293,6 +209,7 @@ async def test_drain_waits_for_artifact_poll_task(auth_tokens: AuthTokens) -> No
 
     assert result.status == "completed"
     assert poll_count == 2
+    await core.close(drain=False)
 
 
 @pytest.mark.asyncio
@@ -300,20 +217,16 @@ async def test_close_with_drain_closes_transport_after_timeout(auth_tokens: Auth
     client = NotebookLMClient(auth_tokens)
     calls: list[str] = []
 
-    async def drain_timeout(timeout: float | None = None) -> None:
-        calls.append(f"drain:{timeout}")
+    async def close_transport(*, drain: bool, drain_timeout: float | None) -> None:
+        calls.append(f"close:{drain}:{drain_timeout}")
         raise TimeoutError("deadline")
 
-    async def close_transport(**_kwargs: object) -> None:
-        calls.append("close")
-
-    client._collaborators.drain_tracker.drain = drain_timeout  # type: ignore[method-assign]
-    client._collaborators.lifecycle.close = close_transport  # type: ignore[method-assign]
+    client._lifecycle.close = close_transport  # type: ignore[method-assign]
 
     with pytest.raises(TimeoutError, match="deadline"):
         await client.close(drain=True, drain_timeout=0.1)
 
-    assert calls == ["drain:0.1", "close"]
+    assert calls == ["close:True:0.1"]
 
 
 @pytest.mark.asyncio
@@ -321,20 +234,16 @@ async def test_close_with_invalid_drain_does_not_close_transport(auth_tokens: Au
     client = NotebookLMClient(auth_tokens)
     calls: list[str] = []
 
-    async def invalid_drain(timeout: float | None = None) -> None:
-        calls.append(f"drain:{timeout}")
+    async def close_transport(*, drain: bool, drain_timeout: float | None) -> None:
+        calls.append(f"close:{drain}:{drain_timeout}")
         raise ValueError("bad deadline")
 
-    async def close_transport(**_kwargs: object) -> None:
-        calls.append("close")
-
-    client._collaborators.drain_tracker.drain = invalid_drain  # type: ignore[method-assign]
-    client._collaborators.lifecycle.close = close_transport  # type: ignore[method-assign]
+    client._lifecycle.close = close_transport  # type: ignore[method-assign]
 
     with pytest.raises(ValueError, match="bad deadline"):
         await client.close(drain=True, drain_timeout=-1.0)
 
-    assert calls == ["drain:-1.0"]
+    assert calls == ["close:True:-1.0"]
 
 
 @pytest.mark.asyncio
@@ -345,16 +254,10 @@ async def test_upload_progress_callback_receives_byte_counts(
     core = build_client_shell_for_tests(auth_tokens)
     await core.__aenter__()
     try:
-        api = SourcesAPI(
+        api = WebSourcesAPI(
             core,
-            uploader=SourceUploadPipeline(
-                rpc=core,
-                drain=core._collaborators.drain_tracker,
-                lifecycle=core._collaborators.lifecycle,
-                kernel=core._collaborators.kernel,
-                auth=core._auth,
-                record_upload_queue_wait=core._collaborators.metrics.record_upload_queue_wait,
-            ),
+            supervisor=core._collaborators.call_supervisor,
+            uploader=core._web_runtime.source_uploader,
         )
         test_file = tmp_path / "upload.txt"
         content = b"hello progress"
@@ -392,11 +295,10 @@ async def test_upload_progress_callback_receives_byte_counts(
 @pytest.mark.asyncio
 async def test_wait_for_completion_status_change_callback(auth_tokens: AuthTokens) -> None:
     core = build_client_shell_for_tests(auth_tokens)
-    # ``ArtifactsAPI`` consumes its three runtime collaborators directly.
-    api = ArtifactsAPI(
-        rpc=core._rpc_executor,
-        drain=core._collaborators.drain_tracker,
-        lifecycle=core._collaborators.lifecycle,
+    await core.__aenter__()
+    api = WebArtifactsAPI(
+        rpc=core._web_runtime.executor,
+        supervisor=core._collaborators.call_supervisor,
         notebooks=MagicMock(),
         mind_maps=MagicMock(spec=NoteBackedMindMapService),
         note_service=MagicMock(spec=NoteService),
@@ -422,3 +324,4 @@ async def test_wait_for_completion_status_change_callback(auth_tokens: AuthToken
 
     assert result.status == "completed"
     assert seen == ["in_progress", "completed"]
+    await core.close()

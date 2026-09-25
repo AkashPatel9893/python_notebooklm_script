@@ -11,25 +11,32 @@ from __future__ import annotations
 
 import ast
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
 
 import httpx
 import pytest
-from tests.unit.conftest import install_post_as_stream
 
-from _helpers.client_factory import build_client_shell_for_tests
 from notebooklm import _env
+from notebooklm._web.wire import overrides as rpc_overrides
+from notebooklm._web.wire.overrides import (
+    _load_rpc_overrides,
+    _parse_rpc_overrides,
+    resolve_rpc_id,
+)
 from notebooklm.auth import AuthTokens
 from notebooklm.client import NotebookLMClient
 from notebooklm.rpc import RPCMethod
-from notebooklm.rpc import overrides as rpc_overrides
 from notebooklm.rpc import types as rpc_types
-from notebooklm.rpc.overrides import _load_rpc_overrides, _parse_rpc_overrides, resolve_rpc_id
+from tests._helpers.client_factory import build_client_shell_for_tests
+from tests.unit.conftest import install_post_as_stream
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RPC_TYPES_PATH = PROJECT_ROOT / "src" / "notebooklm" / "rpc" / "types.py"
+RPC_IDENTIFIERS_PATH = PROJECT_ROOT / "src" / "notebooklm" / "rpc" / "_identifiers.py"
 
 
 @pytest.fixture(autouse=True)
@@ -44,10 +51,14 @@ def _clear_override_caches():
 
 def test_rpc_overrides_direct_smoke_import() -> None:
     """The new private owner module exposes the runtime resolver and cached parser."""
-    from notebooklm.rpc.overrides import _parse_rpc_overrides, resolve_rpc_id
+    from notebooklm._web.wire.overrides import _parse_rpc_overrides, resolve_rpc_id
 
     assert callable(resolve_rpc_id)
     assert hasattr(_parse_rpc_overrides, "cache_clear")
+
+
+def test_rpc_overrides_keeps_legacy_logger_name() -> None:
+    assert rpc_overrides.logger.name == "notebooklm.rpc.overrides"
 
 
 def test_rpc_types_override_aliases_are_identity_compatible() -> None:
@@ -59,7 +70,7 @@ def test_rpc_types_override_aliases_are_identity_compatible() -> None:
 
 
 def test_rpc_types_keeps_override_env_parsing_out_of_protocol_enums() -> None:
-    """RPC enum definitions may expose legacy aliases, but env parsing lives in overrides.py."""
+    """RPC enum definitions may expose aliases, but env parsing lives in web wire."""
     assert RPC_TYPES_PATH.exists(), (
         f"Expected RPC types module at {RPC_TYPES_PATH}; update RPC_TYPES_PATH if the source "
         "layout changed."
@@ -92,11 +103,73 @@ def test_rpc_types_keeps_override_env_parsing_out_of_protocol_enums() -> None:
         f"{forbidden_imports}"
     )
     assert "NOTEBOOKLM_RPC_OVERRIDES" not in source, (
-        "Env-var name NOTEBOOKLM_RPC_OVERRIDES must live in overrides.py, not rpc/types.py"
+        "Env-var name NOTEBOOKLM_RPC_OVERRIDES must live in web wire, not rpc/types.py"
     )
     assert "RPC_OVERRIDES_ENV_VAR" not in source, (
-        "RPC_OVERRIDES_ENV_VAR must live in overrides.py, not rpc/types.py"
+        "RPC_OVERRIDES_ENV_VAR must live in web wire, not rpc/types.py"
     )
+
+
+def test_rpc_overrides_depends_on_stable_rpc_identifiers() -> None:
+    """The Web policy imports the dependency-bottom identifier owner directly."""
+    path = Path(__file__).parents[2] / "src" / "notebooklm/_web/wire/overrides.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imports = [
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 3
+        and node.module == "rpc._identifiers"
+        for alias in node.names
+    ]
+    assert imports == ["RPCMethod"]
+
+    compatibility_imports = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level == 3 and node.module == "rpc.types"
+    ]
+    assert compatibility_imports == []
+
+
+def test_rpc_identifier_owner_is_dependency_bottom() -> None:
+    tree = ast.parse(RPC_IDENTIFIERS_PATH.read_text(encoding="utf-8"))
+    imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert [
+        (node.module, node.level, [alias.name for alias in node.names])
+        for node in imports
+        if isinstance(node, ast.ImportFrom)
+    ] == [("enum", 0, ["Enum"])]
+    assert [node for node in imports if isinstance(node, ast.Import)] == []
+
+
+def test_rpc_overrides_imports_directly_without_package_cycle() -> None:
+    """A clean leaf import must not re-enter a partially initialized override module."""
+    script = """
+import importlib
+import pathlib
+import sys
+import types
+
+root = pathlib.Path(sys.argv[1])
+package = types.ModuleType("notebooklm")
+package.__package__ = "notebooklm"
+package.__path__ = [str(root)]
+sys.modules["notebooklm"] = package
+
+rpc_package = types.ModuleType("notebooklm.rpc")
+rpc_package.__package__ = "notebooklm.rpc"
+rpc_package.__path__ = [str(root / "rpc")]
+sys.modules["notebooklm.rpc"] = rpc_package
+
+overrides = importlib.import_module("notebooklm._web.wire.overrides")
+assert overrides.resolve_rpc_id("LIST_NOTEBOOKS", "canonical") == "canonical"
+assert "notebooklm.rpc.types" not in sys.modules
+identifiers = importlib.import_module("notebooklm.rpc._identifiers")
+assert overrides.RPCMethod is identifiers.RPCMethod
+"""
+    source_root = Path(__file__).parents[2] / "src" / "notebooklm"
+    subprocess.run([sys.executable, "-I", "-c", script, str(source_root)], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +379,7 @@ def test_resolve_rpc_id_logs_again_for_different_set(monkeypatch, caplog):
 
 def test_encode_rpc_request_default_uses_canonical():
     """No override → ``method.value`` is embedded in the request body."""
-    from notebooklm.rpc.encoder import encode_rpc_request
+    from notebooklm._web.wire.encoder import encode_rpc_request
 
     result = encode_rpc_request(RPCMethod.LIST_NOTEBOOKS, [None, 1])
     assert result[0][0][0] == RPCMethod.LIST_NOTEBOOKS.value
@@ -314,7 +387,7 @@ def test_encode_rpc_request_default_uses_canonical():
 
 def test_encode_rpc_request_override_replaces_id():
     """When ``rpc_id_override`` is provided, the override is embedded instead."""
-    from notebooklm.rpc.encoder import encode_rpc_request
+    from notebooklm._web.wire.encoder import encode_rpc_request
 
     result = encode_rpc_request(RPCMethod.LIST_NOTEBOOKS, [None, 1], rpc_id_override="OVERRIDE_v9")
     assert result[0][0][0] == "OVERRIDE_v9"
@@ -322,7 +395,7 @@ def test_encode_rpc_request_override_replaces_id():
 
 def test_encode_rpc_request_none_override_uses_canonical():
     """Explicit None override → falls back to canonical id (no surprise)."""
-    from notebooklm.rpc.encoder import encode_rpc_request
+    from notebooklm._web.wire.encoder import encode_rpc_request
 
     result = encode_rpc_request(RPCMethod.LIST_NOTEBOOKS, [None, 1], rpc_id_override=None)
     assert result[0][0][0] == RPCMethod.LIST_NOTEBOOKS.value
@@ -403,9 +476,9 @@ async def test_rpc_call_resolved_id_at_both_sites(monkeypatch, env_value, expect
             # exercises the full encode → wire → decode round-trip.
             return _ok_response_for(expected_id)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+        await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         # URL site
         assert f"rpcids={expected_id}" in captured["url"]
@@ -437,9 +510,9 @@ async def test_rpc_call_host_off_allowlist_ignores_override(monkeypatch):
             captured["content"] = content
             return _ok_response_for(RPCMethod.LIST_NOTEBOOKS.value)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
-        await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+        await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         assert f"rpcids={RPCMethod.LIST_NOTEBOOKS.value}" in captured["url"]
         assert "shouldNOTApply" not in captured["url"]
@@ -464,10 +537,10 @@ async def test_rpc_call_invalid_json_falls_back_with_warning(monkeypatch, caplog
             captured["content"] = content
             return _ok_response_for(RPCMethod.LIST_NOTEBOOKS.value)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with caplog.at_level("WARNING", logger="notebooklm.rpc.overrides"):
-            await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+            await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         assert any("not valid JSON" in r.message for r in caplog.records)
         assert f"rpcids={RPCMethod.LIST_NOTEBOOKS.value}" in captured["url"]
@@ -491,10 +564,10 @@ async def test_rpc_call_non_dict_json_falls_back_with_warning(monkeypatch, caplo
             captured["content"] = content
             return _ok_response_for(RPCMethod.LIST_NOTEBOOKS.value)
 
-        install_post_as_stream(monkeypatch, core._collaborators.kernel.get_http_client(), fake_post)
+        install_post_as_stream(monkeypatch, core._web_runtime.kernel.get_http_client(), fake_post)
 
         with caplog.at_level("WARNING", logger="notebooklm.rpc.overrides"):
-            await core._rpc_executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
+            await core._web_runtime.executor.rpc_call(RPCMethod.LIST_NOTEBOOKS, [None, 1])
 
         assert any("must be a JSON object" in r.message for r in caplog.records)
         assert f"rpcids={RPCMethod.LIST_NOTEBOOKS.value}" in captured["url"]
