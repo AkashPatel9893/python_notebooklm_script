@@ -58,3 +58,6 @@ pipeline/output/
 pipeline/progress.csv
 pipeline/pipeline.log
 pipeline/.pipeline.lock
+# Google Drive credentials for the pipeline — secrets, never commit
+pipeline/client_secret.json
+pipeline/.drive_token.json

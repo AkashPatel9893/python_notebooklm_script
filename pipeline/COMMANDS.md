@@ -139,6 +139,58 @@ python run.py all
 
 ---
 
+## 7. Google Drive mirror
+
+Drive gets an exact copy of `output/` — same folders, same files:
+
+```
+output/Class 11/Chemistry/Chapter 1/quiz.json
+  →  My Drive / Lernoverse NCERT / Class 11 / Chemistry / Chapter 1 / quiz.json
+```
+
+Every file is shared "anyone with the link can view". Each local chapter folder
+gets a `drive.json` with the file ids and links (for the backend). Until you
+sign in, uploads are skipped with a warning — nothing else is affected. To
+upload only some types, set `DRIVE_EXTS` near the top of `run.py`.
+
+**One-time Google Cloud setup** (about 5 minutes, in the browser):
+
+1. Go to <https://console.cloud.google.com/> → create a project (e.g. "Lernoverse pipeline").
+2. **APIs & Services → Library** → search **Google Drive API** → **Enable**.
+3. **APIs & Services → OAuth consent screen** → *External* → fill app name +
+   your email → on **Test users**, add the Google account whose Drive you want to use.
+4. **APIs & Services → Credentials → Create credentials → OAuth client ID** →
+   type **Desktop app** → copy the **Client ID** and **Client secret**.
+5. Paste them into `pipeline/.env` (created from `.env.example`, git-ignored):
+
+   ```bash
+   GOOGLE_DRIVE_CLIENT_ID=1234-abc.apps.googleusercontent.com
+   GOOGLE_DRIVE_CLIENT_SECRET=GOCSPX-...
+   ```
+
+   `pipeline/.env` also holds `MONGODB_URI` (same value as in
+   `Lernoverse/phoenix/.env`). New machine? `cp .env.example .env` and fill it in.
+
+**Sign in once** (opens the browser):
+
+```bash
+python run.py drive-login
+```
+
+After that, `generate` / `download` upload automatically. To upload everything
+already on disk (or retry failed uploads):
+
+```bash
+python run.py drive
+```
+
+Turn it off for one run with `--no-drive`.
+
+> While the OAuth app is in *Testing* mode, Google expires the sign-in after
+> 7 days — just run `python run.py drive-login` again when the log says so.
+
+---
+
 ## Handy options (add to `generate` / `download` / `all`)
 
 | Command | What it does |

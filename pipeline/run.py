@@ -23,10 +23,16 @@ Phase 2 downloads every completed artifact into:
     output/<Class>/<Subject>/<Chapter>/
         source.pdf
         study_guide.md
-        quiz.json
-        flashcards.json
+        quiz.json / .html / .md
+        flashcards.json / .html / .md
         mind_map.json
-        audio.mp3
+        slides.pdf / .pptx
+        audio.m4a
+        cinematic_video.mp4
+        infographic.png
+
+With the default --download-now, each artifact is also downloaded the moment
+it finishes generating, so `download` is only needed as a catch-up/repair pass.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import json
 import logging
 import os
 import sys
@@ -42,9 +49,20 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
+from dotenv import load_dotenv
+import drive_upload
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TaskID,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -66,6 +84,8 @@ from notebooklm import (
     UsageWindowKind,
 )
 
+console = Console(highlight=False)  # colours only on a real terminal
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -74,6 +94,7 @@ SHEET_ID = "1pvR_vpZjeEK9d3UxuFaFGX0GS_S8ObUu_dS6jWmlKeE"
 SHEET_CSV_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
 
 HERE = Path(__file__).resolve().parent
+load_dotenv(HERE / ".env")  # secrets + settings; see .env.example
 OUTPUT_DIR = HERE / "output"
 PROGRESS_CSV = HERE / "progress.csv"
 LOG_FILE = HERE / "pipeline.log"
@@ -113,6 +134,23 @@ ARTIFACTS: list[str] = [
     "cinematic_video",
     "infographic",
 ]
+
+# Extra download formats. Each listed format is saved as its own file next to
+# the default one (e.g. quiz.json + quiz.html + quiz.md). Downloads are free —
+# they don't touch the usage meter. Artifacts not listed get their single file.
+DOWNLOAD_FORMATS: dict[str, list[str]] = {
+    "quiz": ["json", "html", "markdown"],
+    "flashcards": ["json", "html", "markdown"],
+    "slide_deck": ["pdf", "pptx"],
+}
+FORMAT_EXT = {"json": "json", "html": "html", "markdown": "md", "pdf": "pdf", "pptx": "pptx"}
+
+# Google Drive mirrors output/ exactly: same Class/Subject/Chapter folders, same
+# files. Each chapter folder also gets a local drive.json with every uploaded
+# file's id and share links, for the backend. Set DRIVE_EXTS to a set of
+# extensions (e.g. {".m4a", ".mp4", ".pdf"}) to upload only those; None = all.
+DRIVE_EXTS: set[str] | None = None
+DRIVE_MANIFEST = "drive.json"
 
 # Defaults (overridable on the CLI).
 DEFAULT_CONCURRENCY = 3          # chapters generated in parallel
@@ -204,7 +242,7 @@ async def _gen_mind_map(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
 ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     "study_guide": {
         "generate": _gen_study_guide,
-        "download": lambda c, nb, p, aid: c.artifacts.download_report(nb, p, aid),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_report(nb, p, aid),
         "filename": "study_guide.md",
         "timeout": 900.0,
         "sync_gen": False,
@@ -213,7 +251,7 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "quiz": {
         "generate": _gen_quiz,
-        "download": lambda c, nb, p, aid: c.artifacts.download_quiz(nb, p, aid, "json"),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_quiz(nb, p, aid, fmt or "json"),
         "filename": "quiz.json",
         "timeout": 900.0,
         "sync_gen": False,
@@ -221,7 +259,9 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "flashcards": {
         "generate": _gen_flashcards,
-        "download": lambda c, nb, p, aid: c.artifacts.download_flashcards(nb, p, aid, "json"),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_flashcards(
+            nb, p, aid, fmt or "json"
+        ),
         "filename": "flashcards.json",
         "timeout": 900.0,
         "sync_gen": False,
@@ -230,7 +270,7 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     "mind_map": {
         "generate": _gen_mind_map,
         # note-backed mind map: auto-pick by passing artifact_id=None
-        "download": lambda c, nb, p, aid: c.artifacts.download_mind_map(nb, p, None),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_mind_map(nb, p, None),
         "filename": "mind_map.json",
         "timeout": 0.0,
         "sync_gen": True,
@@ -238,15 +278,15 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "audio": {
         "generate": _gen_audio,
-        "download": lambda c, nb, p, aid: c.artifacts.download_audio(nb, p, aid),
-        "filename": "audio.mp3",
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_audio(nb, p, aid),
+        "filename": "audio.m4a",  # AAC in an MP4 container, not MP3
         "timeout": 1500.0,
         "sync_gen": False,
         "type": ArtifactType.AUDIO,
     },
     "video": {
         "generate": _gen_video,
-        "download": lambda c, nb, p, aid: c.artifacts.download_video(nb, p, aid),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_video(nb, p, aid),
         "filename": "video.mp4",
         "timeout": 2700.0,
         "sync_gen": False,
@@ -254,7 +294,7 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "cinematic_video": {
         "generate": _gen_cinematic_video,
-        "download": lambda c, nb, p, aid: c.artifacts.download_video(nb, p, aid),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_video(nb, p, aid),
         "filename": "cinematic_video.mp4",
         "timeout": 3600.0,  # Veo 3: ~30-40 min
         "sync_gen": False,
@@ -262,7 +302,7 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "infographic": {
         "generate": _gen_infographic,
-        "download": lambda c, nb, p, aid: c.artifacts.download_infographic(nb, p, aid),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_infographic(nb, p, aid),
         "filename": "infographic.png",
         "timeout": 1200.0,
         "sync_gen": False,
@@ -270,7 +310,7 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "slide_deck": {
         "generate": _gen_slide_deck,
-        "download": lambda c, nb, p, aid: c.artifacts.download_slide_deck(nb, p, aid),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_slide_deck(nb, p, aid, fmt or "pdf"),
         "filename": "slides.pdf",
         "timeout": 1200.0,
         "sync_gen": False,
@@ -278,7 +318,7 @@ ARTIFACT_SPECS: dict[str, dict[str, Any]] = {
     },
     "data_table": {
         "generate": _gen_data_table,
-        "download": lambda c, nb, p, aid: c.artifacts.download_data_table(nb, p, aid),
+        "download": lambda c, nb, p, aid, fmt=None: c.artifacts.download_data_table(nb, p, aid),
         "filename": "data_table.csv",
         "timeout": 900.0,
         "sync_gen": False,
@@ -793,6 +833,7 @@ async def generate_row(
     max_attempts: int,
     nb_index: dict[str, str],
     gate: QuotaGate,
+    download_now: bool = True,
 ) -> None:
     key = row_key(row)
     async with sem:
@@ -801,6 +842,13 @@ async def generate_row(
             row["gen_status"] = "done"
             await store.save()
             log.info("[%s] gen already complete — skip", key)
+            if download_now and row.get("notebook_id"):
+                for a in active:
+                    if not download_complete(row, a):
+                        await download_artifact(client, store, row, a, key)
+                row["dl_status"] = roll_up(row, "dl", active)
+                await store.save()
+            await DRIVE.sync_chapter(row, key)
             return
         # Give up ONLY on a genuinely failed row after max_attempts tries.
         # max_attempts <= 0 means "never give up". rate_limited/partial rows are
@@ -865,7 +913,21 @@ async def generate_row(
             #    Before generating, ASK NotebookLM whether the artifact already
             #    exists — adopt a completed one, or wait on one still in flight,
             #    instead of firing a duplicate generation (idempotent on re-run).
+            tried_dl: set[str] = set()
+
+            async def download_ready() -> None:
+                """--download-now: fetch finished artifacts before starting the next
+                one, then mirror any new files to Drive."""
+                if download_now:
+                    for a in active:
+                        if (a not in tried_dl and row.get(f"{a}_gen") == "done"
+                                and not download_complete(row, a)):
+                            tried_dl.add(a)  # one try per run; `download` phase repairs
+                            await download_artifact(client, store, row, a, key)
+                await DRIVE.sync_chapter(row, key)
+
             for name in active:
+                await download_ready()
                 if row.get(f"{name}_gen") == "done":
                     continue
                 spec = ARTIFACT_SPECS[name]
@@ -931,7 +993,12 @@ async def generate_row(
                     row["updated_at"] = now()
                     await store.save()
 
+            await download_ready()
             row["gen_status"] = roll_up(row, "gen", active)
+            if download_now:
+                done_gen = [a for a in active if row.get(f"{a}_gen") == "done"]
+                if done_gen:
+                    row["dl_status"] = roll_up(row, "dl", done_gen)
         except Exception as e:  # noqa: BLE001 — row-level failure (PDF/notebook/source)
             row["gen_status"] = "failed"
             row["gen_error"] = str(e)[:500]
@@ -942,7 +1009,151 @@ async def generate_row(
         log.info("[%s] gen_status=%s", key, row["gen_status"])
 
 
+# --------------------------------------------------------------------------- #
+# Google Drive sync
+# --------------------------------------------------------------------------- #
+
+
+def drive_files(cdir: Path) -> list[Path]:
+    if not cdir.is_dir():
+        return []
+    return sorted(f for f in cdir.iterdir()
+                  if f.is_file() and not f.name.startswith(".") and f.name != DRIVE_MANIFEST
+                  and (DRIVE_EXTS is None or f.suffix.lower() in DRIVE_EXTS))
+
+
+def load_drive_manifest(cdir: Path) -> dict[str, Any]:
+    try:
+        return json.loads((cdir / DRIVE_MANIFEST).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _in_sync(entry: dict[str, Any] | None, f: Path) -> bool:
+    if not entry:
+        return False
+    st = f.stat()
+    return entry.get("size") == st.st_size and entry.get("mtime") == st.st_mtime
+
+
+def _mb(n: int) -> str:
+    return f"{n / 1_048_576:.1f} MB"
+
+
+class DriveSync:
+    """Mirrors a chapter's output folder to Drive, one file at a time.
+
+    Disabled (with one warning) when Drive isn't set up, so the rest of the
+    pipeline keeps working. Uploads are serialised because the Google client
+    library isn't thread-safe; they run in a worker thread so generation and
+    polling carry on meanwhile.
+    """
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+        self.lock = asyncio.Lock()
+        self.drive: drive_upload.Drive | None = None
+        # Live bars pinned under the scrolling log: the current file, plus an
+        # overall bar during `python run.py drive`. transient → they vanish
+        # when finished, leaving just the "✓ ☁ ... done" log line.
+        self.progress = Progress(
+            TextColumn("[cyan]☁[/] {task.description}", markup=True),
+            BarColumn(bar_width=30),
+            TextColumn("{task.percentage:>5.1f}%"),
+            DownloadColumn(binary_units=True),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        )
+        self.overall: TaskID | None = None
+
+    def _bar_start(self) -> None:
+        if not self.progress.live.is_started:
+            self.progress.start()
+
+    def _bar_stop_if_idle(self) -> None:
+        if self.progress.live.is_started and not self.progress.tasks:
+            self.progress.stop()
+
+    def start_overall(self, n_files: int, total_bytes: int) -> None:
+        self._bar_start()
+        self.overall = self.progress.add_task(f"[bold]all files[/] (0/{n_files})",
+                                              total=total_bytes or 1)
+        self._overall_files = (0, n_files)
+
+    def finish_overall(self) -> None:
+        if self.overall is not None:
+            self.progress.remove_task(self.overall)
+            self.overall = None
+        self._bar_stop_if_idle()
+
+    async def _client(self) -> drive_upload.Drive | None:
+        if not self.enabled:
+            return None
+        if self.drive is None:
+            try:
+                self.drive = await asyncio.to_thread(drive_upload.Drive)
+            except Exception as e:  # noqa: BLE001 — Drive is optional
+                self.enabled = False
+                log.warning("Google Drive upload is OFF — %s", e)
+                return None
+        return self.drive
+
+    async def sync_chapter(self, row: dict[str, str], key: str) -> None:
+        """Upload any new/changed files in this chapter's folder. Never raises."""
+        cdir = chapter_dir(row)
+        manifest = load_drive_manifest(cdir)
+        pending = [f for f in drive_files(cdir) if not _in_sync(manifest.get(f.name), f)]
+        if not pending:
+            return
+        drive = await self._client()
+        if drive is None:
+            return
+        parts = (row["class"], row["subject"], row["chapter"])
+        for f in pending:
+            size = f.stat().st_size
+            async with self.lock:
+                self._bar_start()
+                label = f"{short_key(key)} · {f.name}"
+                task = self.progress.add_task(label, total=size or 1)
+                overall, before = self.overall, 0
+
+                def on_progress(sent: int, total: int) -> None:
+                    nonlocal before
+                    self.progress.update(task, completed=sent)
+                    if overall is not None:
+                        self.progress.advance(overall, sent - before)
+                        before = sent
+
+                try:
+                    info = await asyncio.to_thread(drive.upload, f, parts, None, on_progress)
+                except Exception as e:  # noqa: BLE001 — retried on the next sync
+                    log.error("[%s] drive upload %s FAILED: %s", key, f.name, e)
+                    continue
+                finally:
+                    self.progress.remove_task(task)
+                    if overall is not None:
+                        self.progress.advance(overall, size - before)  # skipped/linked files too
+                        done, n = self._overall_files
+                        self._overall_files = (done + 1, n)
+                        self.progress.update(overall,
+                                             description=f"[bold]all files[/] ({done + 1}/{n})")
+                    self._bar_stop_if_idle()
+            manifest[f.name] = info
+            tmp = cdir / f".{DRIVE_MANIFEST}.tmp"
+            tmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            os.replace(tmp, cdir / DRIVE_MANIFEST)
+            what = "uploaded" if info["uploaded"] else "already on Drive, linked"
+            log.info("[%s] ☁ %s %s (%s) done", key, f.name, what, _mb(info["size"]))
+
+
+DRIVE = DriveSync(enabled=False)  # replaced per run by the phase functions
+
+
 async def phase_generate(args: argparse.Namespace) -> None:
+    global DRIVE
+    DRIVE = DriveSync(args.drive)
     active = parse_artifacts(args.artifacts)
     store = Store()
     store.load()
@@ -965,7 +1176,8 @@ async def phase_generate(args: argparse.Namespace) -> None:
                    if args.usage_every > 0 else None)
         try:
             await asyncio.gather(*[
-                generate_row(client, store, row, active, sem, args.max_attempts, nb_index, gate)
+                generate_row(client, store, row, active, sem, args.max_attempts, nb_index, gate,
+                             args.download_now)
                 for row in targets
             ])
         finally:
@@ -977,6 +1189,95 @@ async def phase_generate(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 # Phase 2: download
 # --------------------------------------------------------------------------- #
+
+
+def artifact_outputs(name: str) -> list[tuple[str, str | None]]:
+    """(filename, format) pairs to save for one artifact."""
+    spec = ARTIFACT_SPECS[name]
+    fmts = DOWNLOAD_FORMATS.get(name)
+    if not fmts:
+        return [(spec["filename"], None)]
+    stem = Path(spec["filename"]).stem
+    return [(f"{stem}.{FORMAT_EXT.get(f, f)}", f) for f in fmts]
+
+
+def validate_download(path: Path, label: str | None = None) -> None:
+    """Cheap sanity check that a downloaded file is what it claims to be."""
+    label = label or path.name
+    size = path.stat().st_size
+    if size == 0:
+        raise ValueError(f"{label} is empty")
+    head = path.open("rb").read(16)
+    ext = path.suffix.lower()
+    ok = {
+        ".pdf": head.startswith(b"%PDF"),
+        ".pptx": head.startswith(b"PK"),                       # zip container
+        ".m4a": head[4:8] == b"ftyp",                          # MP4 container
+        ".mp4": head[4:8] == b"ftyp",
+        ".png": head.startswith(b"\x89PNG") or head.startswith(b"\xff\xd8")
+        or head[8:12] == b"WEBP",                              # png / jpeg / webp
+    }.get(ext, True)
+    if not ok:
+        raise ValueError(f"{label} doesn't look like a valid {ext} file (starts {head[:8]!r})")
+    if ext == ".json":
+        json.loads(path.read_text(encoding="utf-8"))
+
+
+def _is_downloaded(path: Path) -> bool:
+    if not path.exists():
+        return False
+    try:
+        validate_download(path)
+        return True
+    except Exception:  # noqa: BLE001 — anything wrong means "download again"
+        return False
+
+
+def download_complete(row: dict[str, str], name: str) -> bool:
+    return row.get(f"{name}_dl") == "done" and all(
+        _is_downloaded(chapter_dir(row) / fn) for fn, _ in artifact_outputs(name))
+
+
+async def download_artifact(
+    client: NotebookLMClient, store: Store, row: dict[str, str], name: str, key: str
+) -> bool:
+    """Download every configured format of one generated artifact. Never raises.
+
+    Each file is written to a hidden temp name, validated, then renamed into
+    place — so a crash or bad download never leaves a truncated file that
+    looks real. Files already present and valid are skipped.
+    """
+    spec = ARTIFACT_SPECS[name]
+    cdir = chapter_dir(row)
+    cdir.mkdir(parents=True, exist_ok=True)
+    art_id = row.get(f"{name}_id") or None
+    saved: list[str] = []
+    try:
+        for filename, fmt in artifact_outputs(name):
+            out = cdir / filename
+            if _is_downloaded(out):
+                continue
+            part = out.with_name(f".{out.stem}.part{out.suffix}")
+            part.unlink(missing_ok=True)
+            try:
+                await spec["download"](client, row["notebook_id"], str(part), art_id, fmt)
+                validate_download(part, out.name)
+                os.replace(part, out)
+            finally:
+                part.unlink(missing_ok=True)
+            saved.append(filename)
+        row[f"{name}_dl"] = "done"
+        if saved:
+            log.info("[%s] downloaded %s → %s done", key, name, ", ".join(saved))
+        return True
+    except Exception as e:  # noqa: BLE001 — record + continue; `download` phase retries
+        row[f"{name}_dl"] = "failed"
+        row["dl_error"] = f"{name}: {e}"[:500]
+        log.error("[%s] download %s FAILED: %s", key, name, e)
+        return False
+    finally:
+        row["updated_at"] = now()
+        await store.save()
 
 
 async def download_row(
@@ -991,9 +1292,16 @@ async def download_row(
     async with sem:
         if not row.get("notebook_id"):
             return
-        if all(row.get(f"{a}_dl") == "done" for a in active
-               if row.get(f"{a}_gen") == "done"):
-            row["dl_status"] = roll_up(row, "dl", [a for a in active if row.get(f"{a}_gen") == "done"]) or "done"
+        downloadable = [a for a in active if row.get(f"{a}_gen") == "done"]
+        if not downloadable:
+            return
+        # Everything already on disk and valid: record it and stop — without
+        # counting an attempt.
+        if all(download_complete(row, a) for a in downloadable):
+            row["dl_status"] = roll_up(row, "dl", downloadable)
+            await store.save()
+            await DRIVE.sync_chapter(row, key)
+            return
         # retry guard (max_attempts <= 0 means never give up)
         if (
             max_attempts > 0
@@ -1005,35 +1313,20 @@ async def download_row(
 
         row["dl_attempts"] = str(int(row.get("dl_attempts") or 0) + 1)
         row["dl_error"] = ""
-        nb_id = row["notebook_id"]
-        cdir = chapter_dir(row)
-        cdir.mkdir(parents=True, exist_ok=True)
-
-        downloadable = [a for a in active if row.get(f"{a}_gen") == "done"]
         for name in downloadable:
-            spec = ARTIFACT_SPECS[name]
-            out = cdir / spec["filename"]
-            if row.get(f"{name}_dl") == "done" and out.exists() and out.stat().st_size > 0:
-                continue
-            try:
-                log.info("[%s] downloading %s", key, name)
-                await spec["download"](client, nb_id, str(out), row.get(f"{name}_id") or None)
-                row[f"{name}_dl"] = "done"
-            except Exception as e:  # noqa: BLE001
-                row[f"{name}_dl"] = "failed"
-                row["dl_error"] = f"{name}: {e}"[:500]
-                log.error("[%s] download %s FAILED: %s", key, name, e)
-            finally:
-                row["updated_at"] = now()
-                await store.save()
+            if not download_complete(row, name):
+                await download_artifact(client, store, row, name, key)
 
-        row["dl_status"] = roll_up(row, "dl", downloadable) if downloadable else "pending"
+        row["dl_status"] = roll_up(row, "dl", downloadable)
         row["updated_at"] = now()
         await store.save()
         log.info("[%s] dl_status=%s", key, row["dl_status"])
+        await DRIVE.sync_chapter(row, key)
 
 
 async def phase_download(args: argparse.Namespace) -> None:
+    global DRIVE
+    DRIVE = DriveSync(args.drive)
     active = parse_artifacts(args.artifacts)
     store = Store()
     store.load()
@@ -1113,6 +1406,7 @@ def summarize(store: Store) -> None:
         head = SHORT_NAME.get(a, a[:5])
         table.add_column(head, justify="center", no_wrap=True, min_width=len(head))
     table.add_column("gen", justify="center", no_wrap=True, min_width=7)
+    table.add_column("drive", justify="center", no_wrap=True, min_width=5)
     narrow = console.width < 90
     if not narrow:
         table.add_column("dl", justify="center", no_wrap=True, min_width=7)
@@ -1125,11 +1419,19 @@ def summarize(store: Store) -> None:
         cells = [CELL.get(r.get(f"{a}_gen", ""), CELL[""]) for a in ARTIFACTS]
         gen = r.get("gen_status") or "pending"
         dl = r.get("dl_status") or "pending"
+        cdir = chapter_dir(r)
+        local = drive_files(cdir)
+        manifest = load_drive_manifest(cdir)
+        up = sum(_in_sync(manifest.get(f.name), f) for f in local)
+        drive_cell = Text(f"{up}/{len(local)}" if local else "·",
+                          style="green" if local and up == len(local)
+                          else "yellow" if local else "bright_black")
         table.add_row(Text(key, style=key_style(key)), *[Text(c[0], style=c[1]) for c in cells],
-                      Text(gen, style=STATUS_STYLE.get(gen, "")),
+                      Text(gen, style=STATUS_STYLE.get(gen, "")), drive_cell,
                       *([Text(dl, style=STATUS_STYLE.get(dl, ""))] if not narrow else []),
                       *([(r.get("notebook_id") or "")[:8]] if wide else []))
-        plain.append(f"{key:<24} " + " ".join(c[0] for c in cells) + f"  gen={gen} dl={dl}")
+        plain.append(f"{key:<24} " + " ".join(c[0] for c in cells)
+                     + f"  gen={gen} drive={drive_cell.plain} dl={dl}")
 
     counts: dict[str, int] = {}
     for r in rows:
@@ -1139,6 +1441,114 @@ def summarize(store: Store) -> None:
                      "   [bright_black]· not yet[/]\n"
                      + "  ".join(f"{k}={v}" for k, v in counts.items()))
     show_table(table, plain)
+
+
+ENV_VARS = [  # (name, required?, secret?) — keep in sync with .env.example
+    ("GOOGLE_DRIVE_CLIENT_ID", True, False),
+    ("GOOGLE_DRIVE_CLIENT_SECRET", True, True),
+    ("GOOGLE_DRIVE_REFRESH_TOKEN", False, True),
+    ("DRIVE_ROOT_FOLDER", False, False),
+    ("MONGODB_URI", True, True),
+    ("MONGODB_DB", False, False),
+]
+
+
+async def cmd_check(_: argparse.Namespace) -> None:
+    """Verify .env and every credential, without changing anything."""
+    env_file = HERE / ".env"
+    vars_t = Table(title="pipeline/.env", title_style="bold", header_style="bold",
+                   border_style="bright_black")
+    vars_t.add_column("variable")
+    vars_t.add_column("value")
+    if not env_file.exists():
+        log.error(".env not found — run: cp .env.example .env   (in the pipeline folder)")
+    for name, required, secret in ENV_VARS:
+        val = os.getenv(name, "").strip()
+        if not val:
+            shown = Text("missing", style="bold red") if required else Text("not set (optional)",
+                                                                             style="bright_black")
+        elif secret:
+            shown = Text(f"set ({len(val)} chars, hidden)", style="green")
+        else:
+            shown = Text(val, style="green")
+        vars_t.add_row(name, shown)
+    console.print(vars_t)
+
+    checks = Table(title="Connections", title_style="bold", header_style="bold",
+                   border_style="bright_black")
+    checks.add_column("service")
+    checks.add_column("result")
+    ok, bad = Text("✓ ok", style="bold green"), lambda m: Text(f"✗ {m}", style="bold red")
+
+    # NotebookLM
+    try:
+        async with NotebookLMClient.from_storage() as client:
+            limits = await client.settings.get_account_limits()
+        checks.add_row("NotebookLM", Text.assemble(
+            ok, f"  ({TIER_NAMES.get(limits.tier or 0, limits.tier)} plan)"))
+    except Exception as e:  # noqa: BLE001 — report, don't crash
+        checks.add_row("NotebookLM", bad(f"{type(e).__name__}: {e} — run `notebooklm login`"))
+
+    # Google Drive
+    try:
+        drive = await asyncio.to_thread(drive_upload.Drive)
+        about = await asyncio.to_thread(
+            lambda: drive.svc.about().get(fields="user(emailAddress)").execute())
+        checks.add_row("Google Drive", Text.assemble(
+            ok, f"  ({about['user']['emailAddress']}, folder \"{drive_upload.ROOT_FOLDER}\")"))
+    except Exception as e:  # noqa: BLE001
+        checks.add_row("Google Drive", bad(str(e)))
+
+    # MongoDB
+    try:
+        from pymongo import MongoClient
+
+        uri = os.getenv("MONGODB_URI", "").strip()
+        if not uri:
+            raise RuntimeError("MONGODB_URI is not set in .env")
+        mc = MongoClient(uri, serverSelectionTimeoutMS=8000)
+        await asyncio.to_thread(mc.admin.command, "ping")
+        db = mc[os.getenv("MONGODB_DB", "").strip()] if os.getenv("MONGODB_DB", "").strip() \
+            else mc.get_default_database()
+        checks.add_row("MongoDB", Text.assemble(ok, f"  (database \"{db.name}\")"))
+        mc.close()
+    except Exception as e:  # noqa: BLE001
+        checks.add_row("MongoDB", bad(f"{type(e).__name__}: {e}"))
+    console.print(checks)
+
+
+def cmd_drive_login(_: argparse.Namespace) -> None:
+    try:
+        drive_upload.login()
+    except drive_upload.DriveNotConfigured as e:
+        log.error("%s", e)
+        sys.exit(1)
+    log.info("Drive sign-in saved to %s done", drive_upload.TOKEN_FILE.name)
+
+
+async def cmd_drive(_: argparse.Namespace) -> None:
+    global DRIVE
+    DRIVE = DriveSync(True)
+    store = Store()
+    store.load()
+    pending: list[Path] = []
+    for row in store.rows.values():
+        cdir = chapter_dir(row)
+        manifest = load_drive_manifest(cdir)
+        pending += [f for f in drive_files(cdir) if not _in_sync(manifest.get(f.name), f)]
+    if not pending:
+        log.info("Drive is up to date — nothing to upload")
+    elif await DRIVE._client() is None:
+        pass  # not signed in — the warning already says what to do
+    else:
+        log.info("uploading %d file(s), %s", len(pending), _mb(sum(f.stat().st_size for f in pending)))
+        DRIVE.start_overall(len(pending), sum(f.stat().st_size for f in pending))
+        try:
+            for row in store.rows.values():
+                await DRIVE.sync_chapter(row, row_key(row))
+        finally:
+            DRIVE.finish_overall()
+    summarize(store)
 
 
 def cmd_status(_: argparse.Namespace) -> None:
@@ -1173,6 +1583,12 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--limit", type=int, default=0, help="cap number of rows (0 = all)")
     p.add_argument("--artifacts", type=str, default="",
                    help=f"comma list (default: {','.join(ARTIFACTS)}); valid: {','.join(ARTIFACT_SPECS)}")
+    p.add_argument("--download-now", action=argparse.BooleanOptionalAction, default=True,
+                   help="during `generate`, download each artifact as soon as it is done "
+                        "(default on; --no-download-now to disable)")
+    p.add_argument("--drive", action=argparse.BooleanOptionalAction, default=True,
+                   help="mirror every saved file to Google Drive as it is saved "
+                        "(default on; skipped with a warning until `drive-login` is done)")
     p.add_argument("--usage-every", type=float, default=USAGE_EVERY, metavar="SECONDS",
                    help=f"re-print the live usage tables this often while generating "
                         f"(default {USAGE_EVERY:.0f}; 0 = off)")
@@ -1183,7 +1599,6 @@ def add_common(p: argparse.ArgumentParser) -> None:
 # --------------------------------------------------------------------------- #
 
 
-console = Console(highlight=False)  # colours only on a real terminal
 
 SHORT_NAME = {"study_guide": "study", "flashcards": "flash", "mind_map": "mind",
               "slide_deck": "slide", "cinematic_video": "cine", "infographic": "info",
@@ -1342,6 +1757,12 @@ def main() -> None:
 
     sub.add_parser("sync", help="pull sheet into progress.csv").set_defaults(fn=cmd_sync)
     sub.add_parser("status", help="print progress summary").set_defaults(fn=cmd_status)
+    sub.add_parser("check", help="verify .env + NotebookLM, Drive and MongoDB access").set_defaults(
+        fn=lambda ns: asyncio.run(cmd_check(ns)))
+    sub.add_parser("drive-login", help="sign in to Google Drive (one time)").set_defaults(
+        fn=cmd_drive_login)
+    sub.add_parser("drive", help="upload any local output file not yet on Drive").set_defaults(
+        fn=lambda ns: asyncio.run(cmd_drive(ns)))
 
     def locked(coro_factory: Callable[[argparse.Namespace], Awaitable[None]]):
         """Run an async phase under the single-run lock."""
