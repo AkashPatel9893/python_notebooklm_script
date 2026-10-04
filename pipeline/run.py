@@ -43,6 +43,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,6 +52,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 from dotenv import load_dotenv
 import drive_upload
+import mongo_sync
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -104,6 +106,11 @@ LANGUAGE = "en"
 # Studio "Customize" defaults — mirror the settings picked in the NotebookLM UI.
 QUIZ_QUANTITY = QuizQuantity.MORE
 QUIZ_DIFFICULTY = QuizDifficulty.MEDIUM
+# The backend stores multiple-choice questions only; anything else is dropped
+# when saving to MongoDB, so ask NotebookLM not to make it.
+QUIZ_INSTRUCTIONS = ("Only multiple-choice questions, each with exactly four options and exactly "
+                     "one correct answer. No multiple-select, fill-in-the-blank or short-answer "
+                     "questions.")
 FLASHCARDS_QUANTITY = QuizQuantity.MORE
 FLASHCARDS_DIFFICULTY = QuizDifficulty.MEDIUM
 SLIDE_DECK_FORMAT = SlideDeckFormat.DETAILED_DECK
@@ -173,7 +180,8 @@ async def _gen_study_guide(c: NotebookLMClient, nb: str, sids: list[str]) -> str
 
 async def _gen_quiz(c: NotebookLMClient, nb: str, sids: list[str]) -> str:
     s = await c.artifacts.generate_quiz(
-        nb, sids, quantity=QUIZ_QUANTITY, difficulty=QUIZ_DIFFICULTY
+        nb, sids, instructions=QUIZ_INSTRUCTIONS, quantity=QUIZ_QUANTITY,
+        difficulty=QUIZ_DIFFICULTY,
     )
     return s.task_id
 
@@ -354,7 +362,7 @@ NO_CINEMATIC_TIERS = {1, 4}
 
 SHEET_COLS = ["class", "subject", "book", "chapter", "pdf_url", "book_index_url"]
 BASE_COLS = [
-    "notebook_id", "source_id",
+    "notebook_id", "source_id", "chapter_title",
     "gen_status", "gen_attempts", "gen_error",
     "dl_status", "dl_attempts", "dl_error",
     "updated_at",
@@ -566,6 +574,47 @@ _RL_MARKERS = (
     "rate limit", "ratelimit", "rate-limit", "quota", "resource_exhausted",
     "resource exhausted", "too many requests", "user_displayable_error", "429",
 )
+
+
+TITLE_PROMPT = ("What is the exact title of this chapter as printed in the textbook? "
+                "Reply with the title only — no chapter/unit number, no quotes, no explanation.")
+_SMALL_WORDS = {"a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to",
+                "with"}
+
+
+def clean_title(answer: str) -> str:
+    """NotebookLM's chat answer → a bare chapter title ('' if it isn't one)."""
+    strip = " \t\"'“”‘’*_."
+    t = re.sub(r"\s*\[[\d,\s\-–]+\]", "", answer or "").strip(strip)  # citations: [1, 2]
+    t = re.sub(r"^(chapter|unit|lesson)\s+[\dIVXivx]+\s*[:.\-–—]?\s*", "", t, flags=re.IGNORECASE)
+    t = t.strip(strip)
+    if not t or "\n" in t or len(t) > 120:
+        return ""  # a sentence or a refusal, not a title
+    if t.isupper():  # printed in capitals in the book
+        words = t.lower().split()
+        t = " ".join(w if i and w in _SMALL_WORDS else w[:1].upper() + w[1:]
+                     for i, w in enumerate(words))
+    return t
+
+
+async def ensure_chapter_title(client: NotebookLMClient, store: Store, row: dict[str, str],
+                               key: str) -> None:
+    """Ask the notebook for the chapter's real name, once. Never raises — the
+    MongoDB save falls back to the mind map's root when this is empty."""
+    if row.get("chapter_title") or not row.get("notebook_id"):
+        return
+    try:
+        res = await client.chat.ask(row["notebook_id"], TITLE_PROMPT)
+    except Exception as e:  # noqa: BLE001 — retried on the next run
+        log.warning("[%s] chapter title: ask failed (%s)", key, e)
+        return
+    title = clean_title(res.answer)
+    if not title:
+        log.warning("[%s] chapter title: unusable answer %r", key, (res.answer or "")[:80])
+        return
+    row["chapter_title"] = title
+    await store.save()
+    log.info("[%s] chapter title: \"%s\"", key, title)
 
 
 def _looks_rate_limited(e: Exception) -> bool:
@@ -842,13 +891,14 @@ async def generate_row(
             row["gen_status"] = "done"
             await store.save()
             log.info("[%s] gen already complete — skip", key)
+            await ensure_chapter_title(client, store, row, key)
             if download_now and row.get("notebook_id"):
                 for a in active:
                     if not download_complete(row, a):
                         await download_artifact(client, store, row, a, key)
                 row["dl_status"] = roll_up(row, "dl", active)
                 await store.save()
-            await DRIVE.sync_chapter(row, key)
+            await sync_backends(row, key)
             return
         # Give up ONLY on a genuinely failed row after max_attempts tries.
         # max_attempts <= 0 means "never give up". rate_limited/partial rows are
@@ -908,6 +958,7 @@ async def generate_row(
             )
             log.info("[%s] source ready (%s)", key, sid(row["source_id"]))
             sids = [row["source_id"]]
+            await ensure_chapter_title(client, store, row, key)
 
             # 4. Artifacts (sequential within a chapter; chapters run in parallel).
             #    Before generating, ASK NotebookLM whether the artifact already
@@ -924,7 +975,7 @@ async def generate_row(
                                 and not download_complete(row, a)):
                             tried_dl.add(a)  # one try per run; `download` phase repairs
                             await download_artifact(client, store, row, a, key)
-                await DRIVE.sync_chapter(row, key)
+                await sync_backends(row, key)
 
             for name in active:
                 await download_ready()
@@ -1018,7 +1069,8 @@ def drive_files(cdir: Path) -> list[Path]:
     if not cdir.is_dir():
         return []
     return sorted(f for f in cdir.iterdir()
-                  if f.is_file() and not f.name.startswith(".") and f.name != DRIVE_MANIFEST
+                  if f.is_file() and not f.name.startswith(".")
+                  and f.name not in (DRIVE_MANIFEST, mongo_sync.MARKER)
                   and (DRIVE_EXTS is None or f.suffix.lower() in DRIVE_EXTS))
 
 
@@ -1151,9 +1203,60 @@ class DriveSync:
 DRIVE = DriveSync(enabled=False)  # replaced per run by the phase functions
 
 
+class MongoSync:
+    """Writes a chapter into the phoenix MongoDB once its content changes.
+
+    Skipped quietly until the chapter has a mind map (it supplies the chapter
+    title); disabled with one warning when MONGODB_URI isn't set. Writes are
+    serialised and run in a worker thread (pymongo is synchronous).
+    """
+
+    def __init__(self, enabled: bool, dry_run: bool = False) -> None:
+        self.enabled = enabled
+        self.dry_run = dry_run
+        self.lock = asyncio.Lock()
+        self.db: Any = None
+
+    async def sync_chapter(self, row: dict[str, str], key: str, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        cdir = chapter_dir(row)
+        if not (force or self.dry_run or mongo_sync.needs_sync(cdir)):
+            return
+        if not (cdir / "mind_map.json").exists():
+            return
+        async with self.lock:
+            try:
+                if self.db is None:
+                    self.db = await asyncio.to_thread(mongo_sync.connect)
+                s = await asyncio.to_thread(mongo_sync.sync_chapter, self.db, row, cdir,
+                                            self.dry_run)
+            except mongo_sync.MongoNotConfigured as e:
+                self.enabled = False
+                log.warning("MongoDB save is OFF — %s", e)
+                return
+            except Exception as e:  # noqa: BLE001 — retried on the next sync
+                log.error("[%s] mongo save FAILED: %s", key, e)
+                return
+        verb = "would save" if self.dry_run else "🗄 saved to MongoDB"
+        log.info("[%s] %s \"%s\": %d quiz, %d flashcards, mind map (%d nodes), %d resources done",
+                 key, verb, s["title"], s["quiz"], s["flashcards"], s["mind_map_nodes"],
+                 len(s["resources"]))
+
+
+MONGO = MongoSync(enabled=False)
+
+
+async def sync_backends(row: dict[str, str], key: str) -> None:
+    """After local files change: mirror to Drive, then save to MongoDB (it needs Drive links)."""
+    await DRIVE.sync_chapter(row, key)
+    await MONGO.sync_chapter(row, key)
+
+
 async def phase_generate(args: argparse.Namespace) -> None:
-    global DRIVE
+    global DRIVE, MONGO
     DRIVE = DriveSync(args.drive)
+    MONGO = MongoSync(args.mongo)
     active = parse_artifacts(args.artifacts)
     store = Store()
     store.load()
@@ -1300,7 +1403,7 @@ async def download_row(
         if all(download_complete(row, a) for a in downloadable):
             row["dl_status"] = roll_up(row, "dl", downloadable)
             await store.save()
-            await DRIVE.sync_chapter(row, key)
+            await sync_backends(row, key)
             return
         # retry guard (max_attempts <= 0 means never give up)
         if (
@@ -1321,12 +1424,13 @@ async def download_row(
         row["updated_at"] = now()
         await store.save()
         log.info("[%s] dl_status=%s", key, row["dl_status"])
-        await DRIVE.sync_chapter(row, key)
+        await sync_backends(row, key)
 
 
 async def phase_download(args: argparse.Namespace) -> None:
-    global DRIVE
+    global DRIVE, MONGO
     DRIVE = DriveSync(args.drive)
+    MONGO = MongoSync(args.mongo)
     active = parse_artifacts(args.artifacts)
     store = Store()
     store.load()
@@ -1517,6 +1621,35 @@ async def cmd_check(_: argparse.Namespace) -> None:
     console.print(checks)
 
 
+async def cmd_mongo(ns: argparse.Namespace) -> None:
+    global MONGO
+    MONGO = MongoSync(True, dry_run=ns.dry_run)
+    store = Store()
+    store.load()
+    for row in store.rows.values():
+        await MONGO.sync_chapter(row, row_key(row), force=ns.force)
+    if ns.dry_run:
+        log.info("dry run — nothing was written")
+
+
+async def cmd_titles(_: argparse.Namespace) -> None:
+    """Fill chapter_title for every chapter that has a notebook but no title yet."""
+    store = Store()
+    store.load()
+    todo = [r for r in store.rows.values() if r.get("notebook_id") and not r.get("chapter_title")]
+    if not todo:
+        log.info("every chapter with a notebook already has a title")
+        return
+    sem = asyncio.Semaphore(DEFAULT_CONCURRENCY)
+
+    async def one(row: dict[str, str]) -> None:
+        async with sem:
+            await ensure_chapter_title(client, store, row, row_key(row))
+
+    async with NotebookLMClient.from_storage() as client:
+        await asyncio.gather(*[one(r) for r in todo])
+
+
 def cmd_drive_login(_: argparse.Namespace) -> None:
     try:
         drive_upload.login()
@@ -1549,6 +1682,15 @@ async def cmd_drive(_: argparse.Namespace) -> None:
         finally:
             DRIVE.finish_overall()
     summarize(store)
+
+
+async def cmd_upload(ns: argparse.Namespace) -> None:
+    """Drive first, then MongoDB — the Mongo documents carry the Drive links."""
+    if ns.dry_run:
+        log.info("dry run — skipping the Drive upload")
+    else:
+        await cmd_drive(ns)
+    await cmd_mongo(ns)
 
 
 def cmd_status(_: argparse.Namespace) -> None:
@@ -1589,6 +1731,9 @@ def add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--drive", action=argparse.BooleanOptionalAction, default=True,
                    help="mirror every saved file to Google Drive as it is saved "
                         "(default on; skipped with a warning until `drive-login` is done)")
+    p.add_argument("--mongo", action=argparse.BooleanOptionalAction, default=True,
+                   help="save each chapter to the phoenix MongoDB when its content changes "
+                        "(default on; needs MONGODB_URI in .env)")
     p.add_argument("--usage-every", type=float, default=USAGE_EVERY, metavar="SECONDS",
                    help=f"re-print the live usage tables this often while generating "
                         f"(default {USAGE_EVERY:.0f}; 0 = off)")
@@ -1759,6 +1904,17 @@ def main() -> None:
     sub.add_parser("status", help="print progress summary").set_defaults(fn=cmd_status)
     sub.add_parser("check", help="verify .env + NotebookLM, Drive and MongoDB access").set_defaults(
         fn=lambda ns: asyncio.run(cmd_check(ns)))
+    m = sub.add_parser("mongo", help="save generated content to the phoenix MongoDB")
+    m.add_argument("--dry-run", action="store_true", help="show what would be saved, write nothing")
+    m.add_argument("--force", action="store_true", help="re-save chapters even if unchanged")
+    m.set_defaults(fn=lambda ns: asyncio.run(cmd_mongo(ns)))
+    u = sub.add_parser("upload", help="upload output/ to Drive, then save to MongoDB "
+                                      "(`drive` + `mongo` in one go)")
+    u.add_argument("--dry-run", action="store_true",
+                   help="upload nothing; show what would be saved to MongoDB")
+    u.add_argument("--force", action="store_true",
+                   help="re-save chapters to MongoDB even if unchanged")
+    u.set_defaults(fn=lambda ns: asyncio.run(cmd_upload(ns)))
     sub.add_parser("drive-login", help="sign in to Google Drive (one time)").set_defaults(
         fn=cmd_drive_login)
     sub.add_parser("drive", help="upload any local output file not yet on Drive").set_defaults(
@@ -1776,6 +1932,10 @@ def main() -> None:
             finally:
                 release_lock()
         return runner
+
+    sub.add_parser("titles", help="ask each notebook for its chapter's real name "
+                                  "(fills chapter_title in progress.csv)").set_defaults(
+        fn=locked(cmd_titles))
 
     g = sub.add_parser("generate", help="phase 1: upload + generate")
     add_common(g)

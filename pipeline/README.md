@@ -58,7 +58,6 @@ A filled-in file looks like:
 ```bash
 GOOGLE_DRIVE_CLIENT_ID=1234567890-abc123.apps.googleusercontent.com
 GOOGLE_DRIVE_CLIENT_SECRET=GOCSPX-xxxxxxxxxxxxxxxxxxxx
-GOOGLE_DRIVE_REFRESH_TOKEN=
 DRIVE_ROOT_FOLDER=Lernoverse NCERT
 
 MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/<database>
@@ -229,7 +228,10 @@ cd pipeline
 python run.py sync          # pull the sheet → progress.csv (adds new rows)
 python run.py generate      # PDFs → notebooks → artifacts; downloads + Drive upload as each finishes
 python run.py download      # catch-up / repair pass: fetch anything missing or broken
-python run.py drive         # upload anything in output/ not yet on Drive
+python run.py upload        # Drive upload, then MongoDB save — both in one go
+python run.py drive         # only: upload anything in output/ not yet on Drive
+python run.py mongo         # save content to the phoenix MongoDB (--dry-run to preview)
+python run.py titles        # ask each notebook for the chapter's real name → chapter_title column
 python run.py status        # progress table
 python run.py check         # verify .env + NotebookLM / Drive / MongoDB access
 python run.py all           # generate then download
@@ -247,6 +249,7 @@ Useful flags on `generate` / `download` / `all`:
 | `--artifacts a,b` | override which artifacts to make (default: `quiz,flashcards,mind_map,slide_deck,audio,cinematic_video,infographic`) |
 | `--no-download-now` | during `generate`, don't download each artifact as it finishes |
 | `--no-drive` | skip Google Drive uploads for this run |
+| `--no-mongo` | skip saving to MongoDB for this run |
 | `--usage-every SECONDS` | how often to re-print the live usage tables (default 120; `0` = off) |
 | `-v` (before the command) | also show library + HTTP logs on the console |
 
@@ -266,6 +269,7 @@ adds tracking columns — it's the single source of truth, safe to re-upload to
 Google Sheets:
 
 - `notebook_id`, `source_id` — the NotebookLM notebook + uploaded source per chapter
+- `chapter_title` — the chapter's real name, asked from the notebook once its source is ready (used as the title in MongoDB)
 - `gen_status`, `dl_status` — overall state: `pending` / `done` / `partial` / `rate_limited` / `failed`
 - `gen_attempts`, `dl_attempts`, `gen_error`, `dl_error` — retry bookkeeping
 - per artifact: `<name>_id`, `<name>_gen`, `<name>_dl` (e.g. `quiz_id`, `slide_deck_gen`, `cinematic_video_dl`)
@@ -286,6 +290,7 @@ output/                                   Google Drive: My Drive / Lernoverse NC
         cinematic_video.mp4
         infographic.png
         drive.json                        # local only: Drive id + links per file
+        mongo.json                        # local only: last MongoDB save (chapter _id, counts)
 ```
 
 Extra formats are set by `DOWNLOAD_FORMATS` at the top of `run.py`; which files
@@ -293,6 +298,27 @@ go to Drive by `DRIVE_EXTS` (default: all). `drive.json` holds, per file,
 `view_url` (open in browser), `preview_url` (embed in an `<iframe>` — use this
 for audio/video in the app) and `download_url` (raw file; unreliable for large
 files).
+
+## MongoDB (phoenix backend)
+
+After each chapter's files reach Drive, the chapter is saved into the phoenix
+database using the exact shapes of `phoenix/app/models/ncert/*`:
+
+| Collection | What |
+|------------|------|
+| `ncertclasses` → `ncertsubjects` → `ncertbooks` → `ncertchapters` | the hierarchy; chapter title is `chapter_title` from `progress.csv` (falls back to the mind map's root node) |
+| `ncertquizquestions` | multiple-choice questions only (`answer_options`, exactly one correct, + `hint`); other question types NotebookLM produces are skipped |
+| `ncertflashcards` | every card (`card_type` 1 — NotebookLM doesn't send a type) |
+| `ncertmindmaps` | the tree, converted to `{title, root: {id, text, level, expanded, children}}` |
+| `ncertresources` | audio, video, slides PDF, chapter PDF (`url` = Drive `preview_url`), plus quiz / flashcard / mind-map entries with counts |
+
+Re-running is safe: records are matched on natural keys (class number, subject
+name, question text, card front…), so `_id`s never change; class/subject/book/
+chapter are only filled in on first creation, so edits made in the backend are
+kept. Pipeline-made resources carry `meta.source: "notebooklm-pipeline"`.
+Not saved (no place in the models): `slides.pptx` and the `.html` / `.md`
+exports — they're on Drive only. Bump `SCHEMA_VERSION` in `mongo_sync.py`
+when changing the saved shapes, so every chapter re-syncs.
 
 ## Notes
 
