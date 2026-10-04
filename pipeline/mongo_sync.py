@@ -40,6 +40,8 @@ PIPELINE = "notebooklm-pipeline"
 # Bump when the document shapes written here change, so every chapter re-syncs.
 SCHEMA_VERSION = "3"  # 3: multiple-choice quiz only, no infographic resource (2 saved both)
 MARKER = "mongo.json"  # local per-chapter record of the last sync
+# Local files a sync reads; a chapter is saved once any of them exists.
+CONTENT_FILES = ("mind_map.json", "quiz.json", "flashcards.json", "drive.json")
 
 C = {
     "class": "ncertclasses",
@@ -166,16 +168,20 @@ def _load(path: Path) -> Any | None:
 
 def content_hash(cdir: Path) -> str:
     h = hashlib.sha256(SCHEMA_VERSION.encode())
-    for name in ("mind_map.json", "quiz.json", "flashcards.json", "drive.json"):
+    for name in CONTENT_FILES:
         p = cdir / name
         h.update(name.encode())
         h.update(p.read_bytes() if p.exists() else b"-")
     return h.hexdigest()
 
 
+def has_content(cdir: Path) -> bool:
+    return any((cdir / n).exists() for n in CONTENT_FILES)
+
+
 def needs_sync(cdir: Path) -> bool:
     marker = _load(cdir / MARKER) or {}
-    return (cdir / "mind_map.json").exists() and marker.get("hash") != content_hash(cdir)
+    return has_content(cdir) and marker.get("hash") != content_hash(cdir)
 
 
 # --------------------------------------------------------------------------- #
@@ -199,12 +205,13 @@ def sync_chapter(db: Any, row: dict[str, str], cdir: Path, dry_run: bool = False
     """Write one chapter. Returns a summary dict. Raises on bad input / DB errors."""
     from pymongo import UpdateOne
 
+    # The mind map is optional: without one, whatever an earlier run saved stays.
     mind_raw = _load(cdir / "mind_map.json")
-    if not mind_raw:
-        raise ValueError("no mind_map.json yet — it provides the chapter title")
-    title, root, n_nodes = convert_mind_map(mind_raw)
+    mm_title, root, n_nodes = convert_mind_map(mind_raw) if mind_raw else ("", None, 0)
     # The name NotebookLM gave when asked (progress.csv) beats the mind map's root.
-    title = (row.get("chapter_title") or "").strip() or title
+    title = (row.get("chapter_title") or "").strip() or mm_title
+    if not title:
+        raise ValueError("no chapter_title in progress.csv and no mind_map.json to take it from")
     quiz = convert_quiz(_load(cdir / "quiz.json") or {})
     cards = convert_flashcards(_load(cdir / "flashcards.json") or {})
     drive = _load(cdir / "drive.json") or {}
@@ -229,7 +236,9 @@ def sync_chapter(db: Any, row: dict[str, str], cdir: Path, dry_run: bool = False
     if cards:
         resources.append(("flashcards", "flashcard", f"{title} – Flashcard Deck", None,
                           {"card_count": len(cards)}))
-    resources.append(("mind_map", "mindmap", f"{title} – Mind Map", None, {"node_count": n_nodes}))
+    if root:
+        resources.append(("mind_map", "mindmap", f"{title} – Mind Map", None,
+                          {"node_count": n_nodes}))
 
     summary = {"title": title, "quiz": len(quiz), "flashcards": len(cards),
                "mind_map_nodes": n_nodes, "resources": [r[0] for r in resources]}
@@ -268,20 +277,23 @@ def sync_chapter(db: Any, row: dict[str, str], cdir: Path, dry_run: bool = False
             upsert=True) for c in cards], ordered=False)
         db[C["flashcard"]].delete_many({"chapter_id": chapter_id,
                                         "front": {"$nin": [c["front"] for c in cards]}})
-    db[C["mindmap"]].update_one(
-        {"chapter_id": chapter_id},
-        {"$set": {"title": title, "root": root, "updated_at": now},
-         "$setOnInsert": {"created_at": now}},
-        upsert=True)
-    db[C["resource"]].bulk_write([UpdateOne(
-        {"chapter_id": chapter_id, "meta.source": PIPELINE, "meta.key": key},
-        {"$set": {"title": rtitle, "resource_type": rtype, "url": url,
-                  "meta": {"source": PIPELINE, "key": key, **meta}, "updated_at": now},
-         "$setOnInsert": {"created_at": now}},
-        upsert=True) for key, rtype, rtitle, url, meta in resources], ordered=False)
+    if root:
+        db[C["mindmap"]].update_one(
+            {"chapter_id": chapter_id},
+            {"$set": {"title": title, "root": root, "updated_at": now},
+             "$setOnInsert": {"created_at": now}},
+            upsert=True)
+    if resources:
+        db[C["resource"]].bulk_write([UpdateOne(
+            {"chapter_id": chapter_id, "meta.source": PIPELINE, "meta.key": key},
+            {"$set": {"title": rtitle, "resource_type": rtype, "url": url,
+                      "meta": {"source": PIPELINE, "key": key, **meta}, "updated_at": now},
+             "$setOnInsert": {"created_at": now}},
+            upsert=True) for key, rtype, rtitle, url, meta in resources], ordered=False)
     # Drop our own resources this run no longer produces (never hand-added ones).
+    keep = [r[0] for r in resources] + ([] if root else ["mind_map"])
     db[C["resource"]].delete_many({"chapter_id": chapter_id, "meta.source": PIPELINE,
-                                   "meta.key": {"$nin": [r[0] for r in resources]}})
+                                   "meta.key": {"$nin": keep}})
 
     summary["chapter_id"] = str(chapter_id)
     marker = {"hash": content_hash(cdir), "chapter_id": str(chapter_id),

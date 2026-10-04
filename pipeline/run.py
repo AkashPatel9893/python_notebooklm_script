@@ -1206,8 +1206,8 @@ DRIVE = DriveSync(enabled=False)  # replaced per run by the phase functions
 class MongoSync:
     """Writes a chapter into the phoenix MongoDB once its content changes.
 
-    Skipped quietly until the chapter has a mind map (it supplies the chapter
-    title); disabled with one warning when MONGODB_URI isn't set. Writes are
+    Skipped quietly until the chapter has some content on disk; disabled with
+    one warning when MONGODB_URI isn't set. Writes are
     serialised and run in a worker thread (pymongo is synchronous).
     """
 
@@ -1223,7 +1223,7 @@ class MongoSync:
         cdir = chapter_dir(row)
         if not (force or self.dry_run or mongo_sync.needs_sync(cdir)):
             return
-        if not (cdir / "mind_map.json").exists():
+        if not mongo_sync.has_content(cdir):
             return
         async with self.lock:
             try:
@@ -1239,9 +1239,9 @@ class MongoSync:
                 log.error("[%s] mongo save FAILED: %s", key, e)
                 return
         verb = "would save" if self.dry_run else "🗄 saved to MongoDB"
-        log.info("[%s] %s \"%s\": %d quiz, %d flashcards, mind map (%d nodes), %d resources done",
-                 key, verb, s["title"], s["quiz"], s["flashcards"], s["mind_map_nodes"],
-                 len(s["resources"]))
+        mind = f"mind map ({s['mind_map_nodes']} nodes)" if s["mind_map_nodes"] else "no mind map"
+        log.info("[%s] %s \"%s\": %d quiz, %d flashcards, %s, %d resources done",
+                 key, verb, s["title"], s["quiz"], s["flashcards"], mind, len(s["resources"]))
 
 
 MONGO = MongoSync(enabled=False)
